@@ -1,0 +1,25 @@
+#!/usr/bin/env python
+import zslurm_shared
+import socket
+try: 
+    import http.client as httplib
+except:
+    import httplib
+import argparse
+import sys
+s = zslurm_shared.TimeoutServerProxy(zslurm_shared.job_url, allow_none = True)
+
+parser = argparse.ArgumentParser(description='Cancel XSlurm job')
+parser.add_argument('job_id', nargs='*')
+args = parser.parse_args()
+
+if not args.job_id:
+    job_ids = [line for line in sys.stdin]
+else:
+    job_ids = args.job_id
+
+try:
+    for job_id in job_ids: 
+        s.cancel_job(job_id.strip())
+except (socket.error, httplib.HTTPException) as serror:
+    print('Job canceling failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)

@@ -1,0 +1,42 @@
+#!/usr/bin/env python
+import zslurm_shared
+import getpass
+import socket
+try: 
+    import http.client as httplib
+except:
+    import httplib
+import argparse
+
+s = zslurm_shared.TimeoutServerProxy(zslurm_shared.job_url, allow_none = True)
+
+parser = argparse.ArgumentParser(description='ZSlurm node listing')
+parser.add_argument('--all', action='store_true', help='Show also queued nodes.')
+args = parser.parse_args()
+try:
+    nodes = s.list_nodes()
+    
+    print("ID\tPARTITION\tCORES\tMEM\tTIME\tNJOBS\tCPU\tMEM\tLOAD")
+    for partition, cluster_id, cores, totmem, runtime, njobs, cpu_usage, mem_usage, load in nodes:
+        days = 0
+        hours = 0
+        minutes = 0
+        while runtime > (24 * 60 * 60):
+            days += 1
+            runtime -= 24 * 60 * 60
+        while runtime > 60 * 60:
+            hours += 1
+            runtime -= 60 * 60
+        while runtime > 60:
+            minutes += 1
+            runtime -= 60
+        seconds = runtime
+        runtime = '%d:%d:%d' % ( hours, minutes, seconds)
+        if days > 0:
+            runtime = ('%d-' % days) + runtime
+                    
+
+        print('%s\t%s\t%.0f\t%.1fGb\t%s\t%d\t%.1f\t%.1f\t%.1f' % (cluster_id, partition, cores, totmem/1024.0, runtime, njobs, cpu_usage, mem_usage, load))
+
+except (socket.error, httplib.HTTPException) as serror:
+    print('Queue request failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)

@@ -1,0 +1,435 @@
+#!/usr/bin/env python
+import subprocess, sys, getopt, time, shlex
+from subprocess import Popen
+import os,sys
+import signal
+import psutil
+import shutil
+import random
+import threading
+import zslurm_shared
+import socket
+try:
+    import http.client as httplib
+except:
+    import httplib
+import numpy
+import resource
+
+resource.setrlimit(resource.RLIMIT_NPROC, (8192, 16000))
+
+PING_INTERVAL = 20
+PING_TIMEOUT = 600
+REQUEST_TIMEOUT = 60
+
+REGISTRATION_ATTEMPTS = 5
+REGISTRATION_SLEEP = 30
+REGISTRATION_SLEEP_RANDOM = 180
+
+address = zslurm_shared.address
+port = zslurm_shared.port
+
+cpu = psutil.cpu_count()
+partition = 'compute'
+
+opts, args = getopt.getopt(sys.argv[1:],"a:p:c:m:t:",["address=","port=","cpu=","mem=","partition="])
+for o, a in opts:
+    if o in ('-a', '--address'):
+        address = a
+    elif o in ('-p', '--port'):
+        port = a
+    elif o in ('-c', '--cpu'):
+        cpu = int(a)
+    elif o in ('-t', '--partition'):
+        partition = a.strip()
+
+myip = zslurm_shared.get_hostname()
+myid = myip #for now
+
+memory_core_mb = (psutil.virtual_memory().total / (1024.0 ** 2)) / psutil.cpu_count()
+e_ncpu = min(psutil.cpu_count(), cpu)
+e_memtot = memory_core_mb * e_ncpu - 100.0 #reserve some space for self
+
+
+if 'SLURM_ARRAY_JOB_ID' in os.environ:
+    clusterid = os.environ.get('SLURM_ARRAY_JOB_ID','') + '_' + os.environ.get('SLURM_ARRAY_TASK_ID','')
+else:
+    clusterid = os.environ.get('SLURM_JOB_ID','')
+
+
+#self register
+print(("[%s] Preparing to register on " % str(myip)) + str(address) + ":" + str(port))
+s = zslurm_shared.TimeoutServerProxy('http://' + str(address) + ":" + str(port), timeout = REQUEST_TIMEOUT, allow_none = True)
+
+myid = None
+attempt = REGISTRATION_ATTEMPTS
+while attempt > 0 :
+    try:
+        myid = s.register(myip, e_ncpu, e_memtot, partition, clusterid)
+    except (socket.error, httplib.HTTPException) as serror :
+        attempt -= 1
+        sleep_time = random.randint(REGISTRATION_SLEEP, REGISTRATION_SLEEP + REGISTRATION_SLEEP_RANDOM)
+        print('[-] Failed registration, %d attempts left, sleeping for %d seconds' % (attempt, sleep_time))
+        time.sleep(sleep_time)
+    if myid is not None :
+        break
+
+
+last_seen = time.time()
+
+
+
+
+if myid == "DENIED":
+    print("[%s] Cluster manager does not like me..." % myip)
+    sys.exit()
+else:
+    print(("[%s] Registered with controller, got id: " % myip) + myid)
+ 
+def handler(signum, frame) :
+    print(("[%s] CATCH SYSTEM EXIT" % myid))
+    sys.stdout.flush()
+    mode = zslurm_shared.STOPPING
+
+    terminate_jobs()
+    print(("[%s] CATCH SYSTEM EXIT 2" % myid))
+    sys.stdout.flush()
+    time.sleep(5) #allow job monitor to report back the demise of the jobs
+    sys.exit()
+
+def terminate_jobs():
+    status.lock.acquire()
+    for process in list(status.running_processes.values()):
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except OSError:
+            pass
+    status.lock.release()
+
+    counter = 20 #give 20 seconds to shut down normally
+    while counter > 0 and len(status.running_processes) > 0:
+        time.sleep(1)
+        counter -= 1
+        print(counter)
+
+
+    #kill any remaining jobs
+    status.lock.acquire()
+    for process in list(status.running_processes.values()):
+        print("\t[%s] Killing remaining process" % myid)
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except OSError:
+            pass
+    status.lock.release()
+
+class status:
+    lock = None
+    current_cpu = e_ncpu
+    current_mem = e_memtot
+    running_processes = {}
+    assigned_jobs = {}
+    return_codes = {}
+    reports = {}
+    current_cpu_usage = {}
+    current_mem_usage = {}
+
+def job_monitor(jobid, process, ncpu, mem):
+    memcache = []
+    retcode = None
+    resources = None
+    lastcpureport = None
+    spend_time = 0
+
+    pid = process.pid
+    try:
+        ps = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        ps = None
+
+    start_time = time.time()
+    report_time = 0
+    last_report_time = start_time
+    status.current_cpu_usage[jobid] = 0.0
+    status.current_mem_usage[jobid] = 0.0
+    
+   
+
+    while retcode is None:
+        try:
+            res = os.wait4(process.pid,os.WNOHANG)
+            if res[0] > 0:
+                retcode = res[1]
+                resources = res[2]
+        except OSError:
+            retcode = process.poll()
+            resources = None
+        
+        cur_time = time.time()
+        
+        if (cur_time - report_time) > 30.0:
+            report_time = cur_time
+            prevspend_time = spend_time
+            if retcode is None and not ps is None:
+                try:
+                    with ps.oneshot():
+                        c = ps.cpu_times()
+                        lastcpureport={'user':c.user,'system':c.system,'children_user':c.children_user,'children_system':c.children_system, 'iowait':c.iowait}
+
+                        m = ps.memory_full_info()
+                        r = {'uss':m.uss,'rss':m.rss,'vms':m.vms, 'pss':m.pss}
+                        
+                        for m in ps.children(recursive=True):
+                            try:
+                                with m.oneshot():
+                                    cx = m.cpu_times()
+                                    for lab in ['user','system','children_user','children_system','iowait']:
+                                        lastcpureport[lab] += getattr(cx,lab)
+                                    mx = m.memory_full_info()
+                                    for lab in ['uss','rss','vms','pss']:
+                                        r[lab] += getattr(mx,lab)
+                            except psutil.AccessDenied:
+                                continue #process did probably end
+                            except psutil.NoSuchProcess:
+                                continue
+                        memcache.append(r)
+                    
+                    spend_time = lastcpureport['user'] + lastcpureport['system'] + lastcpureport['children_user'] + lastcpureport['children_system'] - prevspend_time
+                    cpu_percentage = spend_time / (report_time - last_report_time)
+                    last_report_time = report_time
+                    status.lock.acquire()
+                    status.current_cpu_usage[jobid] = cpu_percentage
+                    status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
+                    status.lock.release()
+
+                except psutil.NoSuchProcess:
+                    pass
+                except psutil.AccessDenied:
+                    pass #process did probably end
+
+
+        time.sleep(1)
+
+
+    report = {}
+    if not resources is None:
+        report['user'] = resources.ru_utime
+        report['system'] = resources.ru_stime
+        report['maxrss'] = resources.ru_maxrss / 1024.0
+    if not lastcpureport is None:
+        #note: children_x contains time of _terminated_ children. 
+        report['mon_user'] = lastcpureport['user'] + lastcpureport['children_user']
+        report['mon_system'] = lastcpureport['system'] + lastcpureport['children_system']
+        report['iowait'] = lastcpureport['iowait']
+
+    if len(memcache) > 0:
+        for lab in ['uss','rss','vms']:
+            report[lab] = list([float(e)/(1024.0 * 1024.0) for e in numpy.percentile([e[lab] for e in memcache],[0,5,25,50,75,95,100])])
+    report['runtime'] = time.time() - start_time
+    report['montime'] = report_time - start_time
+    report['retcode'] = retcode
+
+    print(("Job %s done with rcode %s" % (str(jobid), str(retcode))))
+    status.lock.acquire()
+    status.return_codes[jobid] = retcode
+    status.reports[jobid] = report
+    status.current_cpu_usage.pop(jobid, None)
+    status.current_mem_usage.pop(jobid, None)
+    status.current_cpu += ncpu
+    status.current_mem += mem
+    del status.running_processes[jobid]
+
+    event_timer.set()
+    status.lock.release()
+
+
+
+status.lock = threading.RLock()
+
+
+signal.signal(signal.SIGTERM, handler)
+
+starttime = time.time()
+last_seen = time.time()
+mode = zslurm_shared.RUNNING
+idle_start = 0
+event_timer = threading.Event()
+
+try :
+    #lengine_monitor = psutil.Process(lengine.pid)
+
+    while True:
+        sys.stderr.flush()
+        sys.stdout.flush()
+        event_timer.clear()
+
+        while status.return_codes:
+            status.lock.acquire()
+            nretcodes = {}
+            for jobid, rcode in list(status.return_codes.items()):
+                try :
+                    s.job_finished(myid, jobid, rcode,status.reports.get(jobid,{'no_job_report':True, 'jobid':jobid}))
+                    print('Reported that job %s finished with rcode %s' % (str(jobid), str(rcode)))
+
+                    status.reports.pop(jobid,None)
+                except (socket.error, httplib.HTTPException) as serror :
+                    print('[%s] Caught a socket error at time %f for jobid %s!' % (myid, time.time(), str(jobid)))
+                    nretcodes[jobid] = rcode
+            status.return_codes = nretcodes
+            status.lock.release()
+            if status.return_codes:
+                time.sleep(PING_INTERVAL) #retry later
+       
+       
+        mb_memory_available = e_memtot - sum(status.current_mem_usage.values(),0.0)
+        
+        status.lock.acquire()   
+        if mode == zslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0 and mb_memory_available > 1024.0:
+            if status.assigned_jobs:
+                jobs = list(status.assigned_jobs.values())
+            else:
+                try:
+                    jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available), partition)
+                except (socket.error, httplib.HTTPException) as serror :
+                    jobs = []
+            for job in jobs: 
+                jobid, command, cwd, env, ncpu, mem, state = job
+                if state == 'ASSIGNED':
+                    if status.current_cpu >= ncpu and min(status.current_mem,mb_memory_available) >= mem:
+                        status.assigned_jobs.pop(jobid,None)
+                        try :
+                            permission = s.can_run_assigned_job(myid, jobid)
+                        except (socket.error, httplib.HTTPException) as serror :
+                            continue
+                        if not permission: #drop
+                            continue
+
+                    else:
+                        status.assigned_jobs[jobid] = job
+                        continue
+
+                #start job
+                curdir = os.getcwd()
+                os.chdir(cwd)
+
+                logfile = open('zslurm-%s.out' % jobid,'w')
+
+                command = shlex.split(command)
+                try:
+                    process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
+
+                    status.current_cpu -= ncpu
+                    status.current_mem -= mem
+                    status.running_processes[jobid] = process
+                    
+                    os.chdir(curdir)
+                    #start monitoring
+                    t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem))
+                    t.start()
+                except:
+                    status.return_codes[jobid] = -20
+                        
+                    os.chdir(curdir)
+
+                
+
+        status.lock.release()
+
+        if mode == zslurm_shared.STOPPING and not status.running_processes:
+            break
+
+           
+        #POLL
+        cpu_usage = (sum(status.current_cpu_usage.values(),0.0) / e_ncpu) * 100.0
+        mem_usage = (sum(status.current_mem_usage.values(), 0.0) / e_memtot) * 100.0
+        load = psutil.getloadavg()[0] / float(psutil.cpu_count())
+        idle = len(status.running_processes) == 0
+        if idle and idle_start == 0:
+            idle_start = time.time()
+        elif not idle:
+            idle_start = 0
+        try:
+            if idle_start == 0:
+                commands = s.poll(myid, cpu_usage, mem_usage, load,mode, 0.0, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
+            else:
+                commands = s.poll(myid, cpu_usage, mem_usage, load, mode, time.time() - idle_start, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
+            last_seen = time.time()
+        except (socket.error, httplib.HTTPException) as serror :
+            print('[%s] Caught a socket error for command poll !' % myid)
+            if time.time() - last_seen > PING_TIMEOUT:
+                print('[%s] Timeout triggered!' % myid)
+                mode=zslurm_shared.STOPPING
+
+
+        cancel_job_list = []
+        for cmd, param in commands:
+            if (cmd == zslurm_shared.STOP) :
+                print('[%s] Received command to stop.' % myid)
+                mode = zslurm_shared.STOPPING
+            elif (cmd == zslurm_shared.DIE):
+                print('[%s] Received command to die.' % myid)
+                mode = zslurm_shared.STOPPING
+
+                terminate_jobs()
+            elif (cmd == zslurm_shared.DEASSIGN):
+                print(('[%s] Received command to deassign job: ' % myid)+ str(param))
+                status.lock.acquire()
+                jobid = param
+                status.assigned_jobs.pop(jobid,None)
+                status.lock.release()
+            elif (cmd == zslurm_shared.CANCEL):
+                print(('[%s] Received command to cancel job: ' % myid)+ str(param))
+                cancel_job_list.append(param)
+
+            elif (cmd == zslurm_shared.REREGISTER):
+                print(('[%s] Received command to reregister.' % myid))
+                try:
+                    myid = s.register(myip, e_ncpu, e_memtot, partition, clusterid)
+                except (socket.error, httplib.HTTPException) as serror :
+                    pass
+                if myid == 'DENIED':
+                    print(('[%s] Denied reregistration, stopping.' %myid))
+                    mode = zslurm_shared.STOPPING
+
+            else :
+                print("[%s] UNKNOWN COMMAND RECEIVED, EXITING!" %myid)
+                break
+        if cancel_job_list:
+            status.lock.acquire()
+            for jobid in cancel_job_list:
+                if jobid in status.running_processes:
+                    p = status.running_processes[jobid]
+                    try:
+                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    except OSError:
+                        pass
+            status.lock.release()
+            
+            time.sleep(10) #allow jobs some time to terminate normally
+
+            #kill any remaining jobs
+            status.lock.acquire()
+            for jobid in cancel_job_list:
+                if jobid in status.running_processes:
+                    p = status.running_processes[jobid]
+                    try:
+                        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    except OSError:
+                        pass
+            status.lock.release()
+
+
+        event_timer.wait(PING_INTERVAL)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    s.unregister(myid)
+
+
+except (Exception, KeyboardInterrupt, SystemExit) :
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    s.unregister(myid)
+    raise

@@ -1,0 +1,1587 @@
+#!/usr/bin/env python
+import curses, curses.textpad, curses.ascii
+import os
+import subprocess, sys, getopt, time,shlex
+from subprocess import Popen
+try:
+    import _thread
+    from xmlrpc.server import SimpleXMLRPCServer
+except:
+    import thread as _thread
+    from SimpleXMLRPCServer import SimpleXMLRPCServer
+import threading
+from collections import defaultdict, OrderedDict
+
+import random
+import psutil
+import numpy
+import getpass
+
+import zslurm_shared
+import ipyparallel
+
+mylocal_id = zslurm_shared.short_name(zslurm_shared.get_hostname())
+
+WHITE=0
+RED=1
+GREEN=2
+YELLOW=3
+MAGENTA=4
+BLUE=5
+CYAN=6
+
+TIMEOUT = 1200
+
+#current screen info
+class gb:
+    scr = None
+    lock = None
+
+    wlog = None
+    wlog_currow = 0
+    wlog_size = (0,0)
+
+    wcom = None
+    wcom_status = None
+    
+    wstatus = None
+    wstatus_progress = None
+
+
+
+class Servers:
+    manager_server = None
+    job_server = None
+
+
+class Status(object):
+    def __init__(self):
+        self.stop_status_display = False
+        self.address = ''
+        self.port = 0
+        self.kill_idle = False
+        self.lastin_first = False
+        self.used_load = numpy.array([],dtype=float)
+        self.used_cpus = numpy.array([],dtype=float)
+        self.used_mem = numpy.array([],dtype=float)
+        self.total_cpus = numpy.array([],dtype=float)
+        self.total_mem = numpy.array([],dtype=float)
+
+
+    def set_address(self, address, port):
+        self.address = address
+        self.port = port
+
+status = Status()
+
+
+def parse_timeleft(time):
+    time = time.split('-')
+    if len(time) > 1:
+        days = int(time[0])
+        time = time[1]
+    else:
+        days = 0
+        time = time[0]
+    time = [int(e) for e in time.split(':')]
+    
+    if len(time) == 3:
+        hours = time[0]
+        time = time[1:]
+    else:
+        hours = 0
+
+    if len(time) == 2:
+        minutes = time[0]
+        time = time[1:]
+    else:
+        minutes = 0
+    seconds = time[0]
+    
+    return (days * 24 * 60 + hours * 60 + minutes)
+
+queue_states = set(['PENDING', 'REQUEUED'])
+
+class Job(object):
+    def __init__(self, job_name, jobid, command, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition):
+        self.job_name = job_name
+        self.jobid = jobid
+        self.command = command
+        self.cwd = cwd
+        self.env =env
+        self.ncpu = ncpu
+        self.mem = mem
+        self.reqtime = reqtime
+        self.requeue = requeue
+        self.dependency = dependency
+        self.archive_start_use_add = arch_use_add
+        self.archive_end_use_remove = arch_use_remove
+        self.active_start_use_add = active_use_add
+        self.active_end_use_remove = active_use_remove
+        self.dcache_start_use_add = dcache_use_add
+        self.dcache_end_use_remove = dcache_use_remove
+        self.partition = partition
+
+
+
+        self.state= 'PENDING'
+        self.node_id = None
+        self.starttime = None
+        self.endtime = None
+        self.current_cpu_usage = 0.0
+        self.current_mem_usage = 0.0
+
+
+
+
+class JobManager(object):
+    def __init__(self):
+        self.jobid_counter = numpy.random.randint(0, 1000000)
+
+        self.jobs_by_id = OrderedDict()
+
+        self.jobs_done_counter = 0
+        self.lock = threading.RLock()
+
+        self.failed_jobs = 0
+        self.running_jobs = 0
+        self.total_jobs = 0
+
+        self.active_total = 0
+        self.active_inuse = 0
+        self.archive_total = 0
+        self.archive_inuse = 0
+        self.dcache_total = 0
+        self.dcache_inuse = 0 
+   
+    
+    def get_job_stats(self):
+        return (self.total_jobs, self.running_jobs, self.failed_jobs, self.jobs_done_counter)
+    
+
+    def active_engines(self):
+        nodes = set()
+        for job in list(self.jobs_by_id.values()):
+            if not job.node_id is None:
+                nodes.add(job.node_id)
+        return nodes
+   
+
+
+    def prioritize(self, job_pattern):
+        self._reorder_jobs(job_pattern, not status.lastin_first)
+
+    def deprioritize(self, job_pattern):
+        self._reorder_jobs(job_pattern, status.lastin_first)
+
+    def _reorder_jobs(self, job_pattern, up=True):
+        self.lock.acquire()
+        try:
+            ndict = OrderedDict()
+            if up:
+                for jobid, job in list(self.jobs_by_id.items()):
+                    if job_pattern in job.job_name:
+                        ndict[jobid] = job
+                for jobid, job in list(self.jobs_by_id.items()):
+                    if not job_pattern in job.job_name:
+                        ndict[jobid] = job
+            else:
+                for jobid, job in list(self.jobs_by_id.items()):
+                    if not job_pattern in job.job_name:
+                        ndict[jobid] = job
+                for jobid, job in list(self.jobs_by_id.items()):
+                    if job_pattern in job.job_name:
+                        ndict[jobid] = job
+               
+            self.jobs_by_id = ndict
+        finally:
+            self.lock.release()
+
+       
+
+    def submit_job(self, job_name, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition):
+
+        self.lock.acquire()
+        jobid = str(self.jobid_counter)
+        self.jobid_counter += 1
+        self.total_jobs += 1
+        self.lock.release()
+    
+
+        #weird xml-rpc problem?
+        if len(env) == 1 and 'data' in env:
+            env = env['data']
+
+        job = Job(job_name, jobid, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, float(arch_use_add), float(arch_use_remove), float(dcache_use_add), float(dcache_use_remove), float(active_use_add), float(active_use_remove), partition)
+
+        self.jobs_by_id[jobid] = job
+
+        if arch_use_add or arch_use_remove or dcache_use_add or dcache_use_remove or active_use_add or active_use_remove:
+            add_log_line(gb,"Job %s (id: %s, ncore: %d, mem: %d mb, partition: %s, arch+: %d GB, arch-: %d GB, d+: %d GB, d-: %d GB, active+: %d GB, active-: %d GB) submitted." % (job_name, jobid, ncpu, mem, partition, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove),GREEN)
+        else:
+            add_log_line(gb,"Job %s (id: %s, ncore: %d, mem: %d mb, partition: %s) submitted." % (job_name, jobid, ncpu, mem, partition),GREEN)
+        return jobid
+
+    def cancel_job(self, jobid):
+        self.lock.acquire()
+        try:
+            job = None
+            if jobid in self.jobs_by_id:
+                job = self.jobs_by_id[jobid]
+                if job.state == 'RUNNING':
+                    node_id = job.node_id
+                    job.requeue = 0 #prevent restart
+                    job.reason = "Awaiting cancellation at worker node"
+
+                    try:
+                        engines.send_command(node_id, zslurm_shared.CANCEL, jobid)
+                    except:
+                        pass
+
+                    add_log_line(gb,"Job %s (id: %s, running on %s) has been send a cancel signal." % (job.job_name, job.jobid, job.node_id),YELLOW)
+                    #now wait for cancel to propagate
+                elif job.state == 'ASSIGNED':
+                    node_id = job.node_id
+                    try:
+                        engines.send_command(node_id, zslurm_shared.DEASSIGN, jobid)
+                    except:
+                        pass
+                    self.job_done(job.jobid, -255, 'Cancelled by user')
+                else:
+                    self.job_done(job.jobid, -255, 'Cancelled by user')
+                    add_log_line(gb,"Job %s (id: %s) cancelled." % (job.job_name, job.jobid),YELLOW)
+                job.state = 'CANCELLED'
+            else:
+                add_log_line(gb,"Attempt to cancel unknown job (id: %s)." % jobid,YELLOW)
+        finally:
+            self.lock.release()
+
+    def list_done_jobs(self):
+        return []
+
+        #jobs = []
+        #for job in self.jobs_done:
+        #    if not job.starttime is None and not job.endtime is None:
+        #        runtime = job.endtime - job.starttime
+        #    else:
+        #        runtime = 0.0
+
+        #    jobs.append([job.jobid, job.job_name, job.state, runtime, job.ncpu, job.partition, job.reason])
+
+        #return jobs        
+ 
+
+    def list_jobs(self):
+        jobs = []
+        for job in list(self.jobs_by_id.values()):
+            if not job.starttime is None:
+                runtime = time.time() - job.starttime
+            else:
+                runtime = 0.0
+
+            if job.node_id is None:
+                node_id = '(Resources)'
+            else:
+                node_id = job.node_id
+
+            jobs.append([job.jobid, job.job_name, job.state, runtime, job.ncpu, job.partition, node_id, job.current_cpu_usage, job.current_mem_usage])
+
+        return jobs        
+    
+    def request_jobs(self, myid,current_cpu, current_mem, partition):
+        #add_log_line(gb,"Node %s requests for job with %d cpus and %d mb mem" % (myid, current_cpu, current_mem), BLUE)
+
+        if not myid in engines.engine_by_id or engines.engine_by_id[myid] is None:
+            timeleft = 5 * 24 * 60 * 60
+            cores = 24
+            totmem = 64000
+        else:
+            timeleft = int(engines.engine_by_id[myid].timeleft)
+            cores = engines.engine_by_id[myid].cores
+            totmem = engines.engine_by_id[myid].totmem
+
+        self.lock.acquire()
+        try:
+            allres = []
+            joblist = list(self.jobs_by_id.values())
+            if status.lastin_first:
+                joblist = joblist[::-1]
+            for job in joblist:
+                #FIXME; assume 5 days of time
+                if job.state in queue_states and job.reqtime <= timeleft and job.ncpu <= cores and job.mem <= totmem and job.partition == partition and \
+                    ((self.active_total >= (self.active_inuse + job.active_start_use_add)) or job.active_start_use_add == 0) and \
+                    ((self.dcache_total >= (self.dcache_inuse + job.dcache_start_use_add)) or job.dcache_start_use_add == 0) and \
+                    ((self.archive_total >= (self.archive_inuse + job.archive_start_use_add)) or job.archive_start_use_add == 0):
+
+                    self.active_inuse += job.active_start_use_add
+                    self.dcache_inuse += job.dcache_start_use_add
+                    self.archive_inuse += job.archive_start_use_add
+
+                    if not (job.ncpu <= current_cpu and job.mem <= current_mem):
+                        job.state = 'ASSIGNED'
+                        add_log_line(gb,"Job %s (id: %s) assigned to node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
+                    else:
+                        job.state = 'RUNNING'
+                        add_log_line(gb,"Job %s (id: %s) started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
+                        self.running_jobs += 1
+                        job.starttime = time.time()
+               
+                    current_cpu -= job.ncpu
+                    current_mem -= job.mem
+
+                    job.node_id = myid
+
+                    res =  (job.jobid, job.command, job.cwd, job.env, job.ncpu, job.mem, job.state)
+                    allres.append(res)
+                    if current_cpu <= 0 or current_mem <= 0:
+                        break
+            
+            if current_cpu > 0:
+                joblist = list(self.jobs_by_id.values())
+                if status.lastin_first:
+                    joblist = joblist[::-1]
+                for job in joblist:
+                    #FIXME; assume 5 days of time
+                    if job.state == 'ASSIGNED' and job.reqtime <= timeleft and job.ncpu <= current_cpu and job.mem <= current_mem and job.partition == partition:
+                        try:
+                            engines.send_command(job.node_id, zslurm_shared.DEASSIGN, job.jobid)
+                        except KeyError:
+                            pass
+
+                        job.state = 'RUNNING'
+                        add_log_line(gb,"Job %s (id: %s) reassigned and started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu, current_mem), BLUE)
+                        self.running_jobs += 1
+                        job.starttime = time.time()
+                
+                        current_cpu -= job.ncpu
+                        current_mem -= job.mem
+
+                        job.node_id = myid
+
+                        res =  (job.jobid, job.command, job.cwd, job.env, job.ncpu, job.mem, job.state)
+                        allres.append(res)
+                        if current_cpu <= 0 or current_mem <= 0:
+                            break
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            raise
+        finally:            
+            self.lock.release()
+        return allres
+
+    def engine_removed(self, engine_id, reason='Engine disappeared'):
+        self.lock.acquire()
+        try:
+            for job in list(self.jobs_by_id.values()):
+                if job.node_id == engine_id:
+                    if job.state == 'RUNNING':
+                        self.job_done(job.jobid, -1, reason=reason)
+                    elif job.state == 'ASSIGNED':
+                        job.state = 'PENDING'
+        finally:
+            self.lock.release()
+
+    def can_run_assigned_job(self, nodeid, jobid):
+        self.lock.acquire()
+        try:
+            res = False #DROP
+            if jobid in self.jobs_by_id:
+                job = self.jobs_by_id[jobid]
+                if job.state == 'ASSIGNED':
+                    self.job_start(nodeid, jobid)
+                    res = True
+        finally:
+            self.lock.release()
+        return res
+
+    def job_start(self, node_id, jobid):
+        self.lock.acquire()
+        try:
+            job = self.jobs_by_id[jobid]
+            job.state = 'RUNNING'
+            self.running_jobs += 1
+            job.starttime = time.time()
+            job.node_id = node_id
+
+        finally:        
+            self.lock.release()
+        
+
+    def job_done(self, jobid, return_code, reason='No Reason'):
+        #FIXME: add in requeue stuff
+        self.lock.acquire()
+        try: 
+            job = self.jobs_by_id.get(jobid,None)
+            if not job is None:
+                if not job.node_id is None:
+                    if return_code == 0:
+                        self.active_inuse -= job.active_end_use_remove
+                        self.archive_inuse -= job.archive_end_use_remove
+                        self.dcache_inuse -= job.dcache_end_use_remove
+                    else: #failed job, assume space is free again
+                        self.active_inuse -= job.active_start_use_add
+                        self.archive_inuse -= job.archive_start_use_add
+                        self.dcache_inuse -= job.dcache_start_use_add
+
+                if not job.node_id is None and not return_code == -255:
+                    job.endtime = time.time()
+                    job.node_id = None
+                    self.running_jobs -=1
+
+                if return_code != 0 and return_code != -255 and return_code != 15 and job.requeue > 0: #-255 is cancelled
+                    job.requeue -= 1
+                    job.mem = job.mem * 2
+                    job.state = 'REQUEUED'
+                    job.starttime = None
+                else:
+                    job =  self.jobs_by_id[jobid]
+                    del self.jobs_by_id[jobid]
+                    self.jobs_done_counter += 1
+                    self.total_jobs -= 1
+
+                    if return_code != 0 and return_code != -255 and return_code != 15:
+                        self.failed_jobs += 1
+
+                job.return_code = return_code
+                job.reason = reason
+        finally:        
+            self.lock.release()
+        if not job is None:
+            return job.job_name
+        else:
+            return ""
+
+    def job_finished(self, myid, jobid, return_code,report):
+        self.lock.acquire()
+        if return_code == 0:
+            reason = 'Job Finished'
+        elif return_code == 143 or return_code == 15:
+            reason = 'Job Terminated'
+        elif return_code == 137:
+            reason = 'Job Killed'
+        elif return_code == 130:
+            reason = 'Job Interrupted'
+        else:
+            reason = 'Job Failed (errorcode: %d)' % return_code
+        
+           
+        name = 'unknown'
+        try:
+            if not jobid in self.jobs_by_id:
+                add_log_line(gb,"Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),YELLOW)
+            else:
+                name = self.job_done(jobid, return_code, reason)
+            
+        finally:
+            self.lock.release()
+       
+        if 'uss' in report:
+            line = [name, myid]
+            for lab in ['uss','rss','vms']:
+                line.extend(report[lab])
+            for lab in ['runtime','montime','user','system','maxrss','mon_user','mon_system','iowait','retcode']:
+                line.append(report.get(lab,''))
+            status.reports_file.write('\t'.join([str(e) for e in line])  + '\n')
+            status.reports_file.flush()
+
+        if return_code == 0:
+            add_log_line(gb,"Job %s (id: %s) completed." % (name, jobid),GREEN)
+        else:
+            add_log_line(gb,"Job %s (id: %s, node: %s) failed, reason: %s."  % (name, jobid, myid, reason),YELLOW)
+
+
+jobs = JobManager()
+submit_job = lambda *args: jobs.submit_job(*args)
+cancel_job = lambda *args: jobs.cancel_job(*args)
+list_jobs = lambda *args: jobs.list_jobs(*args)
+list_done_jobs = lambda *args: jobs.list_done_jobs(*args)
+request_jobs = lambda *args: jobs.request_jobs(*args)
+job_finished = lambda *args: jobs.job_finished(*args)
+can_run_assigned_job = lambda *args: jobs.can_run_assigned_job(*args)
+
+
+def thread_start_job_server(port):
+    server = SimpleXMLRPCServer(("", int(port)), logRequests = False, allow_none=True)
+    server.register_function(submit_job, "submit_job")
+    server.register_function(cancel_job, "cancel_job")
+    server.register_function(list_jobs, "list_jobs")
+    server.register_function(list_done_jobs, "list_done_jobs")
+    server.register_function(list_nodes, "list_nodes")
+    Servers.job_server = server
+    server.serve_forever()
+
+
+
+
+class Engine(object):
+    def __init__(self, engine_id, cores, totmem, partition):
+        self.engine_id = engine_id
+        self.cluster_id = None
+
+        self.cores = cores
+        self.totmem = totmem
+        self.starttime = time.time()
+        self.timeleft = 5 * 24 * 60 * 60
+        self.lastseen = time.time()
+
+        self.pending_commands = []
+        self.jobs = []
+
+        self.cpu_usage = 0.0
+        self.mem_usage = 0.0
+        self.load = 0.0
+
+        self.partition = partition
+
+
+
+class EngineManager(object):
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.engine_by_id = {}
+        
+        self.engine_by_clusterid = {}
+        self.local_engine_process = None
+
+        self.cluster_queued_engines = 0
+        self.cluster_running_engines = 0
+
+        self.cluster_queued_engines_archive = 0
+        self.cluster_running_engines_archive = 0
+
+
+    def list_nodes(self):
+        result = []
+        for e in list(self.engine_by_id.values()):
+            result.append((e.partition, e.cluster_id if e.cluster_id is not False else '(local)', e.cores, e.totmem, time.time() - e.starttime, len(e.jobs), e.cpu_usage, e.mem_usage, e.load))
+        return result            
+
+
+    def send_command(self, nodeid, command, param=None):
+        self.lock.acquire()
+        try:
+            engines.engine_by_id[nodeid].pending_commands.append((command,param))
+        finally:    
+            self.lock.release()
+
+    
+
+    def check_local_engine(self):
+        if not self.local_engine_process is None and self.local_engine_process.poll() != None:
+            self.lock.acquire()
+            if not self.local_engine_process is None and self.local_engine_process.poll() != None: #recheck within lock
+                self.local_engine_process = None
+            self.lock.release()
+
+        return self.local_engine_process != None
+    
+    
+    def _check_cluster_engines(self):
+        cmd = "squeue -h -r --user " + getpass.getuser() + " --name zslurm -o '%i|%L|%t|%N|%P'" 
+
+        args = shlex.split(cmd)
+        try:
+            p = Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            output = p.communicate()[0]
+            if isinstance(output, bytes):
+                output = output.decode('utf-8')
+        except OSError:
+            #lets assume this is temporary
+            return
+
+        output = [e.strip().split('|')  for e in output.split("\n") if e]
+
+        z = defaultdict(int)
+        
+        observed_cluster_ids = set()
+        nqueue = 0
+        nqueue_archive = 0
+        nrunning = 0
+        nrunning_archive = 0
+        for cid, ctime, cstate, cnode,cpartition in output:
+            observed_cluster_ids.add(cid)
+            if cstate == 'CG': #cleaning up
+                continue
+            
+            if not cid in self.engine_by_clusterid:
+                continue #needs to register first
+
+            if cpartition == 'staging':
+                if cstate == 'R':
+                    nrunning_archive += 1
+                else:
+                    nqueue_archive += 1
+            else:
+                if cstate == 'R':
+                    nrunning += 1
+                else:
+                    nqueue += 1
+
+            engine = self.engine_by_clusterid[cid]
+            if cstate == 'R':
+                engine.timeleft = parse_timeleft(ctime)
+
+            z[cstate] += 1
+
+        for cid,engine in list(self.engine_by_clusterid.items()):
+            if not engine.cluster_id in observed_cluster_ids:
+                add_log_line(gb, f'Engine {engine.engine_id} @ {engine.cluster_id} disappeared from Slurm..', RED)
+                self._unregister(engine.engine_id, 'Engine disappeared')
+                
+        self.cluster_queued_engines = nqueue
+        self.cluster_running_engines = nrunning
+        self.cluster_queued_engines_archive = nqueue_archive
+        self.cluster_running_engines_archive = nrunning_archive
+
+
+    def count_cluster_engines(self):
+        return len(self.engine_by_clusterid)
+
+    def start_local(self, gb, ncpu, mem):
+        self.lock.acquire()
+        try:
+            if(not self.local_engine_process is None):
+                set_status_message(gb,"Local engine already started!", YELLOW)
+            elif(ncpu <= 0 or mem <= 0):
+                set_status_message(gb,"Invalid cpu (%d) or mem (%.2g gb) constraint. " % (ncpu, mem / 1024.0), YELLOW)
+            else: 
+                set_status_message(gb,"Starting local engines", YELLOW)
+                chief_path = "zslurm_chief"
+                cmd = chief_path + " -a " + str(status.address) + " -p " + str(status.port) + " -c %d" % ncpu
+                add_log_line(gb,"Starting local engine using: " + cmd, GREEN)
+                args = shlex.split(cmd)
+            
+                e = Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                log_output(e.stdout,gb,MAGENTA)
+                log_output(e.stderr,gb,RED)
+                self.local_engine_process = e
+
+                set_status_message(gb,"Local engine started", GREEN)
+                add_log_line(gb,"Local engine started", MAGENTA)
+        finally:
+            self.lock.release()
+
+    def stop_local(self, gb):
+        if(self.local_engine_process is None):
+            set_status_message(gb,"No local engine running",YELLOW)
+        else:
+            set_status_message(gb,"Stopping local engine",YELLOW)
+            stop_engine = self.local_engine_process
+            if stop_engine.poll() is None:
+                add_log_line(gb,"Termination signal send to local engine",MAGENTA)
+                stop_engine.terminate()
+            
+
+            for engine in list(self.engine_by_id.values()):
+                if engine.cluster_id is False:
+                    self.send_command(engine.engine_id, zslurm_shared.DIE) 
+            
+            counter = 65
+            while counter > 0 and stop_engine.poll() is None:
+                if (counter % 10) == 0:
+                    add_log_line(gb,"Waiting %d seconds for local engine to terminate..." % counter,MAGENTA)
+                time.sleep(1)
+                counter -= 1
+            if stop_engine.poll() is None:
+                stop_engine.kill()
+                add_log_line(gb,"Send local engine a kill signal...",RED)
+            
+            self.local_engine_process = None
+            set_status_message(gb,"Local engine terminated",GREEN)
+
+    #FIXME
+    def start_slurm(self, gb,n, stime, partition, constraint, cores):
+        self.lock.acquire()
+        try:
+           if(n < 0):
+                set_status_message(gb,"Invalid number of engines to be started: " + str(n),YELLOW)
+           else: 
+                set_status_message(gb,"Starting SLURM engines",YELLOW)
+                engine_path = "slurm_to_zslurm"
+                if constraint:
+                    constraint = '--constraint ' + constraint
+                if cores > 0:
+                    allocation = f'--cpus-per-task={cores}'
+                else:
+                    allocation = '--exclusive'
+                if n > 1:
+                    cmd = f"sbatch -N 1 -p {partition} {allocation} {constraint} --parsable --array=0-{n-1} -J zslurm -t " 
+                else:
+                    cmd = f"sbatch -N 1 -p {partition} {allocation} {constraint} --parsable -J zslurm -t "
+               
+                cmd = cmd + stime
+
+                if partition == 'staging':
+                    #check for existing nodes
+                    xlist = []
+                    for eid, engine in self.engine_by_id.items():
+                        if engine.partition == 'archive':
+                            xlist.append(eid)
+                    if xlist:
+                        cmd = cmd + ' --exclude=' + ','.join(xlist) + ' ' 
+
+                    lpartition = 'archive'
+                else:
+                    lpartition = 'compute'
+
+
+                cmd = cmd + " slurm_to_zslurm -a " + str(status.address) + " -p " + str(status.port)
+                cmd = cmd + " -t " + lpartition
+
+                if cores > 0:
+                    cmd = cmd + f' -c {cores}'
+
+                args = shlex.split(cmd)
+            
+                eid = Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE).communicate()[0]
+                if isinstance(eid,bytes):
+                    eid = eid.decode('utf-8')
+
+                eid  = eid.strip()
+                add_log_line(gb,"Queueing engines (%s) using: " % eid + cmd,GREEN)
+                if 'error' in eid or not eid:
+                    add_log_line(gb, 'Error during SLURM submission.', RED)
+                    return
+
+
+                time.sleep(3)
+                set_status_message(gb,"SLURM engines queued",GREEN)
+                add_log_line(gb,str(n) + " SLURM engines queued",MAGENTA)
+        finally:
+            self.lock.release()
+
+    #FIXME: jobs running removal, priority of cancelling less active nodes
+    def stop_slurm(self, gb,n):
+        self.lock.acquire()
+        try:
+            if(self.count_cluster_engines() == 0 and n != 0):
+                set_status_message(gb,"No SLURM engines running",YELLOW)
+            elif(n < 0 or n > self.count_cluster_engines()):
+                set_status_message(gb,"Invalid number of engines to be stopped: " + str(n),YELLOW)
+            else:
+                set_status_message(gb,"Stopping SLURM engines",YELLOW)
+
+                #stop queued engines
+                stop_engines = []
+                
+                for cid, engine in list(self.engine_by_clusterid.items()):
+                    if engine is None:
+                        stop_engines.append(cid)
+               
+                stop_engines.sort()
+                stop_engines = stop_engines[::-1] #cancel youngest non-running engine
+
+                #stop idle engines
+                if len(stop_engines) < n:
+                    stop_engines2 = []
+                    for cid, engine in list(self.engine_by_clusterid.items()):
+                        if engine is None:
+                            continue
+                        if len(engine.jobs) == 0: 
+                            stop_engines2.append(cid)
+                    stop_engines2.sort() #cancel oldest running engine
+                    stop_engines = stop_engines + stop_engines2
+
+                #stop oldest engines
+                if len(stop_engines) < n:
+                    stop_engines2 = []
+                    for cid, engine in list(self.engine_by_clusterid.items()):
+                        if engine is None:
+                            continue
+                        if not cid in stop_engines:
+                            stop_engines2.append(cid)
+                    stop_engines2.sort() #cancel oldest running engine
+                    stop_engines = stop_engines + stop_engines2
+
+
+                stop_engines = stop_engines[:n]
+                
+                add_log_line(gb, "Stop engines: %s" % str(stop_engines), CYAN)
+                
+                set_progress_bar(gb,0.0)
+                for pos, eid in enumerate(stop_engines):
+                    self.cancel_cid(eid)
+                    set_progress_bar(gb,float(pos+1)/float(n))
+                
+                time.sleep(2)
+                stop_progress_bar(gb)
+                set_status_message(gb,"SLURM engines stopped",GREEN)
+                add_log_line(gb,str(n) + " SLURM engines stopped",MAGENTA)
+        finally: 
+            self.lock.release()
+
+    def cancel_cid(self, cid):
+        self.lock.acquire()
+        try:
+            cmd = "scancel " + str(cid)
+            args = shlex.split(cmd)
+            add_log_line(gb, "Cancelling using command: " + cmd, CYAN)
+            p = Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            log_output(p.stdout,gb,WHITE)
+            log_output(p.stderr,gb,RED)
+            p.wait()
+            
+            if cid in self.engine_by_clusterid:
+                e = self.engine_by_clusterid[cid]
+                if not e is None:
+                    self._unregister(e.engine_id, reason='Engine stopped')
+        finally:
+            self.lock.release()
+   
+
+    def stop_all(self):
+        if self.count_cluster_engines() > 0:
+            add_log_line(gb,"Terminating SLURM engines.", RED)
+            self.stop_slurm(gb, self.count_cluster_engines())
+        if self.check_local_engine():
+            add_log_line(gb,"Terminating local engine.", RED)
+            self.stop_local(gb)
+    
+    
+    def register(self, myip,cores,totmem, partition, cluster_jobid):
+        self.lock.acquire()
+        try:
+            myid = zslurm_shared.short_name(myip)
+
+            myx = myid
+            counter = 1
+            while myx in self.engine_by_id:
+                counter += 1
+                myx = f'{myid}-{counter}'
+            myid = myx                
+
+            e = Engine(myid, cores, totmem, partition)
+            e.timeleft = 5 * 24 * 60 * 60
+            
+            self.engine_by_id[myid] = e
+            if myid == zslurm_shared.short_name(status.address):
+                e.cluster_id = False
+            else:
+                e.cluster_id = cluster_jobid
+
+            self.engine_by_clusterid[cluster_jobid] = e
+        
+            totalgb = totmem / 1024.0
+            average_use = totalgb / float(cores)
+        
+            add_log_line(gb,"Engine (" + str(cores) + "C:" + "{:1.1f}".format(average_use) + f" GB, {partition}) on {myid} is now online @ {cluster_jobid}",CYAN)
+        
+        except Exception as e:            
+            add_log_line(gb,"Exception in register: " + str(e),RED)
+        finally:
+            self.lock.release()
+        return myid
+
+    def poll(self, myid, cpu_usage, mem_usage, load, mode, idle, current_cpu_usage, current_mem_usage):
+        try:
+            e = self.engine_by_id[myid]
+            e.cpu_usage = cpu_usage
+            e.mem_usage = mem_usage
+            e.load = load
+            e.lastseen = time.time()
+           
+            commands = e.pending_commands
+            # kill if idle for 3 minutes, but not if local engine or archive engine  (except if no extra jobs)
+            if idle > 180.0 and (e.partition != 'archive' or (jobs.running_jobs == 0)) and status.kill_idle and not myid == zslurm_shared.short_name(status.address):
+                add_log_line(gb,"Stopping idle engine: " + myid, YELLOW)
+
+                commands.append((zslurm_shared.STOP,None))
+
+            if commands:
+                self.lock.acquire()
+                commands = e.pending_commands
+                e.pending_commands = []
+                self.lock.release()
+
+            for jobid,value in current_cpu_usage.items():
+                job = jobs.jobs_by_id.get(jobid,None)
+                if not job is None:
+                   job.current_cpu_usage = value
+                   mem = current_mem_usage.get(jobid, 0.0)
+                   job.current_mem_usage = mem
+                    
+
+
+        except KeyError:
+            commands = []
+            if mode == zslurm_shared.STOPPING:
+                add_log_line(gb,"Poll for unknown engine id: " + myid + ". Engine is stopping.",RED)
+                commands.append((zslurm_shared.STOP,None))
+            else:
+                add_log_line(gb,"Poll for unknown engine id: " + myid + ". Taking ownership.",RED)
+                commands.append((zslurm_shared.REREGISTER,None))
+
+        return commands
+            
+    def unregister(self, myid):
+        self._unregister(myid, 'Engine unregistered')
+        add_log_line(gb,"Engine with id " + myid + " unregistered",CYAN)
+        return True
+
+    def terminate_engine(self, myid):
+        self.lock.acquire()
+        try:
+            e = self.engine_by_id[myid]
+            if not (e.cluster_id is None or e.cluster_id is False) and e.cluster_id in self.engine_by_clusterid:
+                self.cancel_cid(e.cluster_id)
+            if e.cluster_id is False:
+                self.stop_local(gb)
+        finally:
+            self.lock.release()
+
+    def _unregister(self, myid, reason='Engine disappeared'):
+        jobs.engine_removed(myid, reason=reason)
+        self.lock.acquire()
+        try:
+            if myid in self.engine_by_id:
+                e = self.engine_by_id[myid]
+                if e.cluster_id in self.engine_by_clusterid:
+                    del self.engine_by_clusterid[e.cluster_id]
+                del self.engine_by_id[myid]
+            
+        finally:
+            self.lock.release()
+    
+    
+
+engines = EngineManager()
+unregister = lambda *args: engines.unregister(*args)
+poll = lambda *args: engines.poll(*args)
+register = lambda *args: engines.register(*args)
+list_nodes = lambda *args: engines.list_nodes(*args)
+
+def thread_check_commands():
+    while 1:
+        
+        engines.lock.acquire()
+        try:
+            engines._check_cluster_engines()
+            all_engines = list(engines.engine_by_id.values())
+        finally:
+            engines.lock.release()
+        
+        now = time.time()
+        for engine in all_engines:
+            if now - engine.lastseen > TIMEOUT:
+                engines.terminate_engine(engine.engine_id)
+                engines._unregister(engine.engine_id, 'Engine timed out')
+                add_log_line(gb,"Engine with id " + engine.engine_id + " timed out",RED)
+        
+        used_cpus = []
+        used_mem = []
+        used_load = []
+        total_cpus = []
+        total_mem = []
+        for engine in all_engines:
+            total_cpus.append(engine.cores)
+            total_mem.append(engine.totmem / 1024.0)
+
+            used_cpus.append(engine.cores * (engine.cpu_usage / 100.0))
+            used_mem.append((engine.totmem / 1024.0) * (engine.mem_usage/100.0))
+            used_load.append(engine.cores * engine.load)
+
+
+        status.used_cpus = numpy.array(used_cpus)
+        status.used_load = numpy.array(used_load)
+        status.total_cpus = numpy.array(total_cpus,dtype=float)
+        status.used_mem = numpy.array(used_mem,dtype=float)
+        status.total_mem = numpy.array(total_mem,dtype=float)
+
+        time.sleep(5)
+
+
+
+def thread_start_manager_server(port):
+    server = SimpleXMLRPCServer(("", int(port)), logRequests = False, allow_none=True)
+    server.register_function(register, "register")
+    server.register_function(unregister, "unregister")
+    server.register_function(poll, "poll")
+    server.register_function(request_jobs, "request_jobs")
+    server.register_function(job_finished, "job_finished")
+    server.register_function(can_run_assigned_job, 'can_run_assigned_job')
+
+    Servers.manager_server = server
+    server.serve_forever()
+
+
+def start_server(port):
+    t = threading.Thread(target=thread_start_manager_server,args=(port,))
+    t.daemon=True
+    t.start()
+    
+    t = threading.Thread(target=thread_start_job_server,args=(port+1,))
+    t.daemon=True
+    t.start()
+
+    t = threading.Thread(target=thread_check_commands)
+    t.daemon=True
+    t.start()
+
+
+#create a bordered window
+def border_win(parent,height,width,x,y,**kwargs):
+    if(not 'notop' in kwargs):
+        parent.hline(x,y,'.',width)
+        height -= 1
+        x += 1
+    if(not 'nobottom' in kwargs):
+        parent.hline(x+height-1,y,'.',width)
+        height -= 1
+    if(not 'noleft' in kwargs):
+        parent.vline(x,y,'.',height)
+        width -= 1
+        y += 1
+    if(not 'noright' in kwargs):
+        parent.vline(x,y+width-1,'.',height)
+        width -= 1
+    w = parent.subwin(height, width,x,y)
+    w.noutrefresh()
+    parent.refresh()
+    return w
+
+
+#threaded output of a file to the log window
+def thread_log_output(file, gb, color, filter):
+    while 1 :
+        line = file.readline()
+        if (not line):
+            break
+         
+        if (filter and len([f for f in filter if f in line]) > 0) :
+            pass
+        else:    
+            add_log_line(gb,line.decode('utf-8'),color)
+
+def log_output(file, gb, color = 0, filter = []):
+    t = _thread.start_new_thread(thread_log_output, (file, gb, color, filter))
+    return t
+
+
+
+def get_stat_str(stats):
+    cpu,memp,mempmax,mem,memmax = stats
+    if(cpu < 0.50 or mempmax > 0.90):
+        color = RED
+    elif(cpu < 0.80 or mempmax > 0.70):
+        color = YELLOW
+    else:
+        color = GREEN
+
+    descr = "(" +  '{:.2%}'.format(cpu) + " CPU, " + \
+            '{:.2%}'.format(memp) + "/" + '{:.2%}'.format(mempmax)  + "/" + \
+            '{}'.format(int(mem)) + "MB MEM)"
+    return descr,color
+
+#thread display status
+def thread_display_status(gb,status):
+    counter = 9
+    completed = queue = running = 0
+    while not status.stop_status_display:
+        counter += 1
+        local_running = engines.check_local_engine()
+        equeue = engines.cluster_queued_engines
+        erunning = engines.cluster_running_engines
+        
+        equeue_archive = engines.cluster_queued_engines_archive
+        erunning_archive = engines.cluster_running_engines_archive
+
+        njobs, nrunning, nfailed, ncompleted = jobs.get_job_stats()
+
+        #active_engines = jobs.active_engines()
+        #active_engines.discard(mylocal_id)
+        #eactive = len(active_engines)
+
+        if counter >= 10:
+            rc = None
+            try:
+                sys.stdout = open(os.devnull,'w')
+                rc = ipyparallel.Client(timeout=0.5)
+                queue = rc.queue_status()
+                unassigned= queue['unassigned']
+                del queue['unassigned']
+                
+                completed = sum([value['completed'] for key,value in list(queue.items()) if isinstance(key,int)],0)
+                nqueue = sum([value['queue'] for key,value in list(queue.items()) if isinstance(key,int)],0)
+                running = sum([value['tasks'] for key,value in list(queue.items()) if isinstance(key,int)],0)
+                queue = nqueue + unassigned
+            except Exception as e:
+                pass
+            finally:
+                sys.stdout = sys.__stdout__
+                if not rc is None:
+                    rc.close()
+            counter = 0
+       
+        
+        gb.lock.acquire()
+        try:
+            if(gb.wcom_status and gb.wcom_status.getmaxyx()[1] > 50):
+                sizey = gb.wcom_status.getmaxyx()[1]
+                gb.wcom_status.erase()
+                gb.wcom_status.addstr(1,1,"Jobs: ")
+                gb.wcom_status.addstr(1,18,"%d/%d (%d completed, %d failed)" % (nrunning, njobs, ncompleted,  nfailed),curses.color_pair(GREEN))
+                
+                
+                gb.wcom_status.addstr(3,1,"Local engine: ")
+                if not local_running:
+                   gb.wcom_status.addstr(3,18,"NOT RUNNING",curses.color_pair(YELLOW))
+                else:
+                   gb.wcom_status.addstr(3,18,"RUNNING",curses.color_pair(GREEN))
+
+                gb.wcom_status.addstr(5,1,"SLURM engines: ")
+                enodes = erunning + equeue
+
+                cpu_c = GREEN
+                mem_c = GREEN
+                load_c = GREEN
+                if len(status.used_cpus) > 0:
+                    cpu_usage = numpy.percentile(status.used_cpus / status.total_cpus,[0,25,50,75,100])
+                    mem_usage = numpy.percentile(status.used_mem / status.total_mem,[0,25,50,75,100])
+                    load = numpy.percentile(status.used_load / status.total_cpus,[0,25,50,75,100])
+                    
+                    if cpu_usage[1] < 0.5 or cpu_usage[2] < 0.75:
+                        cpu_c = YELLOW
+                    if cpu_usage[1] < 0.1 or cpu_usage[2] < 0.2:
+                        cpu_c = RED
+
+                    if mem_usage[-1] > 0.9 or mem_usage[-2] > 0.8 or mem_usage[-3] > 0.7:
+                        mem_c = YELLOW
+                    if mem_usage[-1] > 0.99 or mem_usage[-2] > 0.95 or mem_usage[-3] > 0.9:
+                        mem_c = RED
+
+                    if load[-1] > 1.1:
+                        load_c = YELLOW
+                    if load[2] > 1.1:
+                        load_c = RED
+                    
+                else:
+                    cpu_usage = numpy.zeros(5,dtype=float)
+                    mem_usage = numpy.zeros(5,dtype=float)
+                    load = numpy.zeros(5,dtype=float)
+
+                gb.wcom_status.addstr(6,1,"Archive engines: ")
+                enodes_archive = erunning_archive + equeue_archive
+
+
+                gb.wcom_status.addstr(8,1,"CPU usage: ")
+                gb.wcom_status.addstr(8,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                        % ((numpy.sum(status.used_cpus), numpy.sum(status.total_cpus)) + tuple(cpu_usage)), curses.color_pair(cpu_c))
+
+                gb.wcom_status.addstr(9,1,"Load: ")
+                gb.wcom_status.addstr(9,18, "%.0f/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                        % ((numpy.sum(status.used_load), numpy.sum(status.total_cpus)) + tuple(load)), curses.color_pair(load_c))
+
+                gb.wcom_status.addstr(10,1,"Mem usage (GB): ")
+                gb.wcom_status.addstr(10,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                        % ((numpy.sum(status.used_mem), numpy.sum(status.total_mem)) + tuple(mem_usage)), curses.color_pair(mem_c))
+                                                     
+                if not rc is None:
+                    gb.wcom_status.addstr(12,1,"IPEngines: ")
+                    gb.wcom_status.addstr(12,18, "%d / %d / %d" % (running, queue, completed), curses.color_pair(GREEN))
+
+                gb.wcom_status.addstr(14, 1, "Archive: ")
+                gb.wcom_status.addstr(15, 1, "Active: ")
+                gb.wcom_status.addstr(16, 1, "DCache: ")
+                gb.wcom_status.addstr(14, 18, "%d / %d" % (jobs.archive_inuse, jobs.archive_total), curses.color_pair(GREEN))
+                gb.wcom_status.addstr(15, 18, "%d / %d" % (jobs.active_inuse, jobs.active_total), curses.color_pair(GREEN))
+                gb.wcom_status.addstr(16, 18, "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total), curses.color_pair(GREEN))
+
+
+                if equeue == 0:
+                    color = GREEN
+                else:
+                    color = YELLOW
+                gb.wcom_status.addstr(5,18,"%d/%d" % (erunning,enodes),curses.color_pair(color))
+                gb.wcom_status.addstr(6,18,"%d/%d" % (erunning_archive,enodes_archive),curses.color_pair(color))
+
+                
+                gb.wcom_status.refresh()
+        except Exception as e:
+            add_log_line(gb,"Exception in display thread: " + str(e), RED)
+        finally:
+            gb.lock.release()
+        time.sleep(1)
+
+def start_status_display(gb,status):
+    status.stop_status_display = False
+    t = threading.Thread(target=thread_display_status,args=(gb,status))
+    t.daemon=True
+    t.start()
+    return t
+
+def stop_status_display(status,t):
+    set_status_message(gb, "Waiting for status thread to terminate..", YELLOW)
+    status.stop_status_display = True
+    t.join()
+
+#initialize windows/lock, etc.
+def build_windows(gb):
+    if(not gb.lock): 
+        gb.lock = threading.RLock()
+    gb.lock.acquire()
+    try:
+        
+        #clear screen in curses does not work somehow. 
+        print("\033[2J")
+
+        gb.scr.erase()
+        gb.scr.refresh()
+        curses.start_color()
+        # Invisibility mode of the cursor may not be supported by the terminal
+        try :
+            curses.curs_set(0)
+        except :
+            pass
+        
+        #curses getmaxyx does not work for resize screens to smaller sizes. Use stty instead. 
+        rows, columns = os.popen('stty size', 'r').read().split()       
+        size = (int(rows), int(columns))
+
+        com_win_rows = max(0,min(20,size[0]-2))
+        status_win_rows = max(0,min(2,size[0] - com_win_rows))
+        log_win_rows = max(0,size[0] - com_win_rows - status_win_rows)
+
+
+        #init colors
+        curses.init_pair(RED,curses.COLOR_RED,curses.COLOR_BLACK)
+        curses.init_pair(GREEN,curses.COLOR_GREEN,curses.COLOR_BLACK)
+        curses.init_pair(YELLOW,curses.COLOR_YELLOW,curses.COLOR_BLACK)
+        curses.init_pair(MAGENTA,curses.COLOR_MAGENTA,curses.COLOR_BLACK)
+        curses.init_pair(BLUE,curses.COLOR_BLUE,curses.COLOR_BLACK)
+        curses.init_pair(CYAN,curses.COLOR_CYAN,curses.COLOR_BLACK)
+        
+        #log window
+        if(log_win_rows > 2):
+            gb.wlog = border_win(gb.scr,log_win_rows,size[1],0,0)
+            gb.wlog_size = gb.wlog.getmaxyx()
+            gb.wlog_currow = 0
+            gb.wlog.setscrreg(0,gb.wlog_size[0]-1)
+            gb.wlog.idlok(True)
+            gb.wlog.scrollok(True)
+            gb.wlog.refresh()
+        else:
+            gb.wlog = None
+
+        #com window
+        if(com_win_rows > 11):
+            com_win_cols = size[1] / 2
+            if(com_win_cols > 55):
+                comlog_win_cols = size[1] - 55
+                com_win_cols = 55
+                gb.wcom_status = border_win(gb.scr,com_win_rows,comlog_win_cols,log_win_rows,com_win_cols,notop=True,noleft=True)
+                gb.wcom_status.refresh()
+            else:
+                com_win_cols = size[1]
+                gb.wcom_status = None
+        
+            gb.wcom = border_win(gb.scr,com_win_rows,com_win_cols,log_win_rows,0,notop=True)
+            gb.wcom.refresh()
+        else:
+            gb.wcom = None
+            gb.wcom_status = None
+        
+        #status window
+        if(status_win_rows == 2):
+            gb.wstatus = gb.scr.subwin(status_win_rows,size[1],log_win_rows + com_win_rows,0)
+            gb.wstatus.refresh()
+        else:
+            gb.wstatus = None
+
+        init_commands(gb)
+        gb.scr.refresh()
+    except:
+        pass
+    finally:
+        gb.lock.release()    
+
+#add line to log windows
+def add_log_line(gb,line,color=0):
+    timestring = time.strftime("%H:%M:%S", time.gmtime()) 
+    try:
+        if isinstance(line,bytes):
+            line = str(line.decode('utf-8'))
+    except UnicodeDecodeError:
+        line = "Invalid line format (unicode) encountered"
+        color = RED
+
+    line = timestring + ": " + line
+    gb.lock.acquire()
+    try:
+        if(line and line[-1] == '\n'):
+            gb.log_file.write(line)
+        else:
+            gb.log_file.write(line + '\n')
+        if(gb.wlog):
+            line = line[:(gb.wlog_size[1] - 2)]
+            if(line and line[-1] == '\n'): line = line[:-1]
+            if(gb.wlog_currow < gb.wlog_size[0]):
+                gb.wlog.addstr(gb.wlog_currow,1,line,curses.color_pair(color))
+                gb.wlog_currow += 1
+            else:
+                gb.wlog.scroll()
+                gb.wlog.addstr(gb.wlog_size[0] - 1,1,line,curses.color_pair(color))
+            gb.wlog.refresh()
+    except Exception as e:
+        print(e)
+    finally:
+        gb.lock.release()
+
+#set status message iin status window
+def set_status_message(gb, line, color = 0):
+    gb.lock.acquire()
+    try:
+        if (gb.wstatus) :
+            gb.wstatus.addstr(0,0,line,curses.color_pair(color))
+            gb.wstatus.clrtoeol()
+            gb.wstatus.refresh()
+    except Exception as e:
+        pass
+    finally:
+        gb.lock.release()
+
+def set_progress_bar(gb,s):
+    gb.lock.acquire()
+    try:
+        if(gb.wstatus):
+            if(s < 0.0 or s > 1.0):
+                add_log_line(gb, "Progress bar value out of range: " + str(s),RED)
+            else:
+                size = gb.wstatus.getmaxyx()
+                total_i = size[1] - 3
+                full_i = int(s * total_i)
+                rem_i = total_i - full_i
+                line = "[" + ('#' * full_i) + (' ' * rem_i) + "]"
+                gb.wstatus.clrtoeol()
+                gb.wstatus.refresh()
+    except Exception as e:
+        add_log_line(gb,"Exception in set_progress_bar: " + str(e),RED)
+    finally:
+        gb.lock.release()
+
+def stop_progress_bar(gb):
+    gb.lock.acquire()
+    try:
+        if(gb.wstatus):
+            gb.wstatus.addstr(1,0,"")
+            gb.wstatus.clrtoeol()
+            gb.wstatus.refresh()
+    except Exception as e:
+        pass
+    finally:
+        gb.lock.release()
+
+#print commands in command windows
+def init_commands(gb):
+    gb.lock.acquire()
+    try:
+        if not gb.wcom is None:
+            gb.wcom.addstr(1,1,"Start/stop local engine: s/x")
+            gb.wcom.addstr(2,1,"Start/stop SLURM engines: d/c [n]")
+            gb.wcom.addstr(4,1,"Toggle autostop idle engines: k")
+            gb.wcom.addstr(5,1,"Prioritize jobs: p")
+            gb.wcom.addstr(6,1,"Deprioritize jobs: n")
+            gb.wcom.addstr(7,1,"Set archive/active/dcache total capacity: 1/2/3")
+            gb.wcom.addstr(8,1,"Toggle last in/first out: l")
+            gb.wcom.addstr(10,1,"Shutdown: q")
+            gb.wcom.refresh()
+    except Exception as e:
+        pass
+    finally:
+        gb.lock.release()
+
+#enter command in command window
+def enter_command(gb,argument="Command: "):
+    if gb.wcom is None:
+        return
+    gb.lock.acquire()
+    try:
+        command = ""
+        size = gb.wcom.getmaxyx()
+        x = size[0] - 1
+        gb.wcom.addstr(x,1,argument)
+        gb.wcom.clrtoeol()
+        gb.wcom.refresh()
+        while 1:
+            gb.lock.release()
+            c = gb.scr.getch()
+            gb.lock.acquire()
+            if c == curses.ascii.LF:
+                break
+            elif c == curses.ascii.DEL:
+                command = command[:-1]
+            else:
+                if(c > 256):
+                    set_status_message(gb,"Keycode not supported: " + str(c))
+                else:
+                    command += chr(c)
+            gb.wcom.addstr(x,1,argument + command[:(size[1] - len(argument) - 2)])
+            gb.wcom.clrtoeol()
+            gb.wcom.refresh()
+
+        gb.wcom.addstr(x,1,"")
+        gb.wcom.clrtoeol()
+        gb.wcom.refresh()
+    finally:
+        gb.lock.release()
+    return command
+
+def get_number(gb,argument,default=0):
+    cmd = enter_command(gb,argument)
+    if(not cmd):
+        n = default
+    else:
+        try:
+            n = int(cmd)
+        except ValueError:
+            set_status_message(gb,"Number of engines should be a number",YELLOW)
+            n = None
+    return n
+
+
+
+
+
+
+
+def main(scr, *args, **kwds):
+    address = zslurm_shared.get_hostname()
+    port = zslurm_shared.port
+
+    status.set_address(address,port)
+    status.reports_file = open('reports.tsv','w')
+    fieldnames = ['jobname','machine']
+    for lab in ['uss','rss','vms']:
+        for j in [0,5,25,50,75,95,100]:
+            fieldnames.append(lab + '_' + str(j))
+    fieldnames.extend(['runtime','montime','user','system','maxrss','mon_user','mon_system','iowait','retcode'])
+    status.reports_file.write('\t'.join(fieldnames) + '\n')
+    status.reports_file.flush()
+
+    gb.scr = scr
+    gb.log_file = open('cluster.log','w')
+
+    build_windows(gb)
+    t = start_status_display(gb,status)
+    start_server(port)
+   
+
+    #workaround for bug in curses: no resize messages
+    os.environ['LINES']="blah"
+    del os.environ['LINES']
+    os.environ['COLUMNS']="blah"
+    del os.environ['COLUMNS']
+
+    try:
+        while 1:
+            c = gb.scr.getch()
+            if c == curses.KEY_RESIZE:
+                build_windows(gb)
+            elif c == ord('q'):  #QUIT
+                if engines.check_local_engine() or engines.count_cluster_engines() > 0:
+                    ans = enter_command(gb, "Are you SURE? Engines are STOPPED! (yes/no): ")
+                else:
+                    ans = enter_command(gb, "Are you sure? (yes/no): ")
+                if ans == 'yes':
+                    if engines.check_local_engine() or engines.count_cluster_engines() > 0:
+                        engines.stop_all()
+                    stop_status_display(status,t)
+                    gb.scr.refresh()
+                    break
+            elif c == ord('s'):  #START local engine
+                cpus = get_number(gb, "Number of cpus (def=30): ", 30)
+                mem = get_number(gb, "Maximal memory in GB (def=62): ", 62)
+                if(not cpus is None and not mem is None):
+                    engines.start_local(gb,cpus,mem * 1024.0)
+
+            elif c == ord('x'):  #STOP local engines
+                engines.stop_local(gb)
+
+            elif c == ord('d'):  #START SLURM engines
+                on_snellius = 'snellius' in zslurm_shared.get_full_hostname()
+                if on_snellius:
+                    default_partition = 'thin'
+                else:
+                    default_partition = 'normal'
+
+                partition = enter_command(gb, f"Enter partition (default={default_partition}): ")
+                if partition == 'staging':
+                    cmd = 1
+                    cores = 1
+                    constraint = ''
+                else:
+                    cmd = get_number(gb, "Number of engines (def=1): ",1)
+                    if not on_snellius:
+                        constraint= enter_command(gb, "Enter feature (default=): ")
+                    else:
+                        constraint = ''
+                    cores= get_number(gb, "Enter number of cores (default=exclusive): ",0)
+                
+                runtime = enter_command(gb, "Enter time (default=5-0:0:0): ")
+
+                if runtime == "":
+                    runtime = '5-0:0:0'
+                if partition =="":
+                    partition = default_partition
+                
+                if(not cmd is None and not cores is None):
+                    engines.start_slurm(gb,cmd, runtime, partition, constraint, cores)
+            elif c == ord('p'):
+                jobpattern = enter_command(gb, 'Enter job name pattern to prioritize: ')
+                if not jobpattern == '':
+                    jobs.prioritize(jobpattern)
+            elif c == ord('n'):
+                jobpattern = enter_command(gb, 'Enter job name pattern to deprioritize: ')
+                if not jobpattern == '':
+                    jobs.deprioritize(jobpattern)
+
+            elif c == ord('1'):
+                archive_total = get_number(gb, 'Enter new archive total capacity (in gb): ', 10000)
+                if not archive_total is None:
+                    jobs.archive_total = archive_total
+            elif c == ord('2'):
+                active_total = get_number(gb, 'Enter new active total capacity (in gb): ', 10000)
+                if not active_total is None:
+                    jobs.active_total = active_total
+            elif c == ord('3'):
+                dcache_total = get_number(gb, 'Enter new dcache total capacity (in gb): ', 10000)
+                if not dcache_total is None:
+                    jobs.dcache_total = dcache_total
+            elif c == ord('4'):
+                archive_inuse = get_number(gb, 'Enter new archive used capacity (in gb): ', 10000)
+                if not archive_inuse is None:
+                   jobs.archive_inuse = archive_inuse
+            elif c == ord('5'):
+                active_inuse = get_number(gb, 'Enter new active used capacity (in gb): ', 10000)
+                if not active_inuse is None:
+                    jobs.active_inuse = active_inuse
+            elif c == ord('6'):
+                dcache_inuse = get_number(gb, 'Enter new dcache used capacity (in gb): ', 10000)
+                if not dcache_inuse is None:
+                   jobs.dcache_inuse = dcache_inuse
+
+            elif c == ord('c'):  #STOP PBS engines
+                cmd = get_number(gb, "Number of engines (def=all): ",engines.count_cluster_engines())
+                if(not cmd is None):
+                    engines.stop_slurm(gb,cmd)
+
+            elif c == ord('k'): #KILL IDLE toggle
+                status.kill_idle = not status.kill_idle
+                add_log_line(gb, "Autostop idle engine set to " + ("ON" if status.kill_idle else 'OFF') ,GREEN)
+            elif c == ord('l'): #KILL IDLE toggle
+                status.lastin_first = not status.lastin_first
+                add_log_line(gb, "Last in / First out set to " + ("ON" if status.lastin_first else 'OFF') ,GREEN)
+            elif c == ord('u') :  # Update ncurses screen
+                gb.scr.refresh()
+    except Exception:
+        add_log_line(gb,"EXCEPTION!!! EMERGENCY SHUTDOWN IN PROGRESS!",RED)
+        try:
+            engines.stop_all()
+            stop_status_display(status,t)
+        except Exception:
+            pass
+        raise
+        
+    time.sleep(2) #wait for all paint ops to finish and engines to terminate
+curses.wrapper(main)

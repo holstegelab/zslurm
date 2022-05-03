@@ -1,0 +1,104 @@
+Only in snakemake-4.2.0-adapted: build
+Only in snakemake-4.2.0-adapted: dist
+diff -a -r snakemake-4.2.0/snakemake/executors.py snakemake-4.2.0-adapted/snakemake/executors.py
+40a41
+> import snakemake.zsb as zsb
+611c612
+<                  max_status_checks_per_second=1):
+---
+>                  max_status_checks_per_second=100):
+655a657
+>        
+663a666
+>         logger.info("Job script generated")
+684a688
+>         logger.info("Job script external")
+691a696
+>         
+693,696c698,702
+<             ext_jobid = subprocess.check_output(
+<                 '{submitcmd} "{jobscript}"'.format(submitcmd=submitcmd,
+<                                                    jobscript=jobscript),
+<                 shell=True).decode().split("\n")
+---
+>             cwildcards = self.cluster_wildcards(job)
+>             ext_jobid = [zsb.run([jobscript], mem=cwildcards['mem'], runtime=cwildcards['time'], cpus=cwildcards['n'], 
+>                                               arch_use_add=cwildcards['arch_use_add'], arch_use_remove=cwildcards['arch_use_remove'], 
+>                                               active_use_add=cwildcards['active_use_add'], active_use_remove=cwildcards['active_use_remove'],
+>                                               partition=cwildcards['partition'])]
+701a708,711
+> 
+> 
+> 
+>         logger.info("Job script submitted")
+705c715
+<             logger.info("Submitted job {} with external jobid '{}'.".format(
+---
+>             logger.info("Submitted job {} with zslurm jobid '{}'.".format(
+710a721
+>         logger.info("Job script callback")
+712a724
+>         logger.info("Job script completed")
+750a763,764
+>             jobs = set(zsb.get_jobs())
+> 
+757,767c771,784
+<                     with self.status_rate_limiter:
+<                         if job_finished(active_job):
+<                             active_job.callback(active_job.job)
+<                         elif job_failed(active_job):
+<                             self.print_job_error(
+<                                 active_job.job,
+<                                 cluster_jobid=active_job.jobid if active_job.jobid else "unknown",
+<                             )
+<                             active_job.error_callback(active_job.job)
+<                         else:
+<                             self.active_jobs.append(active_job)
+---
+>                     if int(active_job.jobid) in jobs:
+>                         self.active_jobs.append(active_job)
+>                     else:
+>                         with self.status_rate_limiter:
+>                             if job_finished(active_job):
+>                                 active_job.callback(active_job.job)
+>                             elif job_failed(active_job):
+>                                 self.print_job_error(
+>                                     active_job.job,
+>                                     cluster_jobid=active_job.jobid if active_job.jobid else "unknown",
+>                                 )
+>                                 active_job.error_callback(active_job.job)
+>                             else:
+>                                 self.active_jobs.append(active_job)
+diff -a -r snakemake-4.2.0/snakemake/scheduler.py snakemake-4.2.0-adapted/snakemake/scheduler.py
+259c259
+<                 logger.debug("Resources before job selection: {}".format(
+---
+>                 logger.info("Resources before job selection: {}".format(
+261,262c261,262
+<                 logger.debug("Ready jobs ({}):\n\t".format(len(needrun)) +
+<                              "\n\t".join(map(str, needrun)))
+---
+>                 logger.info("Ready jobs ({}):\t".format(len(needrun)) +
+>                              "\t".join(map(str, needrun)))
+266,267c266,267
+<                 logger.debug("Selected jobs ({}):\n\t".format(len(run)) +
+<                              "\n\t".join(map(str, run)))
+---
+>                 logger.info("Selected jobs ({}):\n\t".format(len(run)) +
+>                              "\t".join(map(str, run)))
+271c271
+<                 logger.debug(
+---
+>                 logger.info(
+275,276c275,276
+<                     with self.rate_limiter:
+<                         self.run(job)
+---
+>                     logger.info("Next job %d" % len(run))
+>                     self.run(job)
+Only in snakemake-4.2.0-adapted/snakemake: zsb.py
+diff -a -r snakemake-4.2.0/snakemake.egg-info/SOURCES.txt snakemake-4.2.0-adapted/snakemake.egg-info/SOURCES.txt
+1a2
+> setup.cfg
+32a34
+> snakemake/zsb.py
