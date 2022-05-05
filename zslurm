@@ -626,7 +626,7 @@ class EngineManager(object):
             z[cstate] += 1
 
         for cid,engine in list(self.engine_by_clusterid.items()):
-            if not engine.cluster_id in observed_cluster_ids:
+            if not engine.cluster_id is False and not engine.cluster_id in observed_cluster_ids:
                 add_log_line(gb, f'Engine {engine.engine_id} @ {engine.cluster_id} disappeared from Slurm..', RED)
                 self._unregister(engine.engine_id, 'Engine disappeared')
                 
@@ -797,18 +797,18 @@ class EngineManager(object):
 
 
                 stop_engines = stop_engines[:n]
-                
-                add_log_line(gb, "Stop engines: %s" % str(stop_engines), CYAN)
-                
-                set_progress_bar(gb,0.0)
-                for pos, eid in enumerate(stop_engines):
-                    self.cancel_cid(eid)
-                    set_progress_bar(gb,float(pos+1)/float(n))
-                
-                time.sleep(2)
-                stop_progress_bar(gb)
-                set_status_message(gb,"SLURM engines stopped",GREEN)
-                add_log_line(gb,str(n) + " SLURM engines stopped",MAGENTA)
+                if stop_engines: 
+                    add_log_line(gb, "Stop engines: %s" % str(stop_engines), CYAN)
+                    
+                    set_progress_bar(gb,0.0)
+                    for pos, eid in enumerate(stop_engines):
+                        self.cancel_cid(eid)
+                        set_progress_bar(gb,float(pos+1)/float(n))
+                    
+                    time.sleep(2)
+                    stop_progress_bar(gb)
+                    set_status_message(gb,"SLURM engines stopped",GREEN)
+                    add_log_line(gb,str(n) + " SLURM engines stopped",MAGENTA)
         finally: 
             self.lock.release()
 

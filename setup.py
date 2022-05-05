@@ -6,7 +6,7 @@ import os
 import os.path
 
 setup(
-    name="XSlurm",
+    name="ZSlurm",
     version="0.1",
     scripts = ['zsqueue', 'zsbatch', 'zscancel','zslurm','zsnodes', 'zslurm_chief','slurm_to_zslurm'],
      install_requires=['numpy>=1.4.1','psutil','dnspython'],
