@@ -16,8 +16,8 @@ args = parser.parse_args()
 try:
     nodes = s.list_nodes()
     
-    print("ID\tPARTITION\tCORES\tMEM\tTIME\tNJOBS\tCPU\tMEM\tLOAD")
-    for partition, cluster_id, cores, totmem, runtime, njobs, cpu_usage, mem_usage, load in nodes:
+    print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tNJOBS\tCPU\tMEM\tLOAD")
+    for partition, engine_id, cluster_id, cores, totmem, runtime, njobs, cpu_usage, mem_usage, load in nodes:
         days = 0
         hours = 0
         minutes = 0
@@ -36,7 +36,7 @@ try:
             runtime = ('%d-' % days) + runtime
                     
 
-        print('%s\t%s\t%.0f\t%.1fGb\t%s\t%d\t%.1f\t%.1f\t%.1f' % (cluster_id, partition, cores, totmem/1024.0, runtime, njobs, cpu_usage, mem_usage, load))
+        print('%s\t%s\t%s\t%.0f\t%.1fGb\t%s\t%d\t%.1f\t%.1f\t%.1f' % (engine_id, cluster_id, partition, cores, totmem/1024.0, runtime, njobs, cpu_usage, mem_usage, load))
 
 except (socket.error, httplib.HTTPException) as serror:
     print('Queue request failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)

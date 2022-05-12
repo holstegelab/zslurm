@@ -31,8 +31,9 @@ port = zslurm_shared.port
 
 cpu = psutil.cpu_count()
 partition = 'compute'
+cluster_managed = True
 
-opts, args = getopt.getopt(sys.argv[1:],"a:p:c:m:t:",["address=","port=","cpu=","mem=","partition="])
+opts, args = getopt.getopt(sys.argv[1:],"a:p:c:m:t:u",["address=","port=","cpu=","mem=","partition=","unmanaged"])
 for o, a in opts:
     if o in ('-a', '--address'):
         address = a
@@ -42,7 +43,8 @@ for o, a in opts:
         cpu = int(a)
     elif o in ('-t', '--partition'):
         partition = a.strip()
-
+    elif o in ('-u' ,'--unmanaged'):
+        cluster_managed=False
 myip = zslurm_shared.get_hostname()
 myid = myip #for now
 
@@ -55,6 +57,9 @@ if 'SLURM_ARRAY_JOB_ID' in os.environ:
     clusterid = os.environ.get('SLURM_ARRAY_JOB_ID','') + '_' + os.environ.get('SLURM_ARRAY_TASK_ID','')
 else:
     clusterid = os.environ.get('SLURM_JOB_ID','')
+
+if not cluster_managed:
+    clusterid = ''
 
 
 #self register
@@ -194,13 +199,14 @@ def job_monitor(jobid, process, ncpu, mem):
                                 continue
                         memcache.append(r)
                     
-                    spend_time = lastcpureport['user'] + lastcpureport['system'] + lastcpureport['children_user'] + lastcpureport['children_system'] - prevspend_time
-                    cpu_percentage = spend_time / (report_time - last_report_time)
+                    spend_time = (lastcpureport['user'] + lastcpureport['system'] + lastcpureport['children_user'] + lastcpureport['children_system']) 
+                    cpu_percentage = ((spend_time - prevspend_time) / (report_time - last_report_time))
                     last_report_time = report_time
-                    status.lock.acquire()
-                    status.current_cpu_usage[jobid] = cpu_percentage
-                    status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
-                    status.lock.release()
+                    if prevspend_time > 0:
+                        status.lock.acquire()
+                        status.current_cpu_usage[jobid] = cpu_percentage
+                        status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
+                        status.lock.release()
 
                 except psutil.NoSuchProcess:
                     pass

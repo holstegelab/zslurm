@@ -435,6 +435,9 @@ class JobManager(object):
                     job.mem = job.mem * 2
                     job.state = 'REQUEUED'
                     job.starttime = None
+                elif return_code == -1:                                    
+                    job.state = 'REQUEUED'
+                    job.starttime = None
                 else:
                     job =  self.jobs_by_id[jobid]
                     del self.jobs_by_id[jobid]
@@ -555,7 +558,7 @@ class EngineManager(object):
     def list_nodes(self):
         result = []
         for e in list(self.engine_by_id.values()):
-            result.append((e.partition, e.cluster_id if e.cluster_id is not False else '(local)', e.cores, e.totmem, time.time() - e.starttime, len(e.jobs), e.cpu_usage, e.mem_usage, e.load))
+            result.append((e.partition, e.engine_id, e.cluster_id if e.cluster_id is not False else 'NA', e.cores, e.totmem, time.time() - e.starttime, len(e.jobs), e.cpu_usage, e.mem_usage, e.load))
         return result            
 
 
@@ -605,23 +608,26 @@ class EngineManager(object):
             if cstate == 'CG': #cleaning up
                 continue
             
-            if not cid in self.engine_by_clusterid:
-                continue #needs to register first
 
             if cpartition == 'staging':
                 if cstate == 'R':
+                    if not cid in self.engine_by_clusterid:
+                        continue #needs to register first
                     nrunning_archive += 1
                 else:
                     nqueue_archive += 1
             else:
                 if cstate == 'R':
+                    if not cid in self.engine_by_clusterid:
+                        continue #needs to register first
                     nrunning += 1
                 else:
                     nqueue += 1
 
-            engine = self.engine_by_clusterid[cid]
-            if cstate == 'R':
-                engine.timeleft = parse_timeleft(ctime)
+            if cid in self.engine_by_clusterid:
+                engine = self.engine_by_clusterid[cid]
+                if cstate == 'R':
+                    engine.timeleft = parse_timeleft(ctime)
 
             z[cstate] += 1
 
@@ -856,12 +862,11 @@ class EngineManager(object):
             e.timeleft = 5 * 24 * 60 * 60
             
             self.engine_by_id[myid] = e
-            if myid == zslurm_shared.short_name(status.address):
+            if myid == zslurm_shared.short_name(status.address) or cluster_jobid == '':
                 e.cluster_id = False
             else:
                 e.cluster_id = cluster_jobid
-
-            self.engine_by_clusterid[cluster_jobid] = e
+                self.engine_by_clusterid[cluster_jobid] = e
         
             totalgb = totmem / 1024.0
             average_use = totalgb / float(cores)
