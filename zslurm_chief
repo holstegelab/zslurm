@@ -15,6 +15,10 @@ except:
     import httplib
 import numpy
 import resource
+from time import gmtime, strftime
+
+def xtime():
+    return (strftime("%Y-%m-%d %H:%M:%S", gmtime()))
 
 resource.setrlimit(resource.RLIMIT_NPROC, (8192, 16000))
 
@@ -235,7 +239,7 @@ def job_monitor(jobid, process, ncpu, mem):
     report['montime'] = report_time - start_time
     report['retcode'] = retcode
 
-    print(("Job %s done with rcode %s" % (str(jobid), str(retcode))))
+    print(("%s - Job %s done with rcode %s" % (xtime(), str(jobid), str(retcode))))
     status.lock.acquire()
     status.return_codes[jobid] = retcode
     status.reports[jobid] = report
@@ -275,11 +279,11 @@ try :
             for jobid, rcode in list(status.return_codes.items()):
                 try :
                     s.job_finished(myid, jobid, rcode,status.reports.get(jobid,{'no_job_report':True, 'jobid':jobid}))
-                    print('Reported that job %s finished with rcode %s' % (str(jobid), str(rcode)))
+                    print('%s - Reported that job %s finished with rcode %s' % (xtime(), str(jobid), str(rcode)))
 
                     status.reports.pop(jobid,None)
                 except (socket.error, httplib.HTTPException) as serror :
-                    print('[%s] Caught a socket error at time %f for jobid %s!' % (myid, time.time(), str(jobid)))
+                    print('%s - [%s] Caught a socket error  for jobid %s!' % (xtime(), myid,  str(jobid)))
                     nretcodes[jobid] = rcode
             status.return_codes = nretcodes
             status.lock.release()
@@ -289,16 +293,21 @@ try :
        
         mb_memory_available = e_memtot - sum(status.current_mem_usage.values(),0.0)
         
-        status.lock.acquire()   
+        status.lock.acquire()  
+        print("%s - CYCLE" % xtime(), str(status.current_cpu), str(status.current_mem), str(mb_memory_available))
         if mode == zslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0 and mb_memory_available > 1024.0:
             if status.assigned_jobs:
                 jobs = list(status.assigned_jobs.values())
             else:
                 try:
+                    print("%s - REQUEST"%xtime(), myid, str(status.current_cpu), str(status.current_mem), str(mb_memory_available), partition)
                     jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available), partition)
+                    print('%s - REQUEST RESULT' % xtime(), len(jobs))
                 except (socket.error, httplib.HTTPException) as serror :
+                    print ("%s - REQUEST HTTP Error" % xtime())
                     jobs = []
-            for job in jobs: 
+            for job in jobs:
+                print("%s - CONSIDER" % xtime(),str(job))
                 jobid, command, cwd, env, ncpu, mem, state = job
                 if state == 'ASSIGNED':
                     if status.current_cpu >= ncpu and min(status.current_mem,mb_memory_available) >= mem:
@@ -311,9 +320,10 @@ try :
                             continue
 
                     else:
+                        print("%s - DELAY" % xtime())
                         status.assigned_jobs[jobid] = job
                         continue
-
+                print("%s - EXECUTE" % xtime())
                 #start job
                 curdir = os.getcwd()
                 os.chdir(cwd)
@@ -361,7 +371,7 @@ try :
                 commands = s.poll(myid, cpu_usage, mem_usage, load, mode, time.time() - idle_start, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
             last_seen = time.time()
         except (socket.error, httplib.HTTPException) as serror :
-            print('[%s] Caught a socket error for command poll !' % myid)
+            print('%s - [%s] Caught a socket error for command poll !' % (xtime(), myid))
             if time.time() - last_seen > PING_TIMEOUT:
                 print('[%s] Timeout triggered!' % myid)
                 mode=zslurm_shared.STOPPING

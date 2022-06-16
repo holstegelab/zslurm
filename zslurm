@@ -98,7 +98,7 @@ def parse_timeleft(time):
         minutes = 0
     seconds = time[0]
     
-    return (days * 24 * 60 + hours * 60 + minutes)
+    return (days * 24 * 60 * 60.0 + hours * 60 * 60.0 + minutes * 60 + seconds)
 
 queue_states = set(['PENDING', 'REQUEUED'])
 
@@ -289,7 +289,6 @@ class JobManager(object):
         return jobs        
     
     def request_jobs(self, myid,current_cpu, current_mem, partition):
-        #add_log_line(gb,"Node %s requests for job with %d cpus and %d mb mem" % (myid, current_cpu, current_mem), BLUE)
 
         if not myid in engines.engine_by_id or engines.engine_by_id[myid] is None:
             timeleft = 5 * 24 * 60 * 60
@@ -299,6 +298,7 @@ class JobManager(object):
             timeleft = int(engines.engine_by_id[myid].timeleft)
             cores = engines.engine_by_id[myid].cores
             totmem = engines.engine_by_id[myid].totmem
+        add_log_line(gb,"Node %s (%d,%d) with % s left requests for job(s) with %d cpus and %d mb mem" % (myid, cores,totmem, timeleft, current_cpu, current_mem), BLUE)
 
         self.lock.acquire()
         try:
@@ -558,7 +558,7 @@ class EngineManager(object):
     def list_nodes(self):
         result = []
         for e in list(self.engine_by_id.values()):
-            result.append((e.partition, e.engine_id, e.cluster_id if e.cluster_id is not False else 'NA', e.cores, e.totmem, time.time() - e.starttime, len(e.jobs), e.cpu_usage, e.mem_usage, e.load))
+            result.append((e.partition, e.engine_id, e.cluster_id if e.cluster_id is not False else 'NA', e.cores, e.totmem, time.time() - e.starttime, e.timeleft, len(e.jobs), e.cpu_usage, e.mem_usage, e.load))
         return result            
 
 
