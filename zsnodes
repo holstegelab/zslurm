@@ -16,7 +16,7 @@ args = parser.parse_args()
 try:
     nodes = s.list_nodes()
     
-    print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tNJOBS\tCPU\tMEM\tLOAD")
+    print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tLOAD")
     for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load in nodes:
         days = 0
         hours = 0
