@@ -145,6 +145,7 @@ class status:
 
 def job_monitor(jobid, process, ncpu, mem):
     memcache = []
+    cpucache = []
     retcode = None
     resources = None
     lastcpureport = None
@@ -202,9 +203,10 @@ def job_monitor(jobid, process, ncpu, mem):
                             except psutil.NoSuchProcess:
                                 continue
                         memcache.append(r)
-                    
+
                     spend_time = (lastcpureport['user'] + lastcpureport['system'] + lastcpureport['children_user'] + lastcpureport['children_system']) 
                     cpu_percentage = ((spend_time - prevspend_time) / (report_time - last_report_time))
+                    cpucache.append(cpu_percentage)
                     last_report_time = report_time
                     if prevspend_time > 0:
                         status.lock.acquire()
@@ -222,6 +224,13 @@ def job_monitor(jobid, process, ncpu, mem):
 
 
     report = {}
+    report['starttime'] = time.strftime('%b %d %Y %H:%M:%S',time.localtime(start_time))
+    report['endtime'] = time.strftime('%b %d %Y %H:%M:%S', time.localtime(time.time()))
+
+    report['runtime'] = time.time() - start_time
+    report['montime'] = report_time - start_time
+    report['retcode'] = retcode
+
     if not resources is None:
         report['user'] = resources.ru_utime
         report['system'] = resources.ru_stime
@@ -231,15 +240,15 @@ def job_monitor(jobid, process, ncpu, mem):
         report['mon_user'] = lastcpureport['user'] + lastcpureport['children_user']
         report['mon_system'] = lastcpureport['system'] + lastcpureport['children_system']
         report['iowait'] = lastcpureport['iowait']
+        report['avg_cpu_percentage'] = (report['mon_user'] + report['mon_system']) / report['runtime']
 
     if len(memcache) > 0:
         for lab in ['uss','rss','vms']:
             report[lab] = list([float(e)/(1024.0 * 1024.0) for e in numpy.percentile([e[lab] for e in memcache],[0,5,25,50,75,95,100])])
-    report['runtime'] = time.time() - start_time
-    report['montime'] = report_time - start_time
-    report['retcode'] = retcode
-
+        report['cpu_percentage'] = list([float(e) for e in numpy.percentile(cpucache, [0,5,25,50,75,95,100])])
     print(("%s - Job %s done with rcode %s" % (xtime(), str(jobid), str(retcode))))
+    print ("%s - Report %s" % (xtime(), str(report)))
+
     status.lock.acquire()
     status.return_codes[jobid] = retcode
     status.reports[jobid] = report
@@ -307,7 +316,6 @@ try :
                     print ("%s - REQUEST HTTP Error" % xtime())
                     jobs = []
             for job in jobs:
-                print("%s - CONSIDER" % xtime(),str(job))
                 jobid, command, cwd, env, ncpu, mem, state = job
                 if state == 'ASSIGNED':
                     if status.current_cpu >= ncpu and min(status.current_mem,mb_memory_available) >= mem:

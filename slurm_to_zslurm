@@ -1,5 +1,5 @@
 #!/bin/bash
-source "/home/hulsmanm/miniconda3/etc/profile.d/conda.sh"
+source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 conda activate clustersnake
 python -V
 zslurm_chief "$@" 
