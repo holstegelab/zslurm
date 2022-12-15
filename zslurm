@@ -1320,6 +1320,7 @@ def add_log_line(gb,line,color=0):
             gb.log_file.write(line)
         else:
             gb.log_file.write(line + '\n')
+        gb.log_file.flush()
         if(gb.wlog):
             line = line[:(gb.wlog_size[1] - 2)]
             if(line and line[-1] == '\n'): line = line[:-1]
