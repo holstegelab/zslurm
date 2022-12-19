@@ -61,6 +61,7 @@ class Status(object):
         self.port = 0
         self.kill_idle = False
         self.lastin_first = False
+        self.prio_fillmem_context = 1
         self.used_load = numpy.array([],dtype=float)
         self.used_cpus = numpy.array([],dtype=float)
         self.used_mem = numpy.array([],dtype=float)
@@ -305,8 +306,42 @@ class JobManager(object):
             joblist = list(self.jobs_by_id.values())
             if status.lastin_first:
                 joblist = joblist[::-1]
-            for job in joblist:
+
+
+            average_mem_core = float(totmem) / float(cores)
+            while joblist:
+
+                #prioritize jobs with a good memory profile (reorder jobs)
+                if status.prio_fillmem_context > 1:      
+                    #first make a list of applicable jobs
+                    joblist_temp = list(joblist)
+                    rest = []; toconsider = []
+
+                    while joblist_temp and len(toconsider) < status.prio_fillmem_context:
+                        job = joblist_temp.pop(0)
+                        #can the job run?
+                        if job.state in queue_states and job.reqtime <= timeleft and job.ncpu <= cores and job.mem <= totmem and job.partition == partition and \
+                            ((self.active_total >= (self.active_inuse + job.active_start_use_add)) or job.active_start_use_add == 0) and \
+                            ((self.dcache_total >= (self.dcache_inuse + job.dcache_start_use_add)) or job.dcache_start_use_add == 0) and \
+                            ((self.archive_total >= (self.archive_inuse + job.archive_start_use_add)) or job.archive_start_use_add == 0):
+
+                            remain_cores = current_cpu - job.ncpu  #remain cores after scheduling this job
+                            remain_mem = current_mem - job.mem #remain mem after scheduling this job
+
+                            over_use_penalty = -(min(remain_cores,0) + (min(remain_mem/float(average_mem_core),0)/ 1024.0))    #penalty for over using cores (equal to n cores not yet available) or over using mem (too much used, in gb).
+                            memory_penalty = max((float(max(remain_mem,0)) / max(remain_cores,1)) - average_mem_core,0) / 1024.0   #penalty for having memory/core > average after scheduling (in gb)
+
+                            toconsider.append((job, float(job.mem) / job.ncpu, memory_penalty + over_use_penalty))
+                        else:
+                            rest.append(job)
+                    
+                    toconsider.sort(key=lambda x: x[2])
+                    joblist = [e[0] for e in toconsider] + rest + joblist_temp
+                
+                
                 #FIXME; assume 5 days of time
+                job = joblist.pop(0)
+
                 if job.state in queue_states and job.reqtime <= timeleft and job.ncpu <= cores and job.mem <= totmem and job.partition == partition and \
                     ((self.active_total >= (self.active_inuse + job.active_start_use_add)) or job.active_start_use_add == 0) and \
                     ((self.dcache_total >= (self.dcache_inuse + job.dcache_start_use_add)) or job.dcache_start_use_add == 0) and \
@@ -456,7 +491,6 @@ class JobManager(object):
             return ""
 
     def job_finished(self, myid, jobid, return_code,report):
-        self.lock.acquire()
         if return_code == 0:
             reason = 'Job Finished'
         elif return_code == 143 or return_code == 15:
@@ -470,6 +504,7 @@ class JobManager(object):
         
            
         name = 'unknown'
+        self.lock.acquire()
         try:
             if not jobid in self.jobs_by_id:
                 add_log_line(gb,"Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),YELLOW)
@@ -1577,9 +1612,14 @@ def main(scr, *args, **kwds):
             elif c == ord('k'): #KILL IDLE toggle
                 status.kill_idle = not status.kill_idle
                 add_log_line(gb, "Autostop idle engine set to " + ("ON" if status.kill_idle else 'OFF') ,GREEN)
-            elif c == ord('l'): #KILL IDLE toggle
+            elif c == ord('l'): #last in/first out toggle
                 status.lastin_first = not status.lastin_first
                 add_log_line(gb, "Last in / First out set to " + ("ON" if status.lastin_first else 'OFF') ,GREEN)
+            elif c == ord('m'):  #set context size to search for good fitting jobs
+                cmd = get_number(gb, "Search context size for jobs [n=1]: ", 1)
+                if(not cmd is None):
+                    status.prio_fillmem_context = max(int(cmd),1)
+                add_log_line(gb, "Fill memory context size set to " + str(cmd) ,GREEN)
             elif c == ord('u') :  # Update ncurses screen
                 gb.scr.refresh()
     except Exception:
