@@ -31,7 +31,9 @@ REGISTRATION_SLEEP = 30
 REGISTRATION_SLEEP_RANDOM = 180
 
 address = zslurm_shared.address
-port = zslurm_shared.port
+config = zslurm_shared.get_config()
+port = int(config['port'])
+
 
 cpu = psutil.cpu_count()
 partition = 'compute'

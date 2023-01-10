@@ -7,7 +7,7 @@ except:
     import httplib
 import argparse
 import sys
-s = zslurm_shared.TimeoutServerProxy(zslurm_shared.job_url, allow_none = True)
+s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = True)
 
 parser = argparse.ArgumentParser(description='Cancel XSlurm job')
 parser.add_argument('job_id', nargs='*')

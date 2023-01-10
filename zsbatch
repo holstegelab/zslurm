@@ -34,7 +34,7 @@ parser.add_argument('--parsable', action='store_true', help='Outputs only the jo
 parser.add_argument('job_args', nargs='*')
 args = parser.parse_args()
 
-s = zslurm_shared.TimeoutServerProxy(zslurm_shared.job_url, allow_none = True)
+s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = True)
 
 cwd = os.getcwd()
 env = dict(os.environ)

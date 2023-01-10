@@ -9,6 +9,10 @@ else:
 import socket
 from dns import resolver, reversename
 import time
+import yaml
+import socket
+import os
+import os.path
 
 #COMMANDS
 NOOP=0
@@ -21,6 +25,16 @@ DEASSIGN=5
 #MODES
 RUNNING = 1
 STOPPING= 2
+
+def read_yaml_config(filename):
+    with open(filename,'r', encoding='utf-8') as file:
+        yaml_config  = yaml.load(file, Loader=yaml.FullLoader)
+    return yaml_config
+
+def is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) == 0
+
 
 
 
@@ -45,7 +59,6 @@ class TimeoutServerProxy(xmlrpclib.ServerProxy):
 #self register
 port = 38864
 address = '127.0.0.1'
-job_url = 'http://' + address + ':' + str(port + 1)
 
 cache_hostname = None
 def get_full_hostname():
@@ -90,4 +103,21 @@ def get_hostname():
 
 def short_name(name):
     return name.split(".")[0]
+
+
+def get_config():
+    config_file = os.path.expanduser('~/.zslurm') 
+    config = {}
+    config['port'] = port
+    config['reports_file'] = 'reports.tsv'
     
+    if os.path.exists(config_file):
+        config.update(read_yaml_config(config_file))
+
+    return config
+
+def get_job_url(address = '127.0.0.1'):
+
+    config = get_config()
+    job_url = 'http://' + address + ':' + str(int(config['port']) + 1)
+    return job_url

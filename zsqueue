@@ -8,7 +8,7 @@ except:
     import httplib
 import argparse
 
-s = zslurm_shared.TimeoutServerProxy(zslurm_shared.job_url, allow_none = True)
+s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = True)
 
 parser = argparse.ArgumentParser(description='XSlurm Job queue listing')
 parser.add_argument('--all', action='store_true', help='Show also completed jobs.')

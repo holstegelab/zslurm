@@ -9,6 +9,7 @@ try:
 except:
     import thread as _thread
     from SimpleXMLRPCServer import SimpleXMLRPCServer
+import socket
 import threading
 from collections import defaultdict, OrderedDict
 
@@ -1486,14 +1487,14 @@ def get_number(gb,argument,default=0):
 
 
 
-
-
 def main(scr, *args, **kwds):
     address = zslurm_shared.get_hostname()
-    port = zslurm_shared.port
+    
+    config = zslurm_shared.get_config()
 
-    status.set_address(address,port)
-    status.reports_file = open('reports.tsv','w')
+
+    status.set_address(address,int(config['port']))
+    status.reports_file = open(config['reports_file'],'w')
     fieldnames = ['jobname','machine','starttime','endtime']
     for lab in ['uss','rss','vms','cpu_percentage']:
         for j in [0,5,25,50,75,95,100]:
@@ -1507,7 +1508,11 @@ def main(scr, *args, **kwds):
 
     build_windows(gb)
     t = start_status_display(gb,status)
-    start_server(port)
+
+    add_log_line(gb,"Starting servers on port %d and %d" % (int(config['port']), int(config['port'] + 1)), CYAN)
+
+    start_server(int(config['port']))
+    
    
 
     #workaround for bug in curses: no resize messages
