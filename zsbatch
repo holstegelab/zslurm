@@ -30,6 +30,7 @@ parser.add_argument('--dcache-use-remove', type=float, default=0.0, help='DCache
 parser.add_argument('--active-use-add', type=float, default=0.0, help='Active usage added by this job.') #after:job_id[:jobid...], afterany:jobid[:jobid...], afternotok:jobid[:jobid...], afterok:jobid[:jobid...], expand:jobid, singleton
 parser.add_argument('--active-use-remove', type=float, default=0.0, help='Active usage removed by this job.') #after:job_id[:jobid...], afterany:jobid[:jobid...], afternotok:jobid[:jobid...], afterok:jobid[:jobid...], expand:jobid, singleton
 parser.add_argument('--parsable', action='store_true', help='Outputs only the jobid and cluster name (if present), separated by semicolon, only on successful submission.')
+parser.add_argument('--limit-threads', type=float, default=-1, help='Changes environment to limit thread creation by OMP/OPENBLAS/MKL/VECLIB/NUMEXPR to a max value (default:-1 (disabled))')
 
 parser.add_argument('job_args', nargs='*')
 args = parser.parse_args()
@@ -39,6 +40,13 @@ s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = T
 cwd = os.getcwd()
 env = dict(os.environ)
 
+if args.limit_threads >= 1:
+    t = str(int(arg.limit_threads))
+    env["OMP_NUM_THREADS"] = t
+    env["OPENBLAS_NUM_THREADS"] = t
+    env["MKL_NUM_THREADS"] = t
+    env["VECLIB_MAXIMUM_THREADS"] = t
+    env["NUMEXPR_NUM_THREADS"] = t
 
 #parse time format
 try:

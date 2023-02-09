@@ -13,14 +13,24 @@ try:
     import http.client as httplib
 except:
     import httplib
-import numpy
+
+os.environ["OMP_NUM_THREADS"] = "1" 
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+
 import resource
+resource.setrlimit(resource.RLIMIT_NPROC, (8192, 16000))
+
+
+import numpy
 from time import gmtime, strftime
 
 def xtime():
     return (strftime("%Y-%m-%d %H:%M:%S", gmtime()))
 
-resource.setrlimit(resource.RLIMIT_NPROC, (8192, 16000))
 
 PING_INTERVAL = 20
 PING_TIMEOUT = 600
