@@ -41,7 +41,7 @@ cwd = os.getcwd()
 env = dict(os.environ)
 
 if args.limit_threads >= 1:
-    t = str(int(arg.limit_threads))
+    t = str(int(args.limit_threads))
     env["OMP_NUM_THREADS"] = t
     env["OPENBLAS_NUM_THREADS"] = t
     env["MKL_NUM_THREADS"] = t
