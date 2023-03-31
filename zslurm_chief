@@ -14,15 +14,15 @@ try:
 except:
     import httplib
 
-os.environ["OMP_NUM_THREADS"] = "1" 
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+#os.environ["OMP_NUM_THREADS"] = "1" 
+#os.environ["OPENBLAS_NUM_THREADS"] = "1"
+#os.environ["MKL_NUM_THREADS"] = "1"
+#os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+#os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
 import resource
-resource.setrlimit(resource.RLIMIT_NPROC, (8192, 16000))
+resource.setrlimit(resource.RLIMIT_NPROC, (32000, 32000))
 
 
 import numpy
@@ -432,28 +432,31 @@ try :
                 break
         if cancel_job_list:
             status.lock.acquire()
+            processes = []
             for jobid in cancel_job_list:
                 if jobid in status.running_processes:
+                    
                     p = status.running_processes[jobid]
                     try:
-                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-                    except OSError:
+                        process = psutil.Process(p.pid)
+                        processes.append(process)
+                        for proc in process.children(recursive=True):
+                            processes.append(proc)
+                            proc.terminate()
+                        process.terminate()
+                        #os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    except psutil.NoSuchProcess:
                         pass
             status.lock.release()
             
             time.sleep(10) #allow jobs some time to terminate normally
 
             #kill any remaining jobs
-            status.lock.acquire()
-            for jobid in cancel_job_list:
-                if jobid in status.running_processes:
-                    p = status.running_processes[jobid]
-                    try:
-                        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                    except OSError:
-                        pass
-            status.lock.release()
-
+            for proc in processes:
+                try:
+                    proc.kill()
+                except psutil.NoSuchProcess:
+                    pass
 
         event_timer.wait(PING_INTERVAL)
 

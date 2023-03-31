@@ -133,8 +133,24 @@ class Job(object):
         self.current_cpu_usage = 0.0
         self.current_mem_usage = 0.0
 
+    def started(self, nodeid):
+        self.node_id = nodeid
+        self.starttime = time.time()
+        self.state = 'RUNNING'
+        engines.job_running(nodeid, self)
 
+    def assigned(self,nodeid):
+        self.node_id = nodeid
+        self.state = 'ASSIGNED'
 
+    def done(self, return_code, reason, state):
+        self.endtime = time.time()
+        self.state = state
+        self.reason = reason
+        self.return_code = return_code
+        if self.node_id:
+            engines.job_stopped(self.node_id, self)
+        self.node_id = None
 
 class JobManager(object):
     def __init__(self):
@@ -285,8 +301,11 @@ class JobManager(object):
                 node_id = '(Resources)'
             else:
                 node_id = job.node_id
+            arch_use = job.archive_start_use_add - job.archive_end_use_remove 
+            active_use = job.active_start_use_add - job.active_end_use_remove
+            dcache_use = job.dcache_start_use_add - job.dcache_end_use_remove
 
-            jobs.append([job.jobid, job.job_name, job.state, runtime, job.ncpu, job.partition, node_id, job.current_cpu_usage, job.current_mem_usage])
+            jobs.append([job.jobid, job.job_name, job.state, runtime, job.ncpu, job.partition, node_id, job.current_cpu_usage, job.current_mem_usage, arch_use, active_use, dcache_use])
 
         return jobs        
     
@@ -342,29 +361,28 @@ class JobManager(object):
                 
                 #FIXME; assume 5 days of time
                 job = joblist.pop(0)
-
+                #add_log_line(gb, str((job.state, job.reqtime, timeleft, job.ncpu, cores, job.mem, totmem, job.partition, partition)))
+                #add_log_line(gb, str((self.active_total, self.active_inuse, job.active_start_use_add)))
                 if job.state in queue_states and job.reqtime <= timeleft and job.ncpu <= cores and job.mem <= totmem and job.partition == partition and \
                     ((self.active_total >= (self.active_inuse + job.active_start_use_add)) or job.active_start_use_add == 0) and \
                     ((self.dcache_total >= (self.dcache_inuse + job.dcache_start_use_add)) or job.dcache_start_use_add == 0) and \
                     ((self.archive_total >= (self.archive_inuse + job.archive_start_use_add)) or job.archive_start_use_add == 0):
 
+                    #add_log_line(gb, 'SELECT')
                     self.active_inuse += job.active_start_use_add
                     self.dcache_inuse += job.dcache_start_use_add
                     self.archive_inuse += job.archive_start_use_add
 
                     if not (job.ncpu <= current_cpu and job.mem <= current_mem):
-                        job.state = 'ASSIGNED'
                         add_log_line(gb,"Job %s (id: %s) assigned to node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
+                        job.assigned(myid)
                     else:
-                        job.state = 'RUNNING'
                         add_log_line(gb,"Job %s (id: %s) started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
+                        job.started(myid)
                         self.running_jobs += 1
-                        job.starttime = time.time()
                
                     current_cpu -= job.ncpu
                     current_mem -= job.mem
-
-                    job.node_id = myid
 
                     res =  (job.jobid, job.command, job.cwd, job.env, job.ncpu, job.mem, job.state)
                     allres.append(res)
@@ -383,15 +401,13 @@ class JobManager(object):
                         except KeyError:
                             pass
 
-                        job.state = 'RUNNING'
                         add_log_line(gb,"Job %s (id: %s) reassigned and started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu, current_mem), BLUE)
                         self.running_jobs += 1
-                        job.starttime = time.time()
+                        job.started(myid)
                 
                         current_cpu -= job.ncpu
                         current_mem -= job.mem
 
-                        job.node_id = myid
 
                         res =  (job.jobid, job.command, job.cwd, job.env, job.ncpu, job.mem, job.state)
                         allres.append(res)
@@ -435,11 +451,8 @@ class JobManager(object):
         self.lock.acquire()
         try:
             job = self.jobs_by_id[jobid]
-            job.state = 'RUNNING'
             self.running_jobs += 1
-            job.starttime = time.time()
-            job.node_id = node_id
-
+            job.started(node_id)
         finally:        
             self.lock.release()
         
@@ -461,29 +474,31 @@ class JobManager(object):
                         self.dcache_inuse -= job.dcache_start_use_add
 
                 if not job.node_id is None and not return_code == -255:
-                    job.endtime = time.time()
-                    job.node_id = None
                     self.running_jobs -=1
-
+                
                 if return_code != 0 and return_code != -255 and return_code != 15 and job.requeue > 0: #-255 is cancelled
                     job.requeue -= 1
                     job.mem = job.mem * 2
-                    job.state = 'REQUEUED'
+                    newstate = 'REQUEUED'
                     job.starttime = None
                 elif return_code == -1:                                    
-                    job.state = 'REQUEUED'
+                    newstate = 'REQUEUED'
                     job.starttime = None
                 else:
                     job =  self.jobs_by_id[jobid]
                     del self.jobs_by_id[jobid]
                     self.jobs_done_counter += 1
                     self.total_jobs -= 1
-
                     if return_code != 0 and return_code != -255 and return_code != 15:
                         self.failed_jobs += 1
+                        newstate = "FAILED"
+                    elif return_code == 255 or return_code == 15:
+                        newstate = "CANCELLED"
+                    else:
+                        newstate='FINISHED'
 
-                job.return_code = return_code
-                job.reason = reason
+                job.done(return_code, reason, newstate)
+
         finally:        
             self.lock.release()
         if not job is None:
@@ -568,7 +583,7 @@ class Engine(object):
         self.lastseen = time.time()
 
         self.pending_commands = []
-        self.jobs = []
+        self.jobs = set()
 
         self.cpu_usage = 0.0
         self.mem_usage = 0.0
@@ -592,6 +607,16 @@ class EngineManager(object):
         self.cluster_queued_engines_archive = 0
         self.cluster_running_engines_archive = 0
 
+    def job_running(self, clusterid, job):
+        engine = self.engine_by_clusterid.get(clusterid, None)
+        if engine:
+            engine.jobs.add(job)
+
+
+    def job_stopped(self, clusterid, job):
+        engine = self.engine_by_clusterid.get(clusterid, None)
+        if engine:
+            engine.jobs.discard(job)
 
     def list_nodes(self):
         result = []
@@ -671,7 +696,7 @@ class EngineManager(object):
 
         for cid,engine in list(self.engine_by_clusterid.items()):
             if not engine.cluster_id is False and not engine.cluster_id in observed_cluster_ids:
-                add_log_line(gb, f'Engine {engine.engine_id} @ {engine.cluster_id} disappeared from Slurm..', RED)
+                add_log_line(gb, f'Engine {engine.engine_id} @ {engine.cluster_id} disappeared from Slurm.', RED)
                 self._unregister(engine.engine_id, 'Engine disappeared')
                 
         self.cluster_queued_engines = nqueue
@@ -1095,7 +1120,7 @@ def thread_log_output(file, gb, color, filter):
         if (filter and len([f for f in filter if f in line]) > 0) :
             pass
         else:    
-            add_log_line(gb,line.decode('utf-8'),color)
+            add_log_line(gb,line.decode('utf-8','ignore'),color)
 
 def log_output(file, gb, color = 0, filter = []):
     t = _thread.start_new_thread(thread_log_output, (file, gb, color, filter))
@@ -1368,7 +1393,7 @@ def add_log_line(gb,line,color=0):
                 gb.wlog.addstr(gb.wlog_size[0] - 1,1,line,curses.color_pair(color))
             gb.wlog.refresh()
     except Exception as e:
-        print(e)
+        pass
     finally:
         gb.lock.release()
 

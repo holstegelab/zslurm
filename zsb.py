@@ -48,7 +48,7 @@ def get_jobs():
     while attempt > 0 :
         try:
             jobs = s.list_jobs()
-            return [int(jobid) for jobid, job_name, state, runtime, cpus, partition, node in jobs]
+            return [int(jobid) for jobid, job_name, state, runtime, cpus, partition, node, arch_use, active_use, dcache_use in jobs]
         except (socket.error, httplib.HTTPException) as serror:
             time.sleep(15)
             attempt -= 1
