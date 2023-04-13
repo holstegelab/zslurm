@@ -607,14 +607,14 @@ class EngineManager(object):
         self.cluster_queued_engines_archive = 0
         self.cluster_running_engines_archive = 0
 
-    def job_running(self, clusterid, job):
-        engine = self.engine_by_clusterid.get(clusterid, None)
+    def job_running(self, eid, job):
+        engine = self.engine_by_id.get(eid, None)
         if engine:
             engine.jobs.add(job)
 
 
-    def job_stopped(self, clusterid, job):
-        engine = self.engine_by_clusterid.get(clusterid, None)
+    def job_stopped(self, eid, job):
+        engine = self.engine_by_id.get(eid, None)
         if engine:
             engine.jobs.discard(job)
 
