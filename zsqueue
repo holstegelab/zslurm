@@ -13,6 +13,7 @@ s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = T
 parser = argparse.ArgumentParser(description='XSlurm Job queue listing')
 parser.add_argument('--all', action='store_true', help='Show also completed jobs.')
 parser.add_argument('--done', action='store_true', help='Show only completed jobs.')
+parser.add_argument('--pretty', action='store_true', help='Pretty print the table.')
 args = parser.parse_args()
 try:
     if args.done:
@@ -22,27 +23,19 @@ try:
     else:
         jobs = s.list_jobs()
     user = getpass.getuser()
-    
-    print("JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODES\tCPU\tMEM\tACTIVE\tARCH\tDCACHE")
-    for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use in jobs:
-        days = 0
-        hours = 0
-        minutes = 0
-        while runtime > (24 * 60 * 60):
-            days += 1
-            runtime -= 24 * 60 * 60
-        while runtime > 60 * 60:
-            hours += 1
-            runtime -= 60 * 60
-        while runtime > 60:
-            minutes += 1
-            runtime -= 60
-        seconds = runtime
-        runtime = '%d:%d:%d' % ( hours, minutes, seconds)
-        if days > 0:
-            runtime = ('%d-' % days) + runtime
-
-        print('%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%.1f\t%.1f Gb\t%.1f Gb\t%.1f Gb\t%.1f Gb' % (jobid, partition, job_name, user, state, runtime, cpus, node, cpu_usage * 100.0, mem_usage  / 1024.0, active_use, arch_use, dcache_use))
+  
+    if args.pretty:
+        table = []
+        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use in jobs:
+            runtime = zslurm_shared.format_time(runtime)
+            table.append([jobid, partition, job_name, user, state, runtime, cpus, node, '%.1f' % (cpu_usage * 100.0), '%.1f Gb' % (mem_usage / 1024.0), '%.1f Gb' % active_use, '%.1f Gb' % arch_use, '%.1f Gb' % dcache_use])
+        import tabulate
+        print(tabulate.tabulate(table, headers=['JOBID','PARTITION','NAME','USER','STATE','TIME','CORES','NODES','CPU','MEM','ACTIVE','ARCH','DCACHE']))
+    else:
+        print("JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODES\tCPU\tMEM\tACTIVE\tARCH\tDCACHE")
+        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use in jobs:
+            runtime = zslurm_shared.format_time(runtime)
+            print('%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%.1f\t%.1f Gb\t%.1f Gb\t%.1f Gb\t%.1f Gb' % (jobid, partition, job_name, user, state, runtime, cpus, node, cpu_usage * 100.0, mem_usage  / 1024.0, active_use, arch_use, dcache_use))
 
 except (socket.error, httplib.HTTPException) as serror:
     print('Queue request failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)

@@ -121,3 +121,24 @@ def get_job_url(address = '127.0.0.1'):
     config = get_config()
     job_url = 'http://' + address + ':' + str(int(config['port']) + 1)
     return job_url
+
+def format_time(rtime):
+    days = 0
+    hours = 0
+    minutes = 0
+    while rtime > (24 * 60 * 60):
+        days += 1
+        rtime -= 24 * 60 * 60
+    while rtime > 60 * 60:
+        hours += 1
+        rtime -= 60 * 60
+    while rtime > 60:
+        minutes += 1
+        rtime -= 60
+    seconds = rtime
+    rtime = '%d:%d:%d' % ( hours, minutes, seconds)
+    if days > 0:
+        rtime = ('%d-' % days) + rtime
+    
+    return rtime
+   

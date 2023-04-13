@@ -12,47 +12,25 @@ s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = T
 
 parser = argparse.ArgumentParser(description='ZSlurm node listing')
 parser.add_argument('--all', action='store_true', help='Show also queued nodes.')
+parser.add_argument('--pretty', action='store_true', help='Pretty print the table.')
 args = parser.parse_args()
 try:
     nodes = s.list_nodes()
     
-    print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tLOAD")
-    for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load in nodes:
-        days = 0
-        hours = 0
-        minutes = 0
-        while runtime > (24 * 60 * 60):
-            days += 1
-            runtime -= 24 * 60 * 60
-        while runtime > 60 * 60:
-            hours += 1
-            runtime -= 60 * 60
-        while runtime > 60:
-            minutes += 1
-            runtime -= 60
-        seconds = runtime
-        runtime = '%d:%d:%d' % ( hours, minutes, seconds)
-        if days > 0:
-            runtime = ('%d-' % days) + runtime
-                    
-        days = 0
-        hours = 0
-        minutes = 0
-        while timeleft > (24 * 60 * 60):
-            days += 1
-            timeleft -= 24 * 60 * 60
-        while timeleft > 60 * 60:
-            hours += 1
-            timeleft -= 60 * 60
-        while timeleft > 60:
-            minutes += 1
-            timeleft -= 60
-        seconds = timeleft
-        timeleft = '%d:%d:%d' % ( hours, minutes, seconds)
-        if days > 0:
-            timeleft = ('%d-' % days) + timeleft
- 
-        print('%s\t%s\t%s\t%.0f\t%.1fGb\t%s\t%s\t%d\t%.1f\t%.1f\t%.1f' % (engine_id, cluster_id, partition, cores, totmem/1024.0, runtime, timeleft, njobs, cpu_usage, mem_usage, load))
+    if args.pretty:
+        table = []
+        for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load in nodes:
+            runtime = zslurm_shared.format_time(runtime)
+            timeleft = zslurm_shared.format_time(timeleft)
+            table.append([engine_id, cluster_id, partition, '%.0f' % cores, '%.1fGb' % (totmem/1024.0), runtime, timeleft,  njobs, '%.1f' % cpu_usage, '%.1f' % mem_usage, '%.1f' % load])
+        import tabulate            
+        print(tabulate.tabulate(table, headers=['ID','SLURM','PARTITION','CORES','MEM','TIME','REMAINING','NJOBS','CPU','MEM','LOAD']))
+    else:
+        print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tLOAD")
+        for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load in nodes:
+            runtime = zslurm_shared.format_time(runtime)
+            timeleft = zslurm_shared.format_time(timeleft)
+            print('%s\t%s\t%s\t%.0f\t%.1fGb\t%s\t%s\t%d\t%.1f\t%.1f\t%.1f' % (engine_id, cluster_id, partition, cores, totmem/1024.0, runtime, timeleft, njobs, cpu_usage, mem_usage, load))
 
 except (socket.error, httplib.HTTPException) as serror:
     print('Queue request failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)
