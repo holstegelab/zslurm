@@ -718,7 +718,7 @@ class EngineManager(object):
             else: 
                 set_status_message(gb,"Starting local engines", YELLOW)
                 chief_path = "zslurm_chief"
-                cmd = chief_path + " -a " + str(status.address) + " -p " + str(status.port) + " -c %d" % ncpu
+                cmd = chief_path + f" -a {status.address} -p {status.port} -c {ncpu} -m {mem}"
                 add_log_line(gb,"Starting local engine using: " + cmd, GREEN)
                 args = shlex.split(cmd)
             
