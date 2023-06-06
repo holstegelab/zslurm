@@ -163,8 +163,10 @@ class status:
     current_mem_usage = {}
 
 def job_monitor(jobid, process, ncpu, mem):
-    memcache = []
-    cpucache = []
+    memcache = [] #stores memory usage at different snapshots over time
+    cpucache = [] #stores cpu usage at different snapshots over time
+    iocache = {} #stores latest known io counter info per process. Note that this is an estimate, when a child process stops this information disappears, so we might miss the last 30 seconds of io per child process.
+
     retcode = None
     resources = None
     lastcpureport = None
@@ -203,10 +205,14 @@ def job_monitor(jobid, process, ncpu, mem):
                 try:
                     with ps.oneshot():
                         c = ps.cpu_times()
-                        lastcpureport={'user':c.user,'system':c.system,'children_user':c.children_user,'children_system':c.children_system, 'iowait':c.iowait}
+                        nt = ps.num_threads()
+                        lastcpureport={'user':c.user,'system':c.system,'children_user':c.children_user,'children_system':c.children_system, 'iowait':c.iowait, 'nthreads':nt}
 
                         m = ps.memory_full_info()
                         r = {'uss':m.uss,'rss':m.rss,'vms':m.vms, 'pss':m.pss}
+
+                        ix = ps.io_counters()
+                        iocache[ps.pid] = {'read_count':ix.read_count, 'write_count':ix.write_count, 'read_bytes':ix.read_chars, 'write_bytes':ix.write_chars}
                         
                         for m in ps.children(recursive=True):
                             try:
@@ -214,6 +220,12 @@ def job_monitor(jobid, process, ncpu, mem):
                                     cx = m.cpu_times()
                                     for lab in ['user','system','children_user','children_system','iowait']:
                                         lastcpureport[lab] += getattr(cx,lab)
+                                    lastcpureport['nthreads'] += m.num_threads()
+
+                                    imx = m.io_counters()
+                                    iocache[m.pid] = {'read_count':imx.read_count, 'write_count':imx.write_count, 'read_bytes':imx.read_chars, 'write_bytes':imx.write_chars}
+
+
                                     mx = m.memory_full_info()
                                     for lab in ['uss','rss','vms','pss']:
                                         r[lab] += getattr(mx,lab)
@@ -221,11 +233,13 @@ def job_monitor(jobid, process, ncpu, mem):
                                 continue #process did probably end
                             except psutil.NoSuchProcess:
                                 continue
-                        memcache.append(r)
+                    memcache.append(r)
 
                     spend_time = (lastcpureport['user'] + lastcpureport['system'] + lastcpureport['children_user'] + lastcpureport['children_system']) 
                     cpu_percentage = ((spend_time - prevspend_time) / (report_time - last_report_time))
-                    cpucache.append(cpu_percentage)
+                    lastcpureport['cpu_perc'] = cpu_percentage
+                    cpucache.append(lastcpureport)
+
                     last_report_time = report_time
                     if prevspend_time > 0:
                         status.lock.acquire()
@@ -264,9 +278,15 @@ def job_monitor(jobid, process, ncpu, mem):
     if len(memcache) > 0:
         for lab in ['uss','rss','vms']:
             report[lab] = list([float(e)/(1024.0 * 1024.0) for e in numpy.percentile([e[lab] for e in memcache],[0,5,25,50,75,95,100])])
-        report['cpu_percentage'] = list([float(e) for e in numpy.percentile(cpucache, [0,5,25,50,75,95,100])])
-    print(("%s - Job %s done with rcode %s" % (xtime(), str(jobid), str(retcode))))
-    print ("%s - Report %s" % (xtime(), str(report)))
+        report['cpu_percentage'] = list([float(e) for e in numpy.percentile([e['cpu_perc'] for e in cpucache], [0,5,25,50,75,95,100])])
+        report['nthreads_avg'] = float(numpy.mean([e['nthreads'] for e in cpucache]))
+        report['nthreads_max'] = float(numpy.max([e['nthreads'] for e in cpucache]))
+
+    if len(iocache) > 0: 
+        for lab in ['read_count','read_bytes','write_count','write_bytes']:
+            report[lab] = float(numpy.sum([e[lab] for e in iocache.values()]))
+    #print(("%s - Job %s done with rcode %s" % (xtime(), str(jobid), str(retcode))))
+    #print ("%s - Report %s" % (xtime(), str(report)))
 
     status.lock.acquire()
     status.return_codes[jobid] = retcode
@@ -307,7 +327,7 @@ try :
             for jobid, rcode in list(status.return_codes.items()):
                 try :
                     s.job_finished(myid, jobid, rcode,status.reports.get(jobid,{'no_job_report':True, 'jobid':jobid}))
-                    print('%s - Reported that job %s finished with rcode %s' % (xtime(), str(jobid), str(rcode)))
+                    #print('%s - Reported that job %s finished with rcode %s' % (xtime(), str(jobid), str(rcode)))
 
                     status.reports.pop(jobid,None)
                 except (socket.error, httplib.HTTPException) as serror :
@@ -322,15 +342,15 @@ try :
         mb_memory_available = e_memtot - sum(status.current_mem_usage.values(),0.0)
         
         status.lock.acquire()  
-        print("%s - CYCLE" % xtime(), str(status.current_cpu), str(status.current_mem), str(mb_memory_available))
+        #print("%s - CYCLE" % xtime(), str(status.current_cpu), str(status.current_mem), str(mb_memory_available))
         if mode == zslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0 and mb_memory_available > 1024.0:
             if status.assigned_jobs:
                 jobs = list(status.assigned_jobs.values())
             else:
                 try:
-                    print("%s - REQUEST"%xtime(), myid, str(status.current_cpu), str(status.current_mem), str(mb_memory_available), partition)
+                    #print("%s - REQUEST"%xtime(), myid, str(status.current_cpu), str(status.current_mem), str(mb_memory_available), partition)
                     jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available), partition)
-                    print('%s - REQUEST RESULT' % xtime(), len(jobs))
+                    #print('%s - REQUEST RESULT' % xtime(), len(jobs))
                 except (socket.error, httplib.HTTPException) as serror :
                     print ("%s - REQUEST HTTP Error" % xtime())
                     jobs = []
@@ -347,10 +367,10 @@ try :
                             continue
 
                     else:
-                        print("%s - DELAY" % xtime())
+                        #print("%s - DELAY" % xtime())
                         status.assigned_jobs[jobid] = job
                         continue
-                print("%s - EXECUTE" % xtime())
+                #print("%s - EXECUTE" % xtime())
                 #start job
                 curdir = os.getcwd()
                 os.chdir(cwd)

@@ -158,12 +158,12 @@ class JobManager(object):
 
         self.jobs_by_id = OrderedDict()
 
-        self.jobs_done_counter = 0
         self.lock = threading.RLock()
 
-        self.failed_jobs = 0
-        self.running_jobs = 0
-        self.total_jobs = 0
+        self.done_jobs = {}
+        self.failed_jobs = {} # count per partition (compute, archive)
+        self.running_jobs = {}  #count per partition (compute, archive)
+        self.total_jobs = {}   #count per partition (compute, archive)
 
         self.active_total = 0
         self.active_inuse = 0
@@ -174,7 +174,7 @@ class JobManager(object):
    
     
     def get_job_stats(self):
-        return (self.total_jobs, self.running_jobs, self.failed_jobs, self.jobs_done_counter)
+        return (self.total_jobs, self.running_jobs, self.failed_jobs, self.done_jobs)
     
 
     def active_engines(self):
@@ -222,7 +222,7 @@ class JobManager(object):
         self.lock.acquire()
         jobid = str(self.jobid_counter)
         self.jobid_counter += 1
-        self.total_jobs += 1
+        self.total_jobs[partition] = self.total_jobs.get(partition,0) + 1
         self.lock.release()
     
 
@@ -379,7 +379,7 @@ class JobManager(object):
                     else:
                         add_log_line(gb,"Job %s (id: %s) started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu-job.ncpu, current_mem-job.mem), BLUE)
                         job.started(myid)
-                        self.running_jobs += 1
+                        self.running_jobs[job.partition] = self.running_jobs.get(job.partition, 0) + 1
                
                     current_cpu -= job.ncpu
                     current_mem -= job.mem
@@ -402,7 +402,7 @@ class JobManager(object):
                             pass
 
                         add_log_line(gb,"Job %s (id: %s) reassigned and started on node %s (%d/%d remaining)" % (job.job_name, job.jobid, myid, current_cpu, current_mem), BLUE)
-                        self.running_jobs += 1
+                        self.running_jobs[job.partition] = self.running_jobs.get(job.partition, 0) + 1
                         job.started(myid)
                 
                         current_cpu -= job.ncpu
@@ -451,7 +451,7 @@ class JobManager(object):
         self.lock.acquire()
         try:
             job = self.jobs_by_id[jobid]
-            self.running_jobs += 1
+            self.running_jobs[job.partition] = self.running_jobs.get(job.partition, 0) + 1
             job.started(node_id)
         finally:        
             self.lock.release()
@@ -474,7 +474,7 @@ class JobManager(object):
                         self.dcache_inuse -= job.dcache_start_use_add
 
                 if not job.node_id is None and not return_code == -255:
-                    self.running_jobs -=1
+                    self.running_jobs[job.partition] = self.running_jobs.get(job.partition, 0) - 1
                 
                 if return_code != 0 and return_code != -255 and return_code != 15 and job.requeue > 0: #-255 is cancelled
                     job.requeue -= 1
@@ -487,10 +487,10 @@ class JobManager(object):
                 else:
                     job =  self.jobs_by_id[jobid]
                     del self.jobs_by_id[jobid]
-                    self.jobs_done_counter += 1
-                    self.total_jobs -= 1
+                    self.done_jobs[job.partition] = self.done_jobs.get(job.partition,0) + 1 
+                    self.total_jobs[job.partition] = self.total_jobs.get(job.partition,0) - 1
                     if return_code != 0 and return_code != -255 and return_code != 15:
-                        self.failed_jobs += 1
+                        self.failed_jobs[job.partition] = self.failed_jobs.get(job.partition,0) + 1
                         newstate = "FAILED"
                     elif return_code == 255 or return_code == 15:
                         newstate = "CANCELLED"
@@ -524,20 +524,27 @@ class JobManager(object):
         try:
             if not jobid in self.jobs_by_id:
                 add_log_line(gb,"Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),YELLOW)
+                core_reserved = 0
+                mem_reserved = 0
             else:
+                job = self.jobs_by_id[jobid]
+                mem_reserved = job.mem
+                core_reserved = job.ncpu
                 name = self.job_done(jobid, return_code, reason)
+
             
         finally:
             self.lock.release()
        
         
         if 'starttime' in report:
-            line = [name, myid, report.get('starttime',''), report.get('endtime','')]
+            line = [name, report.get('retcode',''), myid, report.get('starttime',''), report.get('endtime',''), core_reserved, mem_reserved]
             nostat = [''] * 7
             for lab in ['uss','rss','vms','cpu_percentage']:
                 line.extend(report.get(lab,nostat))
             
-            for lab in ['runtime','montime','avg_cpu_percentage', 'user','system','maxrss','mon_user','mon_system','iowait','retcode']:
+            for lab in ['runtime','montime','avg_cpu_percentage', 'nthreads_avg','nthreads_max', 'user','system','maxrss','mon_user','mon_system','iowait',
+                            'read_count','write_count','read_bytes','write_bytes']:
                 line.append(report.get(lab,''))
             status.reports_file.write('\t'.join([str(e) for e in line])  + '\n')
             status.reports_file.flush()
@@ -572,9 +579,9 @@ def thread_start_job_server(port):
 
 
 class Engine(object):
-    def __init__(self, engine_id, cores, totmem, partition):
+    def __init__(self, engine_id='?', cores=0, totmem=0, partition='',cluster_id=None):
         self.engine_id = engine_id
-        self.cluster_id = None
+        self.cluster_id = cluster_id
 
         self.cores = cores
         self.totmem = totmem
@@ -697,7 +704,7 @@ class EngineManager(object):
         for cid,engine in list(self.engine_by_clusterid.items()):
             if not engine.cluster_id is False and not engine.cluster_id in observed_cluster_ids:
                 add_log_line(gb, f'Engine {engine.engine_id} @ {engine.cluster_id} disappeared from Slurm.', RED)
-                self._unregister(engine.engine_id, 'Engine disappeared')
+                self._unregister(engine, 'Engine disappeared')
                 
         self.cluster_queued_engines = nqueue
         self.cluster_running_engines = nrunning
@@ -814,6 +821,13 @@ class EngineManager(object):
                     add_log_line(gb, 'Error during SLURM submission.', RED)
                     return
 
+                if n == 1:
+                    self.engine_by_clusterid[eid] = Engine(cluster_id = eid)
+                else:
+                    for i in range(n):
+                        cid = eid + '_' + str(i)
+                        self.engine_by_clusterid[cid] = Engine(cluster_id = cid)
+                        
 
                 time.sleep(3)
                 set_status_message(gb,"SLURM engines queued",GREEN)
@@ -830,7 +844,7 @@ class EngineManager(object):
             elif(n < 0 or n > self.count_cluster_engines()):
                 set_status_message(gb,"Invalid number of engines to be stopped: " + str(n),YELLOW)
             else:
-                set_status_message(gb,"Stopping SLURM engines",YELLOW)
+                set_status_message(gb,f"Stopping {n} SLURM engines",YELLOW)
 
                 #stop queued engines
                 stop_engines = []
@@ -841,7 +855,6 @@ class EngineManager(object):
                
                 stop_engines.sort()
                 stop_engines = stop_engines[::-1] #cancel youngest non-running engine
-
                 #stop idle engines
                 if len(stop_engines) < n:
                     stop_engines2 = []
@@ -895,7 +908,7 @@ class EngineManager(object):
             if cid in self.engine_by_clusterid:
                 e = self.engine_by_clusterid[cid]
                 if not e is None:
-                    self._unregister(e.engine_id, reason='Engine stopped')
+                    self._unregister(e, reason='Engine stopped')
         finally:
             self.lock.release()
    
@@ -922,7 +935,6 @@ class EngineManager(object):
             myid = myx                
 
             e = Engine(myid, cores, totmem, partition)
-            e.timeleft = 5 * 24 * 60 * 60
             
             self.engine_by_id[myid] = e
             if myid == zslurm_shared.short_name(status.address) or cluster_jobid == '':
@@ -952,7 +964,7 @@ class EngineManager(object):
            
             commands = e.pending_commands
             # kill if idle for 3 minutes, but not if local engine or archive engine  (except if no extra jobs)
-            if idle > 180.0 and (e.partition != 'archive' or (jobs.running_jobs == 0)) and status.kill_idle and not myid == zslurm_shared.short_name(status.address):
+            if idle > 180.0 and (e.partition != 'archive' or (sum(jobs.running_jobs.values()) == 0)) and status.kill_idle and not myid == zslurm_shared.get_hostname():
                 add_log_line(gb,"Stopping idle engine: " + myid, YELLOW)
 
                 commands.append((zslurm_shared.STOP,None))
@@ -984,8 +996,13 @@ class EngineManager(object):
         return commands
             
     def unregister(self, myid):
-        self._unregister(myid, 'Engine unregistered')
-        add_log_line(gb,"Engine with id " + myid + " unregistered",CYAN)
+        if myid in self.engine_by_id:
+            e = self.engine_by_id[myid]
+            self._unregister(e, 'Engine unregistered')
+            add_log_line(gb,"Engine with id " + myid + " unregistered",CYAN)
+        else:
+            add_log_line(gb,"Unregister request for unknown engine: " + myid, RED)
+        
         return True
 
     def terminate_engine(self, myid):
@@ -999,15 +1016,12 @@ class EngineManager(object):
         finally:
             self.lock.release()
 
-    def _unregister(self, myid, reason='Engine disappeared'):
-        jobs.engine_removed(myid, reason=reason)
+    def _unregister(self, engine, reason='Engine disappeared'):
+        jobs.engine_removed(engine.engine_id, reason=reason)
         self.lock.acquire()
         try:
-            if myid in self.engine_by_id:
-                e = self.engine_by_id[myid]
-                if e.cluster_id in self.engine_by_clusterid:
-                    del self.engine_by_clusterid[e.cluster_id]
-                del self.engine_by_id[myid]
+            self.engine_by_id.pop(engine.engine_id,'')
+            self.engine_by_clusterid.pop(engine.cluster_id,'')
             
         finally:
             self.lock.release()
@@ -1043,12 +1057,13 @@ def thread_check_commands():
         total_cpus = []
         total_mem = []
         for engine in all_engines:
-            total_cpus.append(engine.cores)
-            total_mem.append(engine.totmem / 1024.0)
+            if not engine.partition == 'archive':
+                total_cpus.append(engine.cores)
+                total_mem.append(engine.totmem / 1024.0)
 
-            used_cpus.append(engine.cores * (engine.cpu_usage / 100.0))
-            used_mem.append((engine.totmem / 1024.0) * (engine.mem_usage/100.0))
-            used_load.append(engine.cores * engine.load)
+                used_cpus.append(engine.cores * (engine.cpu_usage / 100.0))
+                used_mem.append((engine.totmem / 1024.0) * (engine.mem_usage/100.0))
+                used_load.append(engine.cores * engine.load)
 
 
         status.used_cpus = numpy.array(used_cpus)
@@ -1188,17 +1203,19 @@ def thread_display_status(gb,status):
             if(gb.wcom_status and gb.wcom_status.getmaxyx()[1] > 50):
                 sizey = gb.wcom_status.getmaxyx()[1]
                 gb.wcom_status.erase()
-                gb.wcom_status.addstr(1,1,"Jobs: ")
-                gb.wcom_status.addstr(1,18,"%d/%d (%d completed, %d failed)" % (nrunning, njobs, ncompleted,  nfailed),curses.color_pair(GREEN))
+                gb.wcom_status.addstr(1,1,"Compute jobs: ")
+                gb.wcom_status.addstr(1,18,"%d/%d (%d completed, %d failed)" % (nrunning.get('compute',0), njobs.get('compute',0), ncompleted.get('compute',0),  nfailed.get('compute',0)),curses.color_pair(GREEN))
+                gb.wcom_status.addstr(2,1,"Archive jobs: ")
+                gb.wcom_status.addstr(2,18,"%d/%d (%d completed, %d failed)" % (nrunning.get('archive',0), njobs.get('archive',0), ncompleted.get('archive',0),  nfailed.get('archive',0)),curses.color_pair(GREEN))
+               
                 
-                
-                gb.wcom_status.addstr(3,1,"Local engine: ")
+                gb.wcom_status.addstr(4,1,"Local engine: ")
                 if not local_running:
-                   gb.wcom_status.addstr(3,18,"NOT RUNNING",curses.color_pair(YELLOW))
+                   gb.wcom_status.addstr(4,18,"NOT RUNNING",curses.color_pair(YELLOW))
                 else:
-                   gb.wcom_status.addstr(3,18,"RUNNING",curses.color_pair(GREEN))
+                   gb.wcom_status.addstr(4,18,"RUNNING",curses.color_pair(GREEN))
 
-                gb.wcom_status.addstr(5,1,"SLURM engines: ")
+                gb.wcom_status.addstr(6,1,"SLURM engines: ")
                 enodes = erunning + equeue
 
                 cpu_c = GREEN
@@ -1229,40 +1246,40 @@ def thread_display_status(gb,status):
                     mem_usage = numpy.zeros(5,dtype=float)
                     load = numpy.zeros(5,dtype=float)
 
-                gb.wcom_status.addstr(6,1,"Archive engines: ")
+                gb.wcom_status.addstr(7,1,"Archive engines: ")
                 enodes_archive = erunning_archive + equeue_archive
 
 
-                gb.wcom_status.addstr(8,1,"CPU usage: ")
-                gb.wcom_status.addstr(8,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                gb.wcom_status.addstr(9,1,"CPU usage: ")
+                gb.wcom_status.addstr(9,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
                         % ((numpy.sum(status.used_cpus), numpy.sum(status.total_cpus)) + tuple(cpu_usage)), curses.color_pair(cpu_c))
 
-                gb.wcom_status.addstr(9,1,"Load: ")
-                gb.wcom_status.addstr(9,18, "%.0f/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                gb.wcom_status.addstr(10,1,"Load: ")
+                gb.wcom_status.addstr(10,18, "%.0f/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
                         % ((numpy.sum(status.used_load), numpy.sum(status.total_cpus)) + tuple(load)), curses.color_pair(load_c))
 
-                gb.wcom_status.addstr(10,1,"Mem usage (GB): ")
-                gb.wcom_status.addstr(10,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                gb.wcom_status.addstr(11,1,"Mem usage (GB): ")
+                gb.wcom_status.addstr(11,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
                         % ((numpy.sum(status.used_mem), numpy.sum(status.total_mem)) + tuple(mem_usage)), curses.color_pair(mem_c))
                                                      
                 if not rc is None:
-                    gb.wcom_status.addstr(12,1,"IPEngines: ")
-                    gb.wcom_status.addstr(12,18, "%d / %d / %d" % (running, queue, completed), curses.color_pair(GREEN))
+                    gb.wcom_status.addstr(13,1,"IPEngines: ")
+                    gb.wcom_status.addstr(13,18, "%d / %d / %d" % (running, queue, completed), curses.color_pair(GREEN))
 
-                gb.wcom_status.addstr(14, 1, "Archive: ")
-                gb.wcom_status.addstr(15, 1, "Active: ")
-                gb.wcom_status.addstr(16, 1, "DCache: ")
-                gb.wcom_status.addstr(14, 18, "%d / %d" % (jobs.archive_inuse, jobs.archive_total), curses.color_pair(GREEN))
-                gb.wcom_status.addstr(15, 18, "%d / %d" % (jobs.active_inuse, jobs.active_total), curses.color_pair(GREEN))
-                gb.wcom_status.addstr(16, 18, "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total), curses.color_pair(GREEN))
+                gb.wcom_status.addstr(15, 1, "Archive: ")
+                gb.wcom_status.addstr(16, 1, "Active: ")
+                gb.wcom_status.addstr(17, 1, "DCache: ")
+                gb.wcom_status.addstr(15, 18, "%d / %d" % (jobs.archive_inuse, jobs.archive_total), curses.color_pair(GREEN))
+                gb.wcom_status.addstr(16, 18, "%d / %d" % (jobs.active_inuse, jobs.active_total), curses.color_pair(GREEN))
+                gb.wcom_status.addstr(17, 18, "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total), curses.color_pair(GREEN))
 
 
                 if equeue == 0:
                     color = GREEN
                 else:
                     color = YELLOW
-                gb.wcom_status.addstr(5,18,"%d/%d" % (erunning,enodes),curses.color_pair(color))
-                gb.wcom_status.addstr(6,18,"%d/%d" % (erunning_archive,enodes_archive),curses.color_pair(color))
+                gb.wcom_status.addstr(6,18,"%d/%d" % (erunning,enodes),curses.color_pair(color))
+                gb.wcom_status.addstr(7,18,"%d/%d" % (erunning_archive,enodes_archive),curses.color_pair(color))
 
                 
                 gb.wcom_status.refresh()
@@ -1366,7 +1383,7 @@ def build_windows(gb):
 
 #add line to log windows
 def add_log_line(gb,line,color=0):
-    timestring = time.strftime("%H:%M:%S", time.gmtime()) 
+    timestring = time.strftime("%H:%M:%S", time.localtime()) 
     try:
         if isinstance(line,bytes):
             line = str(line.decode('utf-8'))
@@ -1520,11 +1537,13 @@ def main(scr, *args, **kwds):
 
     status.set_address(address,int(config['port']))
     status.reports_file = open(config['reports_file'],'w')
-    fieldnames = ['jobname','machine','starttime','endtime']
+    fieldnames = ['jobname','retcode', 'machine','starttime','endtime', 'cores_reserved', 'mem_reserved_mb']
     for lab in ['uss','rss','vms','cpu_percentage']:
         for j in [0,5,25,50,75,95,100]:
             fieldnames.append(lab + '_' + str(j))
-    fieldnames.extend(['runtime','montime','avg_cpu_percentage','user','system','maxrss','mon_user','mon_system','iowait','retcode'])
+    fieldnames.extend(['runtime','montime','avg_cpu_percentage','nthreads_avg','nthreads_max', 'user',
+                       'system','maxrss','mon_user','mon_system','iowait','read_count','write_count', 
+                       'read_bytes','write_bytes'])
     status.reports_file.write('\t'.join(fieldnames) + '\n')
     status.reports_file.flush()
 

@@ -16,7 +16,7 @@ parser = argparse.ArgumentParser(description='Submit XSlurm job')
 parser.add_argument('-c','--cpus-per-task',type=float, default=1, help='Advise the Slurm controller that ensuing job steps will require ncpus number of processors per task. Without this option, the controller will just try to allocate one processor per task.')
 parser.add_argument('--mem',type=float, default=1024, help='Specify the real memory required per node in MegaBytes. Default value is 1024.') # in mb
 parser.add_argument('-t','--time', default='0:1:0', help='Advise on total run time of the job allocation. Used by scheduler to prevent scheduling on nodes that will run out of time before job completion. Acceptable time formats include "minutes", "minutes:seconds", "hours:minutes:seconds", "days-hours", "days-hours:minutes" and "days-hours:minutes:seconds".') #mintues #minutes:sconds #hours:mintues:seconds #days-[time]
-parser.add_argument('-p','--partition', default='compute', help='Either compute or archive') # not used
+parser.add_argument('-p','--partition', default='compute', help='Either compute or archive')
 parser.add_argument('-q', '--qos', default='none', help='Included for SLURM compatibility, not used') # not used
 parser.add_argument('--requeue', action='store_true', help='Specifies that the batch job should eligible to being requeue. The job may be requeued after node failure. When a job is requeued, the batch script is initiated from its beginning.')
 parser.add_argument('-n', '--ntasks',type=float, default=1, help='Number of tasks to run') 
@@ -113,6 +113,9 @@ if os.path.exists(job_args[0]): #executes file
 
 if job_name is None:
     job_name = os.path.basename(job_args[0])
+
+if not args.partition in ['compute','archive']:
+    print('zsbatch: error: Only compute and archive partitions are currently supported')
 
 attempt = 4
 while attempt > 0 :
