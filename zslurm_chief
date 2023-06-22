@@ -68,7 +68,7 @@ for o, a in opts:
 myip = zslurm_shared.get_hostname()
 myid = myip #for now
 
-e_ncpu = min(psutil.cpu_count(), cpu)
+e_ncpu = float(min(psutil.cpu_count(), cpu))
 memory_core_mb = (psutil.virtual_memory().total / (1024.0 ** 2)) / e_ncpu
 
 if mem is not None:

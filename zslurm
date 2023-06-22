@@ -105,7 +105,7 @@ def parse_timeleft(time):
 queue_states = set(['PENDING', 'REQUEUED'])
 
 class Job(object):
-    def __init__(self, job_name, jobid, command, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition):
+    def __init__(self, job_name, jobid, command, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition, info_input_mb):
         self.job_name = job_name
         self.jobid = jobid
         self.command = command
@@ -123,7 +123,7 @@ class Job(object):
         self.dcache_start_use_add = dcache_use_add
         self.dcache_end_use_remove = dcache_use_remove
         self.partition = partition
-
+        self.input_mb = info_input_mb
 
 
         self.state= 'PENDING'
@@ -217,7 +217,7 @@ class JobManager(object):
 
        
 
-    def submit_job(self, job_name, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition):
+    def submit_job(self, job_name, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition, info_input_mb):
 
         self.lock.acquire()
         jobid = str(self.jobid_counter)
@@ -230,14 +230,14 @@ class JobManager(object):
         if len(env) == 1 and 'data' in env:
             env = env['data']
 
-        job = Job(job_name, jobid, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, float(arch_use_add), float(arch_use_remove), float(dcache_use_add), float(dcache_use_remove), float(active_use_add), float(active_use_remove), partition)
+        job = Job(job_name, jobid, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, float(arch_use_add), float(arch_use_remove), float(dcache_use_add), float(dcache_use_remove), float(active_use_add), float(active_use_remove), partition, info_input_mb)
 
         self.jobs_by_id[jobid] = job
 
         if arch_use_add or arch_use_remove or dcache_use_add or dcache_use_remove or active_use_add or active_use_remove:
-            add_log_line(gb,"Job %s (id: %s, ncore: %d, mem: %d mb, partition: %s, arch+: %d GB, arch-: %d GB, d+: %d GB, d-: %d GB, active+: %d GB, active-: %d GB) submitted." % (job_name, jobid, ncpu, mem, partition, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove),GREEN)
+            add_log_line(gb,"Job %s (id: %s, ncore: %.2g, mem: %d mb, partition: %s, arch+: %d GB, arch-: %d GB, d+: %d GB, d-: %d GB, active+: %d GB, active-: %d GB) submitted." % (job_name, jobid, ncpu, mem, partition, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove),GREEN)
         else:
-            add_log_line(gb,"Job %s (id: %s, ncore: %d, mem: %d mb, partition: %s) submitted." % (job_name, jobid, ncpu, mem, partition),GREEN)
+            add_log_line(gb,"Job %s (id: %s, ncore: %.2g, mem: %d mb, partition: %s) submitted." % (job_name, jobid, ncpu, mem, partition),GREEN)
         return jobid
 
     def cancel_job(self, jobid):
@@ -313,11 +313,11 @@ class JobManager(object):
 
         if not myid in engines.engine_by_id or engines.engine_by_id[myid] is None:
             timeleft = 5 * 24 * 60 * 60
-            cores = 24
+            cores = 24.0
             totmem = 64000
         else:
             timeleft = int(engines.engine_by_id[myid].timeleft)
-            cores = engines.engine_by_id[myid].cores
+            cores = float(engines.engine_by_id[myid].cores)
             totmem = engines.engine_by_id[myid].totmem
 
         self.lock.acquire()
@@ -521,15 +521,17 @@ class JobManager(object):
            
         name = 'unknown'
         self.lock.acquire()
+        core_reserved = 0
+        mem_reserved = 0
+        input_mb = 0
         try:
             if not jobid in self.jobs_by_id:
                 add_log_line(gb,"Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),YELLOW)
-                core_reserved = 0
-                mem_reserved = 0
             else:
                 job = self.jobs_by_id[jobid]
                 mem_reserved = job.mem
                 core_reserved = job.ncpu
+                input_mb = job.input_mb
                 name = self.job_done(jobid, return_code, reason)
 
             
@@ -538,7 +540,7 @@ class JobManager(object):
        
         
         if 'starttime' in report:
-            line = [name, report.get('retcode',''), myid, report.get('starttime',''), report.get('endtime',''), core_reserved, mem_reserved]
+            line = [name, report.get('retcode',''), myid, report.get('starttime',''), report.get('endtime',''), core_reserved, mem_reserved, input_mb]
             nostat = [''] * 7
             for lab in ['uss','rss','vms','cpu_percentage']:
                 line.extend(report.get(lab,nostat))
@@ -1537,7 +1539,7 @@ def main(scr, *args, **kwds):
 
     status.set_address(address,int(config['port']))
     status.reports_file = open(config['reports_file'],'w')
-    fieldnames = ['jobname','retcode', 'machine','starttime','endtime', 'cores_reserved', 'mem_reserved_mb']
+    fieldnames = ['jobname','retcode', 'machine','starttime','endtime', 'cores_reserved', 'mem_reserved_mb', 'input_mb']
     for lab in ['uss','rss','vms','cpu_percentage']:
         for j in [0,5,25,50,75,95,100]:
             fieldnames.append(lab + '_' + str(j))

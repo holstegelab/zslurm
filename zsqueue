@@ -35,7 +35,7 @@ try:
         print("JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODES\tCPU\tMEM\tACTIVE\tARCH\tDCACHE")
         for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use in jobs:
             runtime = zslurm_shared.format_time(runtime)
-            print('%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%.1f\t%.1f Gb\t%.1f Gb\t%.1f Gb\t%.1f Gb' % (jobid, partition, job_name, user, state, runtime, cpus, node, cpu_usage * 100.0, mem_usage  / 1024.0, active_use, arch_use, dcache_use))
+            print('%s\t%s\t%s\t%s\t%s\t%s\t%.2g\t%s\t%.1f\t%.1f Gb\t%.1f Gb\t%.1f Gb\t%.1f Gb' % (jobid, partition, job_name, user, state, runtime, cpus, node, cpu_usage * 100.0, mem_usage  / 1024.0, active_use, arch_use, dcache_use))
 
 except (socket.error, httplib.HTTPException) as serror:
     print('Queue request failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)

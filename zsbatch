@@ -31,6 +31,7 @@ parser.add_argument('--active-use-add', type=float, default=0.0, help='Active us
 parser.add_argument('--active-use-remove', type=float, default=0.0, help='Active usage removed by this job.') #after:job_id[:jobid...], afterany:jobid[:jobid...], afternotok:jobid[:jobid...], afterok:jobid[:jobid...], expand:jobid, singleton
 parser.add_argument('--parsable', action='store_true', help='Outputs only the jobid and cluster name (if present), separated by semicolon, only on successful submission.')
 parser.add_argument('--limit-threads', type=float, default=-1, help='Changes environment to limit thread creation by OMP/OPENBLAS/MKL/VECLIB/NUMEXPR to a max value (default:-1 (disabled))')
+parser.add_argument('--info-input-mb', type=float, default=0.0, help='Used to set file size of the input files in the reports.tsv file')
 
 parser.add_argument('job_args', nargs='*')
 args = parser.parse_args()
@@ -121,7 +122,7 @@ attempt = 4
 while attempt > 0 :
     try:
         for i in range(int(args.ntasks)):
-            jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, args.requeue, args.dependency, args.arch_use_add, args.arch_use_remove, args.dcache_use_add, args.dcache_use_remove, args.active_use_add, args.active_use_remove, args.partition)
+            jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, args.requeue, args.dependency, args.arch_use_add, args.arch_use_remove, args.dcache_use_add, args.dcache_use_remove, args.active_use_add, args.active_use_remove, args.partition, args.info_input_mb)
             if args.parsable:
                 print(jobid)
             else:
