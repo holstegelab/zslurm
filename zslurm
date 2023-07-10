@@ -654,7 +654,7 @@ class EngineManager(object):
     
     
     def _check_cluster_engines(self):
-        cmd = "squeue -h -r --user " + getpass.getuser() + " --name zslurm -o '%i|%L|%t|%N|%P'" 
+        cmd = "squeue -h -r --user " + getpass.getuser() + "  -o '%i|%j|%L|%t|%N|%P'" 
 
         args = shlex.split(cmd)
         try:
@@ -675,27 +675,34 @@ class EngineManager(object):
         nqueue_archive = 0
         nrunning = 0
         nrunning_archive = 0
-        for cid, ctime, cstate, cnode,cpartition in output:
-            observed_cluster_ids.add(cid)
-            if cstate == 'CG': #cleaning up
-                continue
-            
-
-            if cpartition == 'staging':
-                if cstate == 'R':
-                    if not cid in self.engine_by_clusterid:
-                        continue #needs to register first
+        for cid, cname, ctime, cstate, cnode,cpartition in output:
+            if cname == 'zslurm':
+                observed_cluster_ids.add(cid)
+                 
+                if cstate == 'CG': #cleaning up
+                    continue
+                
+                if cpartition == 'staging':
+                    if cstate == 'R':
+                        if not cid in self.engine_by_clusterid:
+                            continue #needs to register first
+                        nrunning_archive += 1
+                    else:
+                        nqueue_archive += 1
+                else:
+                    if cstate == 'R':
+                        if not cid in self.engine_by_clusterid:
+                            continue #needs to register first
+                        nrunning += 1
+                    else:
+                        nqueue += 1
+            elif cstate == 'R' and cid in self.engine_by_clusterid:
+                observed_cluster_ids.add(cid)
+                if cpartition == 'staging':
                     nrunning_archive += 1
                 else:
-                    nqueue_archive += 1
-            else:
-                if cstate == 'R':
-                    if not cid in self.engine_by_clusterid:
-                        continue #needs to register first
                     nrunning += 1
-                else:
-                    nqueue += 1
-
+            
             if cid in self.engine_by_clusterid:
                 engine = self.engine_by_clusterid[cid]
                 if cstate == 'R':
