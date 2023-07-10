@@ -581,9 +581,10 @@ def thread_start_job_server(port):
 
 
 class Engine(object):
-    def __init__(self, engine_id='?', cores=0, totmem=0, partition='',cluster_id=None):
+    def __init__(self, engine_id='?', cores=0, totmem=0, partition='',cluster_id=None, managed=False):
         self.engine_id = engine_id
         self.cluster_id = cluster_id
+        self.managed = managed
 
         self.cores = cores
         self.totmem = totmem
@@ -681,7 +682,11 @@ class EngineManager(object):
                  
                 if cstate == 'CG': #cleaning up
                     continue
-                
+               
+                #indicate this engine is managed
+                if cid in self.engine_by_clusterid:
+                    self.engine_by_clusterid[cid].managed=True
+
                 if cpartition == 'staging':
                     if cstate == 'R':
                         if not cid in self.engine_by_clusterid:
@@ -831,11 +836,11 @@ class EngineManager(object):
                     return
 
                 if n == 1:
-                    self.engine_by_clusterid[eid] = Engine(cluster_id = eid)
+                    self.engine_by_clusterid[eid] = Engine(cluster_id = eid, managed=True)
                 else:
                     for i in range(n):
                         cid = eid + '_' + str(i)
-                        self.engine_by_clusterid[cid] = Engine(cluster_id = cid)
+                        self.engine_by_clusterid[cid] = Engine(cluster_id = cid, managed=True)
                         
 
                 time.sleep(3)
@@ -868,7 +873,7 @@ class EngineManager(object):
                 if len(stop_engines) < n:
                     stop_engines2 = []
                     for cid, engine in list(self.engine_by_clusterid.items()):
-                        if engine is None:
+                        if engine is None or not engine.managed:
                             continue
                         if len(engine.jobs) == 0: 
                             stop_engines2.append(cid)
@@ -879,7 +884,7 @@ class EngineManager(object):
                 if len(stop_engines) < n:
                     stop_engines2 = []
                     for cid, engine in list(self.engine_by_clusterid.items()):
-                        if engine is None:
+                        if engine is None or not engine.managed:
                             continue
                         if not cid in stop_engines:
                             stop_engines2.append(cid)
