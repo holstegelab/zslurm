@@ -62,7 +62,7 @@ class Status(object):
         self.port = 0
         self.kill_idle = False
         self.lastin_first = False
-        self.prio_fillmem_context = 1
+        self.prio_fillmem_context = 100
         self.used_load = numpy.array([],dtype=float)
         self.used_cpus = numpy.array([],dtype=float)
         self.used_mem = numpy.array([],dtype=float)
@@ -105,7 +105,7 @@ def parse_timeleft(time):
 queue_states = set(['PENDING', 'REQUEUED'])
 
 class Job(object):
-    def __init__(self, job_name, jobid, command, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition, info_input_mb):
+    def __init__(self, job_name, jobid, command, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition, info_input_mb, info_output_file):
         self.job_name = job_name
         self.jobid = jobid
         self.command = command
@@ -124,6 +124,7 @@ class Job(object):
         self.dcache_end_use_remove = dcache_use_remove
         self.partition = partition
         self.input_mb = info_input_mb
+        self.output_file = info_output_file
 
 
         self.state= 'PENDING'
@@ -217,7 +218,7 @@ class JobManager(object):
 
        
 
-    def submit_job(self, job_name, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition, info_input_mb):
+    def submit_job(self, job_name, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, arch_use_add, arch_use_remove, dcache_use_add, dcache_use_remove, active_use_add, active_use_remove, partition, info_input_mb, info_output_file):
 
         self.lock.acquire()
         jobid = str(self.jobid_counter)
@@ -230,7 +231,7 @@ class JobManager(object):
         if len(env) == 1 and 'data' in env:
             env = env['data']
 
-        job = Job(job_name, jobid, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, float(arch_use_add), float(arch_use_remove), float(dcache_use_add), float(dcache_use_remove), float(active_use_add), float(active_use_remove), partition, info_input_mb)
+        job = Job(job_name, jobid, cmd, cwd, env, ncpu, mem, reqtime, requeue, dependency, float(arch_use_add), float(arch_use_remove), float(dcache_use_add), float(dcache_use_remove), float(active_use_add), float(active_use_remove), partition, info_input_mb, info_output_file)
 
         self.jobs_by_id[jobid] = job
 
@@ -524,6 +525,7 @@ class JobManager(object):
         core_reserved = 0
         mem_reserved = 0
         input_mb = 0
+        output_file = ''
         try:
             if not jobid in self.jobs_by_id:
                 add_log_line(gb,"Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),YELLOW)
@@ -532,6 +534,7 @@ class JobManager(object):
                 mem_reserved = job.mem
                 core_reserved = job.ncpu
                 input_mb = job.input_mb
+                output_file = job.output_file
                 name = self.job_done(jobid, return_code, reason)
 
             
@@ -540,7 +543,7 @@ class JobManager(object):
        
         
         if 'starttime' in report:
-            line = [name, report.get('retcode',''), myid, report.get('starttime',''), report.get('endtime',''), core_reserved, mem_reserved, input_mb]
+            line = [name, report.get('retcode',''), myid, report.get('starttime',''), report.get('endtime',''), core_reserved, mem_reserved, input_mb, output_file]
             nostat = [''] * 7
             for lab in ['uss','rss','vms','cpu_percentage']:
                 line.extend(report.get(lab,nostat))
@@ -1062,7 +1065,7 @@ def thread_check_commands():
         for engine in all_engines:
             if now - engine.lastseen > TIMEOUT:
                 engines.terminate_engine(engine.engine_id)
-                engines._unregister(engine.engine_id, 'Engine timed out')
+                engines._unregister(engine, 'Engine timed out')
                 add_log_line(gb,"Engine with id " + engine.engine_id + " timed out",RED)
         
         used_cpus = []
@@ -1235,7 +1238,8 @@ def thread_display_status(gb,status):
                 cpu_c = GREEN
                 mem_c = GREEN
                 load_c = GREEN
-                if len(status.used_cpus) > 0:
+                
+                if len(status.used_cpus) > 5:
                     cpu_usage = numpy.percentile(status.used_cpus / status.total_cpus,[0,25,50,75,100])
                     mem_usage = numpy.percentile(status.used_mem / status.total_mem,[0,25,50,75,100])
                     load = numpy.percentile(status.used_load / status.total_cpus,[0,25,50,75,100])
@@ -1254,26 +1258,47 @@ def thread_display_status(gb,status):
                         load_c = YELLOW
                     if load[2] > 1.1:
                         load_c = RED
+                    format_str = '(' + ' - '.join(['%.2f'] * 5) + ')'
+                elif len(status.used_cpus) > 0:
+                    cpu_usage = numpy.sort(status.used_cpus / status.total_cpus)
+                    mem_usage = numpy.sort(status.used_mem / status.total_mem)
+                    load = numpy.sort(status.used_load / status.total_cpus)
+                    if cpu_usage[0] < 0.5:
+                        cpu_c = YELLOW
+                    elif cpu_usage[0] < 0.1:
+                        cpu_c = RED
                     
+                    if mem_usage[-1] > 0.9:
+                        cpu_c = YELLOW
+                    elif mem_usage[-1] > 0.95:
+                        cpu_c = RED
+                    
+                    if load[-1] > 1.1:
+                        load_c = YELLOW
+                    elif load[-1] > 1.4:
+                        load_c = RED
+                    
+                    format_str = '(' + ' - '.join(['%.2f'] * len(status.used_cpus)) + ')'
                 else:
-                    cpu_usage = numpy.zeros(5,dtype=float)
-                    mem_usage = numpy.zeros(5,dtype=float)
-                    load = numpy.zeros(5,dtype=float)
+                    format_str = '%s'
+                    cpu_usage = ('',)
+                    mem_usage = ('',)
+                    load = ('',)
 
                 gb.wcom_status.addstr(7,1,"Archive engines: ")
                 enodes_archive = erunning_archive + equeue_archive
 
 
                 gb.wcom_status.addstr(9,1,"CPU usage: ")
-                gb.wcom_status.addstr(9,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                gb.wcom_status.addstr(9,18, ("%d/%d " + format_str) \
                         % ((numpy.sum(status.used_cpus), numpy.sum(status.total_cpus)) + tuple(cpu_usage)), curses.color_pair(cpu_c))
 
                 gb.wcom_status.addstr(10,1,"Load: ")
-                gb.wcom_status.addstr(10,18, "%.0f/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                gb.wcom_status.addstr(10,18, ("%.0f/%d " + format_str) \
                         % ((numpy.sum(status.used_load), numpy.sum(status.total_cpus)) + tuple(load)), curses.color_pair(load_c))
 
                 gb.wcom_status.addstr(11,1,"Mem usage (GB): ")
-                gb.wcom_status.addstr(11,18, "%d/%d (%.2f - %.2f - %.2f - %.2f - %.2f)" \
+                gb.wcom_status.addstr(11,18, ("%d/%d " + format_str) \
                         % ((numpy.sum(status.used_mem), numpy.sum(status.total_mem)) + tuple(mem_usage)), curses.color_pair(mem_c))
                                                      
                 if not rc is None:
@@ -1484,7 +1509,8 @@ def init_commands(gb):
             gb.wcom.addstr(6,1,"Deprioritize jobs: n")
             gb.wcom.addstr(7,1,"Set archive/active/dcache total capacity: 1/2/3")
             gb.wcom.addstr(8,1,"Toggle last in/first out: l")
-            gb.wcom.addstr(10,1,"Shutdown: q")
+            gb.wcom_addstr(9,1,"Set memory optimization job search window: m")
+            gb.wcom.addstr(11,1,"Shutdown: q")
             gb.wcom.refresh()
     except Exception as e:
         pass
@@ -1551,7 +1577,7 @@ def main(scr, *args, **kwds):
 
     status.set_address(address,int(config['port']))
     status.reports_file = open(config['reports_file'],'w')
-    fieldnames = ['jobname','retcode', 'machine','starttime','endtime', 'cores_reserved', 'mem_reserved_mb', 'input_mb']
+    fieldnames = ['jobname','retcode', 'machine','starttime','endtime', 'cores_reserved', 'mem_reserved_mb', 'input_mb','output_file']
     for lab in ['uss','rss','vms','cpu_percentage']:
         for j in [0,5,25,50,75,95,100]:
             fieldnames.append(lab + '_' + str(j))
@@ -1607,7 +1633,7 @@ def main(scr, *args, **kwds):
             elif c == ord('d'):  #START SLURM engines
                 on_snellius = 'snellius' in zslurm_shared.get_full_hostname()
                 if on_snellius:
-                    default_partition = 'thin'
+                    default_partition = 'genoa'
                 else:
                     default_partition = 'normal'
 
