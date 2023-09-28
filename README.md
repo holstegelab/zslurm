@@ -77,6 +77,7 @@ See zslurm.yaml for an example profile which can be used for snakemake integrati
 zsbatch
 -------
 
+```
 usage: zsbatch [-h] [-c CPUS_PER_TASK] [--mem MEM] [-t TIME] [-p PARTITION] [-q QOS] [--requeue] [-n NTASKS] [-d DEPENDENCY] [-J JOB_NAME] [--arch-use-add ARCH_USE_ADD] [--arch-use-remove ARCH_USE_REMOVE] [--dcache-use-add DCACHE_USE_ADD] [--dcache-use-remove DCACHE_USE_REMOVE]
                [--active-use-add ACTIVE_USE_ADD] [--active-use-remove ACTIVE_USE_REMOVE] [--parsable] [--limit-threads LIMIT_THREADS] [--info-input-mb INFO_INPUT_MB] [--info-output-file INFO_OUTPUT_FILE]
                [job_args ...]
@@ -123,12 +124,14 @@ options:
                         Used to set file size of the input files in the reports.tsv file
   --info-output-file INFO_OUTPUT_FILE
                         Used to set path of primary output file (helpful for identifiying specific jobs in reports.tsv)
-
+```
 
 
 
 zsqueue
 -------
+
+```
 usage: zsqueue [-h] [--all] [--done] [--pretty]
 
 ZSlurm Job queue listing
@@ -138,11 +141,13 @@ options:
   --all       Show also completed jobs.
   --done      Show only completed jobs.
   --pretty    Pretty print the table.
-
+```
 
 
 zsnodes
 -------
+
+```
 usage: zsnodes [-h] [--all] [--pretty]
 
 ZSlurm node listing
@@ -151,10 +156,13 @@ options:
   -h, --help  show this help message and exit
   --all       Show also queued nodes.
   --pretty    Pretty print the table
+```
 
 
 zscancel
 --------
+
+```
 usage: zscancel [-h] [--requeue] [job_id ...]
 
 Cancel ZSlurm job
@@ -165,6 +173,7 @@ positional arguments:
 options:
   -h, --help  show this help message and exit
   --requeue   Requeue after cancel. Will skip non-running jobs.
-
+```
 
 Example: zsqueue  | cut -f1 | xargs zscancel
+
