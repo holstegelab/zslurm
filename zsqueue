@@ -10,7 +10,7 @@ import argparse
 
 s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = True)
 
-parser = argparse.ArgumentParser(description='XSlurm Job queue listing')
+parser = argparse.ArgumentParser(description='ZSlurm Job queue listing')
 parser.add_argument('--all', action='store_true', help='Show also completed jobs.')
 parser.add_argument('--done', action='store_true', help='Show only completed jobs.')
 parser.add_argument('--pretty', action='store_true', help='Pretty print the table.')

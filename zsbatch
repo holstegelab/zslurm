@@ -11,7 +11,7 @@ import sys
 import shlex
 import time
 
-parser = argparse.ArgumentParser(description='Submit XSlurm job')
+parser = argparse.ArgumentParser(description='Submit ZSlurm job')
 
 parser.add_argument('-c','--cpus-per-task',type=float, default=1, help='Advise the Slurm controller that ensuing job steps will require ncpus number of processors per task. Without this option, the controller will just try to allocate one processor per task.')
 parser.add_argument('--mem',type=float, default=1024, help='Specify the real memory required per node in MegaBytes. Default value is 1024.') # in mb
@@ -32,7 +32,7 @@ parser.add_argument('--active-use-remove', type=float, default=0.0, help='Active
 parser.add_argument('--parsable', action='store_true', help='Outputs only the jobid and cluster name (if present), separated by semicolon, only on successful submission.')
 parser.add_argument('--limit-threads', type=float, default=-1, help='Changes environment to limit thread creation by OMP/OPENBLAS/MKL/VECLIB/NUMEXPR to a max value (default:-1 (disabled))')
 parser.add_argument('--info-input-mb', type=float, default=0.0, help='Used to set file size of the input files in the reports.tsv file')
-parser.add_argument('--info-output-file', type=str, default='', help='Used to set path of primary output file (helpful for debugging purposes)')
+parser.add_argument('--info-output-file', type=str, default='', help='Used to set path of primary output file (helpful for identifying specific jobs in reports.tsv)')
 
 parser.add_argument('job_args', nargs='*')
 args = parser.parse_args()
