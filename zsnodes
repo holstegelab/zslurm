@@ -19,18 +19,18 @@ try:
     
     if args.pretty:
         table = []
-        for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load in nodes:
+        for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load, status in nodes:
             runtime = zslurm_shared.format_time(runtime)
             timeleft = zslurm_shared.format_time(timeleft)
-            table.append([engine_id, cluster_id, partition, '%.0f' % cores, '%.1fGb' % (totmem/1024.0), runtime, timeleft,  njobs, '%.1f' % cpu_usage, '%.1f' % mem_usage, '%.1f' % load])
+            table.append([engine_id, cluster_id, partition, '%.0f' % cores, '%.1fGb' % (totmem/1024.0), runtime, timeleft,  njobs, '%.1f' % cpu_usage, '%.1f' % mem_usage, '%.1f' % load, status])
         import tabulate            
-        print(tabulate.tabulate(table, headers=['ID','SLURM','PARTITION','CORES','MEM','TIME','REMAINING','NJOBS','CPU','MEM','LOAD']))
+        print(tabulate.tabulate(table, headers=['ID','SLURM','PARTITION','CORES','MEM','TIME','REMAINING','NJOBS','CPU','MEM','LOAD','STATUS']))
     else:
-        print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tLOAD")
-        for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load in nodes:
+        print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tLOAD\tSTATUS")
+        for partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load, status in nodes:
             runtime = zslurm_shared.format_time(runtime)
             timeleft = zslurm_shared.format_time(timeleft)
-            print('%s\t%s\t%s\t%.2g\t%.1fGb\t%s\t%s\t%d\t%.1f\t%.1f\t%.1f' % (engine_id, cluster_id, partition, cores, totmem/1024.0, runtime, timeleft, njobs, cpu_usage, mem_usage, load))
+            print('%s\t%s\t%s\t%.2g\t%.1fGb\t%s\t%s\t%d\t%.1f\t%.1f\t%.1f\t%s' % (engine_id, cluster_id, partition, cores, totmem/1024.0, runtime, timeleft, njobs, cpu_usage, mem_usage, load, status))
 
 except (socket.error, httplib.HTTPException) as serror:
     print('Queue request failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)

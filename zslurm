@@ -22,6 +22,14 @@ import zslurm_shared
 import ipyparallel
 
 mylocal_id = zslurm_shared.short_name(zslurm_shared.get_hostname())
+PHASING_OUT = 'PHASING_OUT'
+
+
+#return codes
+RC_CANCELLED=-255
+RC_ENGINE_TERMINATED=-1
+RC_SUCCESS=0
+RC_TERMINATED=15
 
 WHITE=0
 RED=1
@@ -241,7 +249,7 @@ class JobManager(object):
             add_log_line(gb,"Job %s (id: %s, ncore: %.2g, mem: %d mb, partition: %s) submitted." % (job_name, jobid, ncpu, mem, partition),GREEN)
         return jobid
 
-    def cancel_job(self, jobid):
+    def cancel_job(self, jobid, requeue=False):
         self.lock.acquire()
         try:
             job = None
@@ -249,8 +257,12 @@ class JobManager(object):
                 job = self.jobs_by_id[jobid]
                 if job.state == 'RUNNING':
                     node_id = job.node_id
-                    job.requeue = 0 #prevent restart
-                    job.reason = "Awaiting cancellation at worker node"
+                    if requeue:
+                        job.requeue = max(job.requeue, 1)
+                        job.reason = "Cancelling for restart"
+                    else:
+                        job.requeue = 0 #prevent restart
+                        job.reason = "Awaiting cancellation at worker node"
 
                     try:
                         engines.send_command(node_id, zslurm_shared.CANCEL, jobid)
@@ -259,17 +271,18 @@ class JobManager(object):
 
                     add_log_line(gb,"Job %s (id: %s, running on %s) has been send a cancel signal." % (job.job_name, job.jobid, job.node_id),YELLOW)
                     #now wait for cancel to propagate
-                elif job.state == 'ASSIGNED':
+                elif job.state == 'ASSIGNED' and not requeue:
                     node_id = job.node_id
                     try:
                         engines.send_command(node_id, zslurm_shared.DEASSIGN, jobid)
                     except:
                         pass
-                    self.job_done(job.jobid, -255, 'Cancelled by user')
-                else:
-                    self.job_done(job.jobid, -255, 'Cancelled by user')
+                    self.job_done(job.jobid, RC_CANCELLED, 'Cancelled by user')
+                    job.state = 'CANCELLED'
+                elif not requeue:
+                    self.job_done(job.jobid, RC_CANCELLED, 'Cancelled by user')
                     add_log_line(gb,"Job %s (id: %s) cancelled." % (job.job_name, job.jobid),YELLOW)
-                job.state = 'CANCELLED'
+                    job.state = 'CANCELLED'
             else:
                 add_log_line(gb,"Attempt to cancel unknown job (id: %s)." % jobid,YELLOW)
         finally:
@@ -306,7 +319,7 @@ class JobManager(object):
             active_use = job.active_start_use_add - job.active_end_use_remove
             dcache_use = job.dcache_start_use_add - job.dcache_end_use_remove
 
-            jobs.append([job.jobid, job.job_name, job.state, runtime, job.ncpu, job.partition, node_id, job.current_cpu_usage, job.current_mem_usage, arch_use, active_use, dcache_use])
+            jobs.append([job.jobid, job.job_name, job.state, runtime, job.ncpu, job.partition, node_id, job.current_cpu_usage, job.current_mem_usage, arch_use, active_use, dcache_use, job.cwd])
 
         return jobs        
     
@@ -317,6 +330,9 @@ class JobManager(object):
             cores = 24.0
             totmem = 64000
         else:
+            engine = engines.engine_by_id[myid]
+            if engine.status == PHASING_OUT:
+                return []
             timeleft = int(engines.engine_by_id[myid].timeleft)
             cores = float(engines.engine_by_id[myid].cores)
             totmem = engines.engine_by_id[myid].totmem
@@ -429,7 +445,7 @@ class JobManager(object):
             for job in list(self.jobs_by_id.values()):
                 if job.node_id == engine_id:
                     if job.state == 'RUNNING':
-                        self.job_done(job.jobid, -1, reason=reason)
+                        self.job_done(job.jobid, RC_ENGINE_TERMINATED, reason=reason)
                     elif job.state == 'ASSIGNED':
                         job.state = 'PENDING'
         finally:
@@ -474,15 +490,15 @@ class JobManager(object):
                         self.archive_inuse -= job.archive_start_use_add
                         self.dcache_inuse -= job.dcache_start_use_add
 
-                if not job.node_id is None and not return_code == -255:
+                if not job.node_id is None and not return_code == RC_CANCELLED:
                     self.running_jobs[job.partition] = self.running_jobs.get(job.partition, 0) - 1
                 
-                if return_code != 0 and return_code != -255 and return_code != 15 and job.requeue > 0: #-255 is cancelled
+                if return_code != RC_SUCCESS and return_code != RC_TERMINATED and job.requeue > 0: 
                     job.requeue -= 1
                     job.mem = job.mem * 2
                     newstate = 'REQUEUED'
                     job.starttime = None
-                elif return_code == -1:                                    
+                elif return_code == RC_ENGINE_TERMINATED:  #ENGINE DISAPPEARED/TERMINATED                          
                     newstate = 'REQUEUED'
                     job.starttime = None
                 else:
@@ -490,10 +506,10 @@ class JobManager(object):
                     del self.jobs_by_id[jobid]
                     self.done_jobs[job.partition] = self.done_jobs.get(job.partition,0) + 1 
                     self.total_jobs[job.partition] = self.total_jobs.get(job.partition,0) - 1
-                    if return_code != 0 and return_code != -255 and return_code != 15:
+                    if return_code != RC_SUCCESS and return_code != RC_CANCELLED and return_code != RC_TERMINATED:
                         self.failed_jobs[job.partition] = self.failed_jobs.get(job.partition,0) + 1
                         newstate = "FAILED"
-                    elif return_code == 255 or return_code == 15:
+                    elif return_code == RC_CANCELLED or return_code == RC_TERMINATED:
                         newstate = "CANCELLED"
                     else:
                         newstate='FINISHED'
@@ -555,7 +571,8 @@ class JobManager(object):
             status.reports_file.flush()
 
         if return_code == 0:
-            add_log_line(gb,"Job %s (id: %s) completed." % (name, jobid),GREEN)
+            runtime = zslurm_shared.format_time(report.get('runtime',0.0))
+            add_log_line(gb,"Job %s (id: %s) completed after %s." % (name, jobid, runtime),GREEN)
         else:
             add_log_line(gb,"Job %s (id: %s, node: %s) failed, reason: %s."  % (name, jobid, myid, reason),YELLOW)
 
@@ -603,6 +620,7 @@ class Engine(object):
         self.load = 0.0
 
         self.partition = partition
+        self.status = ''
 
 
 
@@ -620,6 +638,22 @@ class EngineManager(object):
         self.cluster_queued_engines_archive = 0
         self.cluster_running_engines_archive = 0
 
+
+    def toggle_phasing_out(self, engine_id):
+        self.lock.acquire()
+        res = None
+        try:
+            if engine_id in self.engine_by_id:
+                engine = self.engine_by_id[engine_id]
+                if engine.status == PHASING_OUT:
+                    engine.status = ''
+                else:
+                    engine.status = PHASING_OUT
+                res = engine.status                    
+        finally:
+            self.lock.release()
+        return res            
+
     def job_running(self, eid, job):
         engine = self.engine_by_id.get(eid, None)
         if engine:
@@ -634,7 +668,7 @@ class EngineManager(object):
     def list_nodes(self):
         result = []
         for e in list(self.engine_by_id.values()):
-            result.append((e.partition, e.engine_id, e.cluster_id if e.cluster_id is not False else 'NA', e.cores, e.totmem, time.time() - e.starttime, e.timeleft, len(e.jobs), e.cpu_usage, e.mem_usage, e.load))
+            result.append((e.partition, e.engine_id, e.cluster_id if e.cluster_id is not False else 'NA', e.cores, e.totmem, time.time() - e.starttime, e.timeleft, len(e.jobs), e.cpu_usage, e.mem_usage, e.load, e.status))
         return result            
 
 
@@ -981,9 +1015,11 @@ class EngineManager(object):
            
             commands = e.pending_commands
             # kill if idle for 3 minutes, but not if local engine or archive engine  (except if no extra jobs)
-            if idle > 180.0 and (e.partition != 'archive' or (sum(jobs.running_jobs.values()) == 0)) and status.kill_idle and not myid == zslurm_shared.get_hostname():
+            if idle > 0.0 and e.status == PHASING_OUT:
+                add_log_line(gb,"Stopping phased out engine: " + myid, YELLOW)
+                commands.append((zslurm_shared.STOP,None))
+            elif idle > 180.0 and (e.partition != 'archive' or (sum(jobs.running_jobs.values()) == 0)) and status.kill_idle and not myid == zslurm_shared.get_hostname():
                 add_log_line(gb,"Stopping idle engine: " + myid, YELLOW)
-
                 commands.append((zslurm_shared.STOP,None))
 
             if commands:
@@ -1504,13 +1540,14 @@ def init_commands(gb):
         if not gb.wcom is None:
             gb.wcom.addstr(1,1,"Start/stop local engine: s/x")
             gb.wcom.addstr(2,1,"Start/stop SLURM engines: d/c [n]")
-            gb.wcom.addstr(4,1,"Toggle autostop idle engines: k")
-            gb.wcom.addstr(5,1,"Prioritize jobs: p")
-            gb.wcom.addstr(6,1,"Deprioritize jobs: n")
-            gb.wcom.addstr(7,1,"Set archive/active/dcache total capacity: 1/2/3")
-            gb.wcom.addstr(8,1,"Toggle last in/first out: l")
-            gb.wcom_addstr(9,1,"Set memory optimization job search window: m")
-            gb.wcom.addstr(11,1,"Shutdown: q")
+            gb.wcom.addstr(4,1,"Toggle phaseout engine: o")
+            gb.wcom.addstr(5,1,"Toggle autostop idle engines: k")
+            gb.wcom.addstr(6,1,"Prioritize jobs: p")
+            gb.wcom.addstr(7,1,"Deprioritize jobs: n")
+            gb.wcom.addstr(8,1,"Set archive/active/dcache total capacity: 1/2/3")
+            gb.wcom.addstr(9,1,"Toggle last in/first out: l")
+            gb.wcom_addstr(10,1,"Set memory optimization job search window: m")
+            gb.wcom.addstr(12,1,"Shutdown: q")
             gb.wcom.refresh()
     except Exception as e:
         pass
@@ -1709,6 +1746,16 @@ def main(scr, *args, **kwds):
                 if(not cmd is None):
                     status.prio_fillmem_context = max(int(cmd),1)
                 add_log_line(gb, "Fill memory context size set to " + str(cmd) ,GREEN)
+            elif c == ord('o'):
+                cmd = enter_command(gb, 'Enter node name to toggle phase out: ')
+                r = engines.toggle_phasing_out(cmd)  
+                if r is None:
+                    add_log_line(gb, "Engine %s not found in engine list: %s." % (cmd, str(list(engines.engine_by_id.keys()))))
+                elif r == PHASING_OUT:
+                    add_log_line(gb, "Phasing out engine %s." % cmd)
+                else:
+                    add_log_line(gb, "Disabling phasing out of engine %s." % cmd)
+
             elif c == ord('u') :  # Update ncurses screen
                 gb.scr.refresh()
     except Exception:

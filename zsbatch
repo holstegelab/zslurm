@@ -11,8 +11,6 @@ import sys
 import shlex
 import time
 
-print(sys.argv)
-
 parser = argparse.ArgumentParser(description='Submit XSlurm job')
 
 parser.add_argument('-c','--cpus-per-task',type=float, default=1, help='Advise the Slurm controller that ensuing job steps will require ncpus number of processors per task. Without this option, the controller will just try to allocate one processor per task.')
@@ -114,7 +112,6 @@ if os.path.exists(job_args[0]): #executes file
             sys.exit(1)
         interpreter = firstline[2:]
         cmd = interpreter + " "  + " ".join(job_args)
-        print('X', cmd, firstline)
 
 if job_name is None:
     job_name = os.path.basename(job_args[0])
@@ -126,7 +123,7 @@ attempt = 4
 while attempt > 0 :
     try:
         for i in range(int(args.ntasks)):
-            jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, args.requeue, args.dependency, args.arch_use_add, args.arch_use_remove, args.dcache_use_add, args.dcache_use_remove, args.active_use_add, args.active_use_remove, args.partition, args.info_input_mb, args.info_output_file)
+            jobid = s.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, int(args.requeue), args.dependency, args.arch_use_add, args.arch_use_remove, args.dcache_use_add, args.dcache_use_remove, args.active_use_add, args.active_use_remove, args.partition, args.info_input_mb, args.info_output_file)
             if args.parsable:
                 print(jobid)
             else:
@@ -136,5 +133,5 @@ while attempt > 0 :
         attempt -= 1
         time.sleep(15)
 
-print('zsbatch: error: Job submission failed, could not connect to XSlurm manager on ' + zslurm_shared.job_url)
+print('zsbatch: error: Job submission failed, could not connect to XSlurm manager on ' + zslurm_shared.get_job_url())
 sys.exit(1)
