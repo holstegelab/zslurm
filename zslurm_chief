@@ -102,8 +102,9 @@ if not cluster_managed:
 
 
 #self register
-print(("[%s] Preparing to register on " % str(myip)) + str(address) + ":" + str(port))
-s = zslurm_shared.TimeoutServerProxy('http://' + str(address) + ":" + str(port), timeout = REQUEST_TIMEOUT, allow_none = True)
+uri=zslurm_shared.get_manager_url(address)
+print(" Preparing to register on "+ uri)
+s = zslurm_shared.TimeoutServerProxy(uri, timeout = REQUEST_TIMEOUT, allow_none = True)
 
 myid = None
 attempt = REGISTRATION_ATTEMPTS
