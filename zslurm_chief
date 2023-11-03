@@ -431,8 +431,8 @@ try :
         elif not idle:
             idle_start = 0
         try:
-            sys.stderr.write("%s - POLL; INFO: %s %s %s %s %s %s %s %s %s %s\n" % (xtime(), myid, str(cpu_usage), str(e_memtot), str(e_memtot_buffer), str(psutil.virtual_memory().available), str(mem_usage), str(load), str(mode), str(status.current_cpu_usage), str(status.current_mem_usage)))
-            sys.stderr.flush()
+            #sys.stderr.write("%s - POLL; INFO: %s %s %s %s %s %s %s %s %s %s\n" % (xtime(), myid, str(cpu_usage), str(e_memtot), str(e_memtot_buffer), str(psutil.virtual_memory().available), str(mem_usage), str(load), str(mode), str(status.current_cpu_usage), str(status.current_mem_usage)))
+            #sys.stderr.flush()
             if idle_start == 0:
                 commands = s.poll(myid, cpu_usage, mem_usage, load,mode, 0.0, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
             else:
