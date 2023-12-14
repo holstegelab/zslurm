@@ -75,7 +75,8 @@ if mem is not None:
     memory_core_mb = min(mem / float(e_ncpu), memory_core_mb)
 
 e_memtot = memory_core_mb * e_ncpu - 100.0 #reserve some space for self
-e_memtot_buffer = 0.85 * e_memtot #keep some reserve room for system data, caching, etc.
+e_memtot_buffer = min(0.95 * psutil.virtual_memory().available / (1024 * 1024), 0.85 * e_memtot) #keep some reserve room for system data, caching, etc.
+print(f'Buffer space {e_memtot} - {e_memtot_buffer}')
 
 
 if 'SLURM_ARRAY_JOB_ID' in os.environ:
@@ -356,10 +357,9 @@ try :
                 time.sleep(PING_INTERVAL) #retry later
        
        
-        mb_memory_available = e_memtot_buffer - sum(status.current_mem_usage.values(),0.0)
+        #check memory available (reserved, actual use)
+        mb_memory_available = min(e_memtot_buffer - sum(status.current_mem_usage.values(),0.0),  0.95 * psutil.virtual_memory().available / (1024 * 1024))
 
-        #do a separate check (not taking into account buffer space)
-        mb_memory_available = e_memtot - sum(status.current_mem_usage.values(),0.0)
         
         status.lock.acquire()  
         #print("%s - CYCLE" % xtime(), str(status.current_cpu), str(status.current_mem), str(mb_memory_available))
@@ -432,8 +432,8 @@ try :
         elif not idle:
             idle_start = 0
         try:
-            #sys.stderr.write("%s - POLL; INFO: %s %s %s %s %s %s %s %s %s %s\n" % (xtime(), myid, str(cpu_usage), str(e_memtot), str(e_memtot_buffer), str(psutil.virtual_memory().available), str(mem_usage), str(load), str(mode), str(status.current_cpu_usage), str(status.current_mem_usage)))
-            #sys.stderr.flush()
+            sys.stderr.write("%s - POLL; INFO: %s %s %s %s %s %s %s %s %s %s\n" % (xtime(), myid, str(cpu_usage), str(e_memtot), str(e_memtot_buffer), str(psutil.virtual_memory().available), str(mem_usage), str(load), str(mode), str(status.current_cpu_usage), str(status.current_mem_usage)))
+            sys.stderr.flush()
             if idle_start == 0:
                 commands = s.poll(myid, cpu_usage, mem_usage, load,mode, 0.0, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
             else:

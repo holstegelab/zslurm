@@ -71,7 +71,7 @@ class Status(object):
         self.port = 0
         self.kill_idle = False
         self.lastin_first = False
-        self.prio_fillmem_context = 100
+        self.prio_fillmem_context = 500
         self.used_load = numpy.array([], dtype=float)
         self.used_cpus = numpy.array([], dtype=float)
         self.used_mem = numpy.array([], dtype=float)
