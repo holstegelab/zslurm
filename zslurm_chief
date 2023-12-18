@@ -21,8 +21,11 @@ except:
 #os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
+#return code
+RC_STUCK=-254
+
 import resource
-resource.setrlimit(resource.RLIMIT_NPROC, (32000, 32000))
+resource.setrlimit(resource.RLIMIT_NPROC, (64000, 64000))
 
 
 import numpy
@@ -31,6 +34,7 @@ from time import gmtime, strftime
 def xtime():
     return (strftime("%Y-%m-%d %H:%M:%S", gmtime()))
 
+STOP_THRESHOLD=20
 
 PING_INTERVAL = 20
 PING_TIMEOUT = 600
@@ -264,6 +268,32 @@ def job_monitor(jobid, process, ncpu, mem):
                         status.current_cpu_usage[jobid] = cpu_percentage
                         status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
                         status.lock.release()
+
+                    if lastcpureport['cpu_perc'] < 0.05:
+                        if partition == 'compute' and len(cpucache) > STOP_THRESHOLD and all([e['cpu_perc'] < 0.05 for e in cpucache[::-1][:STOP_THRESHOLD]]):
+                            print('%s - [%s] Job stuck, terminating.' % (xtime(), myid))
+                            #job seems to be stuck, terminate.
+                            procs = []
+                            try:
+                                for proc in ps.children(recursive=True):
+                                    proc.terminate()
+                                    procs.append(proc)
+                                ps.terminate()
+                                procs.append(ps)
+                            except psutil.NoSuchProces:
+                                pass
+                            time.sleep(10) #allow jobs some time to terminate normally
+
+                            #kill any remaining jobs
+                            for proc in procs:
+                                try:
+                                    proc.kill()
+                                except psutil.NoSuchProcess:
+                                    pass
+
+                            retcode=RC_STUCK
+
+
 
                 except psutil.NoSuchProcess:
                     pass
