@@ -69,7 +69,6 @@ class TimeoutServerProxy(xmlrpclib.ServerProxy):
         kw["transport"] = TimeoutTransport(
             timeout=timeout, use_datetime=kw.get("use_datetime", 0)
         )
-        print(uri)
         xmlrpclib.ServerProxy.__init__(self, uri, *l, **kw)
 
 
@@ -128,7 +127,7 @@ def short_name(name):
 def get_config():
     config_file = os.path.expanduser("~/.zslurm")
 
-    config = {"port": port, "reports_file": "reports.tsv"}
+    config = {"port": port, "reports_file_prefix": "reports"}
 
     if os.path.exists(config_file):
         config.update(read_yaml_config(config_file))

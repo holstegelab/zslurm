@@ -330,6 +330,10 @@ def job_monitor(jobid, process, ncpu, mem):
         report['nthreads_avg'] = float(numpy.mean([e['nthreads'] for e in cpucache]))
         report['nthreads_max'] = float(numpy.max([e['nthreads'] for e in cpucache]))
 
+        #20 snapshots of memory usage
+        idx = numpy.cast[int](numpy.round(numpy.linspace(0, len(memcache)-1, 20)))
+        report['memory_over_time'] = ';'.join([str(float(e['pss']) / (1024.0 * 1024.0)) for e in [memcache[i] for i in idx]])
+
     if len(iocache) > 0: 
         for lab in ['read_count','read_bytes','write_count','write_bytes']:
             report[lab] = float(numpy.sum([e[lab] for e in iocache.values()]))

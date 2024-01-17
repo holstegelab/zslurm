@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import curses, curses.textpad, curses.ascii
 import os
+import datetime
 import subprocess, sys, getopt, time, shlex
 from subprocess import Popen
 
@@ -845,6 +846,7 @@ class JobManager(object):
                 "write_bytes",
             ]:
                 line.append(report.get(lab, ""))
+            line.append(report.get('memory_over_time',''))
             status.reports_file.write("\t".join([str(e) for e in line]) + "\n")
             status.reports_file.flush()
 
@@ -2133,7 +2135,8 @@ def main(scr, *args, **kwds):
     config = zslurm_shared.get_config()
 
     status.set_address(address, int(config["port"]))
-    status.reports_file = open(config["reports_file"], "w")
+    current_date = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+    status.reports_file = open(config["reports_file_prefix"] + f'-{current_date}.tsv', "w")
     fieldnames = [
         "jobname",
         "retcode",
@@ -2165,6 +2168,7 @@ def main(scr, *args, **kwds):
             "write_count",
             "read_bytes",
             "write_bytes",
+            "memory_over_time"
         ]
     )
     status.reports_file.write("\t".join(fieldnames) + "\n")
