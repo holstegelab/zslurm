@@ -125,7 +125,10 @@ def short_name(name):
 
 
 def get_config():
-    config_file = os.path.expanduser("~/.zslurm")
+    if os.path.exists('zslurm.config'):
+        config_file = 'zslurm.config'
+    else:
+        config_file = os.path.expanduser("~/.zslurm")
 
     config = {"port": port, "reports_file_prefix": "reports"}
 

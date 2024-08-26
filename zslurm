@@ -88,27 +88,33 @@ status = Status()
 
 
 def parse_timeleft(time):
-    time = time.split("-")
-    if len(time) > 1:
-        days = int(time[0])
-        time = time[1]
-    else:
-        days = 0
-        time = time[0]
-    time = [int(e) for e in time.split(":")]
+    try:
+        time = time.split("-")
+        if len(time) > 1:
+            days = int(time[0])
+            time = time[1]
+        else:
+            days = 0
+            time = time[0]
 
-    if len(time) == 3:
-        hours = time[0]
-        time = time[1:]
-    else:
-        hours = 0
+        time = [int(e) for e in time.split(":")]
 
-    if len(time) == 2:
-        minutes = time[0]
-        time = time[1:]
-    else:
-        minutes = 0
-    seconds = time[0]
+        if len(time) == 3:
+            hours = time[0]
+            time = time[1:]
+        else:
+            hours = 0
+
+        if len(time) == 2:
+            minutes = time[0]
+            time = time[1:]
+        else:
+            minutes = 0
+        seconds = time[0]
+    except: #catch error where time was apparently 'INVALID'.
+        days = 5 #use default full time for engine. Better than crash. 
+        hours = minutes = seconds = 0
+
 
     return days * 24 * 60 * 60.0 + hours * 60 * 60.0 + minutes * 60 + seconds
 
