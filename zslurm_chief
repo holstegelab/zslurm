@@ -449,8 +449,7 @@ try :
 
                 with open(logfile_path, 'a') as logfile:
                     log_insides = logfile.read()
-
-                 if 'error' not in log_insides.lower():
+                if 'error' not in log_insides.lower():
                     os.remove(logfile_path)
 
                 
