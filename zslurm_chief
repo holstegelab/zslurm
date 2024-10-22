@@ -429,24 +429,29 @@ try :
                 curdir = os.getcwd()
                 os.chdir(cwd)
 
-                logfile = open('zslurm-%s.out' % jobid,'w')
+                logfile_path = f'zslurm-{jobid}.out'
+                with open(logfile_path, 'w') as logfile:
+                    command = shlex.split(command)
+                    try:
+                        process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
 
-                command = shlex.split(command)
-                try:
-                    process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
+                        status.current_cpu -= ncpu
+                        status.current_mem -= mem
+                        status.running_processes[jobid] = process
 
-                    status.current_cpu -= ncpu
-                    status.current_mem -= mem
-                    status.running_processes[jobid] = process
-                    
-                    os.chdir(curdir)
-                    #start monitoring
-                    t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem))
-                    t.start()
-                except:
-                    status.return_codes[jobid] = -20
-                        
-                    os.chdir(curdir)
+                        os.chdir(curdir)
+                        #start monitoring
+                        t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem))
+                        t.start()
+                    except:
+                        status.return_codes[jobid] = -20
+                        os.chdir(curdir)
+
+                with open(logfile_path, 'a') as logfile:
+                    log_insides = logfile.read()
+
+                 if 'error' not in log_insides.lower():
+                    os.remove(logfile_path)
 
                 
 
