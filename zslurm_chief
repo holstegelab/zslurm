@@ -184,7 +184,7 @@ class status:
     current_cpu_usage = {}
     current_mem_usage = {}
 
-def job_monitor(jobid, process, ncpu, mem):
+def job_monitor(jobid, process, ncpu, mem,logfile_path):
     memcache = [] #stores memory usage at different snapshots over time
     cpucache = [] #stores cpu usage at different snapshots over time
     iocache = {} #stores latest known io counter info per process. Note that this is an estimate, when a child process stops this information disappears, so we might miss the last 30 seconds of io per child process.
@@ -352,6 +352,13 @@ def job_monitor(jobid, process, ncpu, mem):
     event_timer.set()
     status.lock.release()
 
+    try:
+        with open(logfile_path, 'r') as logfile:
+            log_insides = logfile.read()
+        if 'error' not in log_insides.lower():
+            os.remove(logfile_path)
+    except FileNotFoundError:
+        pass
 
 
 status.lock = threading.RLock()
@@ -441,16 +448,14 @@ try :
 
                         os.chdir(curdir)
                         #start monitoring
-                        t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem))
+                        t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem, logfile_path))
                         t.start()
                     except:
                         status.return_codes[jobid] = -20
                         os.chdir(curdir)
 
-                with open(logfile_path, 'a') as logfile:
-                    log_insides = logfile.read()
-                if 'error' not in log_insides.lower():
-                    os.remove(logfile_path)
+
+
 
                 
 
