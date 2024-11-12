@@ -2118,6 +2118,8 @@ def enter_command(gb, argument="Command: "):
         gb.wcom.addstr(x, 1, "")
         gb.wcom.clrtoeol()
         gb.wcom.refresh()
+    except:
+        pass
     finally:
         gb.lock.release()
     return command
