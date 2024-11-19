@@ -13,7 +13,7 @@ except:
     from SimpleXMLRPCServer import SimpleXMLRPCServer,SimpleXMLRPCRequestHandler
 import socket
 import threading
-from collections import defaultdict, OrderedDict
+from collections import defaultdict, OrderedDict, deque
 
 import random
 import psutil
@@ -144,6 +144,7 @@ class Job(object):
         partition,
         info_input_mb,
         info_output_file,
+        comment
     ):
         self.job_name = job_name
         self.jobid = jobid
@@ -164,6 +165,7 @@ class Job(object):
         self.partition = partition
         self.input_mb = info_input_mb
         self.output_file = info_output_file
+        self.comment = comment
 
         self.state = "PENDING"
         self.node_id = None
@@ -197,6 +199,7 @@ class JobManager(object):
         self.jobid_counter = numpy.random.randint(0, 1000000)
 
         self.jobs_by_id = OrderedDict()
+        self.finished_jobs = deque()
 
         self.lock = threading.RLock()
 
@@ -271,6 +274,7 @@ class JobManager(object):
         partition,
         info_input_mb,
         info_output_file,
+        comment=""
     ):
         self.lock.acquire()
         jobid = str(self.jobid_counter)
@@ -302,6 +306,7 @@ class JobManager(object):
             partition,
             info_input_mb,
             info_output_file,
+            comment
         )
 
         self.jobs_by_id[jobid] = job
@@ -316,27 +321,13 @@ class JobManager(object):
         ):
             add_log_line(
                 gb,
-                "Job %s (id: %s, ncore: %.2g, mem: %d mb, partition: %s, arch+: %d GB, arch-: %d GB, d+: %d GB, d-: %d GB, active+: %d GB, active-: %d GB) submitted."
-                % (
-                    job_name,
-                    jobid,
-                    ncpu,
-                    mem,
-                    partition,
-                    arch_use_add,
-                    arch_use_remove,
-                    dcache_use_add,
-                    dcache_use_remove,
-                    active_use_add,
-                    active_use_remove,
-                ),
-                GREEN,
+                f"Job {job_name} (id: {jobid}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}, arch+: {arch_use_add} GB, arch-: {arch_use_remove} GB, d+: {dcache_use_add} GB, d-: {dcache_use_remove} GB, active+: {active_use_add} GB, active-: {active_use_remove} GB) submitted.",
+                 GREEN,
             )
         else:
             add_log_line(
                 gb,
-                "Job %s (id: %s, ncore: %.2g, mem: %d mb, partition: %s) submitted."
-                % (job_name, jobid, ncpu, mem, partition),
+                f"Job {job_name} (id: {jobid}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}) submitted.",
                 GREEN,
             )
         return jobid
@@ -392,18 +383,36 @@ class JobManager(object):
             self.lock.release()
 
     def list_done_jobs(self):
-        return []
+        jobs = []
+        for job in self.finished_jobs:
+            if not job.starttime is None:
+                runtime = job.endtime - job.starttime
+            else:
+                runtime = 0.0
 
-        # jobs = []
-        # for job in self.jobs_done:
-        #    if not job.starttime is None and not job.endtime is None:
-        #        runtime = job.endtime - job.starttime
-        #    else:
-        #        runtime = 0.0
+            arch_use = job.archive_start_use_add - job.archive_end_use_remove
+            active_use = job.active_start_use_add - job.active_end_use_remove
+            dcache_use = job.dcache_start_use_add - job.dcache_end_use_remove
 
-        #    jobs.append([job.jobid, job.job_name, job.state, runtime, job.ncpu, job.partition, job.reason])
-
-        # return jobs
+            jobs.append(
+                [
+                    job.jobid,
+                    job.job_name,
+                    job.state,
+                    runtime,
+                    job.ncpu,
+                    job.partition,
+                    job.node_id,
+                    job.current_cpu_usage,
+                    job.current_mem_usage,
+                    arch_use,
+                    active_use,
+                    dcache_use,
+                    job.cwd,
+                    job.comment
+                ]
+            )
+        return jobs
 
     def list_jobs(self):
         jobs = []
@@ -436,6 +445,7 @@ class JobManager(object):
                     active_use,
                     dcache_use,
                     job.cwd,
+                    job.comment
                 ]
             )
 
@@ -579,28 +589,14 @@ class JobManager(object):
                     if not (job.ncpu <= current_cpu and job.mem <= current_mem):
                         add_log_line(
                             gb,
-                            "Job %s (id: %s) assigned to node %s (%d/%d remaining)"
-                            % (
-                                job.job_name,
-                                job.jobid,
-                                myid,
-                                current_cpu - job.ncpu,
-                                current_mem - job.mem,
-                            ),
+                            f"Job {job.job_name} (id: {job.jobid}) cannot be scheduled on node {myid} ({current_cpu - job.ncpu}/{current_mem - job.mem:.2f} remaining)",
                             BLUE,
                         )
                         job.assigned(myid)
                     else:
                         add_log_line(
                             gb,
-                            "Job %s (id: %s) started on node %s (%d/%d remaining)"
-                            % (
-                                job.job_name,
-                                job.jobid,
-                                myid,
-                                current_cpu - job.ncpu,
-                                current_mem - job.mem,
-                            ),
+                            f"Job {job.job_name} (id: {job.jobid}) started on node {myid} ({current_cpu - job.ncpu}/{current_mem - job.mem:.2f} remaining)",
                             BLUE,
                         )
                         job.started(myid)
@@ -613,6 +609,7 @@ class JobManager(object):
 
                     res = (
                         job.jobid,
+                        job.job_name,
                         job.command,
                         job.cwd,
                         job.env,
@@ -646,8 +643,7 @@ class JobManager(object):
 
                         add_log_line(
                             gb,
-                            "Job %s (id: %s) reassigned and started on node %s (%d/%d remaining)"
-                            % (job.job_name, job.jobid, myid, current_cpu, current_mem),
+                            f"Job {job.job_name} (id: {job.jobid}) reassigned and started on node {myid} ({current_cpu}/{current_mem} remaining)",
                             BLUE,
                         )
                         self.running_jobs[job.partition] = (
@@ -660,6 +656,7 @@ class JobManager(object):
 
                         res = (
                             job.jobid,
+                            job.job_name,
                             job.command,
                             job.cwd,
                             job.env,
@@ -752,6 +749,10 @@ class JobManager(object):
                     job.starttime = None
                 else:
                     job = self.jobs_by_id[jobid]
+                    
+
+
+
                     del self.jobs_by_id[jobid]
                     self.done_jobs[job.partition] = (
                         self.done_jobs.get(job.partition, 0) + 1
@@ -771,9 +772,15 @@ class JobManager(object):
                     elif return_code == RC_CANCELLED or return_code == RC_TERMINATED:
                         newstate = "CANCELLED"
                     else:
-                        newstate = "FINISHED"
+                        newstate = "COMPLETED"
 
                 job.done(return_code, reason, newstate)
+                self.finished_jobs.append(job)
+
+                #remove job from beginning of queue if endtime is longer than 6 hours ago
+                while self.finished_jobs and self.finished_jobs[0].endtime < time.time() - 6 * 60 * 60:
+                    self.finished_jobs.popleft()
+                
 
         finally:
             self.lock.release()
@@ -795,6 +802,7 @@ class JobManager(object):
             reason = "Job Failed (errorcode: %d)" % return_code
 
         name = "unknown"
+        comment = ""
         self.lock.acquire()
         core_reserved = 0
         mem_reserved = 0
@@ -809,6 +817,7 @@ class JobManager(object):
                 )
             else:
                 job = self.jobs_by_id[jobid]
+                comment = job.comment
                 mem_reserved = job.mem
                 core_reserved = job.ncpu
                 input_mb = job.input_mb
@@ -821,6 +830,7 @@ class JobManager(object):
         if "starttime" in report:
             line = [
                 name,
+                comment,
                 report.get("retcode", ""),
                 myid,
                 jobid,
@@ -962,9 +972,34 @@ class EngineManager(object):
                 engine = self.engine_by_id[engine_id]
                 if engine.status == PHASING_OUT:
                     engine.status = ""
+                    res = f"Engine {engine_id} is no longer phasing out."
                 else:
                     engine.status = PHASING_OUT
+                    res = f"Engine {engine_id} is now phasing out."
                 res = engine.status
+            elif engine_id.strip().isdigit():
+                nr_of_engines = int(engine_id)
+                
+                if nr_of_engines > 0:
+                    engines = [e for e in self.engine_by_id.values() if e.status != PHASING_OUT] #only consider engines that are not already phasing out
+                    #sort by number of jobs, phase out the ones with the least jobs
+                    engines.sort(key=lambda x: len(x.jobs))
+                    nr_of_engines = min(nr_of_engines, len(engines))
+                    for i in range(nr_of_engines):
+                        engines[i].status = PHASING_OUT
+
+                    res = f"Phasing out {nr_of_engines} engines: {[e.engine_id for e in engines[:nr_of_engines]]}."
+                else:
+                    engines = [e for e in self.engine_by_id.values() if e.status == PHASING_OUT] #only consider engines that are phasing out
+                    #sort by number of jobs, dephase out the ones with the most jobs
+                    engines.sort(key=lambda x: len(x.jobs), reverse=True)
+                    nr_of_engines = min(-nr_of_engines, len(engines))
+                    for i in range(nr_of_engines):
+                        engines[i].status = ""
+                    res = f"Dephasing out {nr_of_engines} engines: {[e.engine_id for e in engines[:nr_of_engines]]}."
+            else:
+                res = f"Engine {engine_id} not found in list of engines: {list(self.engine_by_id.keys())}."
+
         finally:
             self.lock.release()
         return res
@@ -2148,6 +2183,7 @@ def main(scr, *args, **kwds):
     status.reports_file = open(config["reports_file_prefix"] + f'-{current_date}.tsv', "w")
     fieldnames = [
         "jobname",
+        "comment",
         "retcode",
         "machine",
         "jobid",
@@ -2347,16 +2383,7 @@ def main(scr, *args, **kwds):
             elif c == ord("o"):
                 cmd = enter_command(gb, "Enter node name to toggle phase out: ")
                 r = engines.toggle_phasing_out(cmd)
-                if r is None:
-                    add_log_line(
-                        gb,
-                        "Engine %s not found in engine list: %s."
-                        % (cmd, str(list(engines.engine_by_id.keys()))),
-                    )
-                elif r == PHASING_OUT:
-                    add_log_line(gb, "Phasing out engine %s." % cmd)
-                else:
-                    add_log_line(gb, "Disabling phasing out of engine %s." % cmd)
+                add_log_line(gb, r)
 
             elif c == ord("u"):  # Update ncurses screen
                 gb.scr.refresh()

@@ -124,8 +124,10 @@ def short_name(name):
     return name.split(".")[0]
 
 
-def get_config():
-    if os.path.exists('zslurm.config'):
+def get_config(config_path=None):
+    if config_path is not None:
+        config_file = os.path.expanduser(config_path)
+    elif os.path.exists('zslurm.config'):
         config_file = 'zslurm.config'
     else:
         config_file = os.path.expanduser("~/.zslurm")
@@ -134,6 +136,8 @@ def get_config():
 
     if os.path.exists(config_file):
         config.update(read_yaml_config(config_file))
+    elif config_path is not None:
+        raise RuntimeError(f"Config file {config_file} not found")
 
     if "rpcpath" not in config:
         config["rpcpath"] = "".join(random.sample(string.ascii_letters, 8))
@@ -142,8 +146,9 @@ def get_config():
     return config
 
 
-def get_job_url(address="127.0.0.1"):
-    config = get_config()
+def get_job_url(address="127.0.0.1", config=None):
+    if config is None:
+        config = get_config()
     return f"http://{address}:" + str(int(config["port"]) + 1) + "/" + config["rpcpath"]
 
 def get_manager_url(address="127.0.0.1"):

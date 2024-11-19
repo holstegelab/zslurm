@@ -52,6 +52,7 @@ port = int(config['port'])
 cpu = psutil.cpu_count()
 partition = 'compute'
 cluster_managed = True
+keep_logfiles = False
 mem = None
 
 
@@ -69,6 +70,8 @@ for o, a in opts:
         partition = a.strip()
     elif o in ('-u' ,'--unmanaged'):
         cluster_managed=False
+    elif o in ('-k', '--keep'):
+        keep_logfiles = True
 myip = zslurm_shared.get_hostname()
 myid = myip #for now
 
@@ -196,7 +199,7 @@ class status:
     current_cpu_usage = {}
     current_mem_usage = {}
 
-def job_monitor(jobid, process, ncpu, mem,logfile_path):
+def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     memcache = [] #stores memory usage at different snapshots over time
     cpucache = [] #stores cpu usage at different snapshots over time
     iocache = {} #stores latest known io counter info per process. Note that this is an estimate, when a child process stops this information disappears, so we might miss the last 30 seconds of io per child process.
@@ -218,8 +221,6 @@ def job_monitor(jobid, process, ncpu, mem,logfile_path):
     status.current_cpu_usage[jobid] = 0.0
     status.current_mem_usage[jobid] = 0.0
     
-   
-
     while retcode is None:
         try:
             res = os.wait4(process.pid,os.WNOHANG)
@@ -315,7 +316,9 @@ def job_monitor(jobid, process, ncpu, mem,logfile_path):
 
         time.sleep(1)
 
-
+    sys.stderr.write(f"{xtime()}:{jobid} - MONITOR END; INFO: {pid} {logfile_path} {retcode}\n")
+    sys.stderr.flush()
+    
     report = {}
     report['starttime'] = time.strftime('%b %d %Y %H:%M:%S',time.localtime(start_time))
     report['endtime'] = time.strftime('%b %d %Y %H:%M:%S', time.localtime(time.time()))
@@ -343,7 +346,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile_path):
         report['nthreads_max'] = float(numpy.max([e['nthreads'] for e in cpucache]))
 
         #20 snapshots of memory usage
-        idx = numpy.cast[int](numpy.round(numpy.linspace(0, len(memcache)-1, 20)))
+        idx = numpy.asarray(numpy.round(numpy.linspace(0, len(memcache)-1, 20)),dtype=int)
         report['memory_over_time'] = ';'.join([str(float(e['pss']) / (1024.0 * 1024.0)) for e in [memcache[i] for i in idx]])
 
     if len(iocache) > 0: 
@@ -364,13 +367,16 @@ def job_monitor(jobid, process, ncpu, mem,logfile_path):
     event_timer.set()
     status.lock.release()
 
-    try:
-        with open(logfile_path, 'r') as logfile:
-            log_insides = logfile.read()
-        if 'error' not in log_insides.lower():
-            os.remove(logfile_path)
-    except FileNotFoundError:
-        pass
+    logfile.close()
+
+    if not keep_logfiles:
+        try:
+            with open(logfile_path, 'r') as logfile:
+                log_insides = logfile.read()
+            if 'error' not in log_insides.lower():
+               os.remove(logfile_path)
+        except FileNotFoundError:
+            pass
 
 
 status.lock = threading.RLock()
@@ -428,7 +434,7 @@ try :
                     print ("%s - REQUEST HTTP Error" % xtime())
                     jobs = []
             for job in jobs:
-                jobid, command, cwd, env, ncpu, mem, state = job
+                jobid, job_name, command, cwd, env, ncpu, mem, state = job
                 if state == 'ASSIGNED':
                     if status.current_cpu >= ncpu and min(status.current_mem,mb_memory_available) >= mem:
                         status.assigned_jobs.pop(jobid,None)
@@ -448,23 +454,34 @@ try :
                 curdir = os.getcwd()
                 os.chdir(cwd)
 
-                logfile_path = f'zslurm-{jobid}.out'
-                with open(logfile_path, 'w') as logfile:
-                    command = shlex.split(command)
-                    try:
-                        process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
+                os.makedirs('zslurm_logs',exist_ok=True)
+                logfile_path = f'zslurm_logs/zslurm-{job_name}-{jobid}.out'
 
-                        status.current_cpu -= ncpu
-                        status.current_mem -= mem
-                        status.running_processes[jobid] = process
+                
+                #do not put logfile in a with, but keep it open, as subprocess will make use of it
+                logfile = open(logfile_path,'w')
 
-                        os.chdir(curdir)
-                        #start monitoring
-                        t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem, logfile_path))
-                        t.start()
-                    except:
-                        status.return_codes[jobid] = -20
-                        os.chdir(curdir)
+                command = shlex.split(command)
+                try:
+                    sys.stderr.write(f"{xtime()}:{jobid} - START; INFO: {ncpu} {mem} {' '.join(command)} {logfile_path}\n")
+                    sys.stderr.flush()
+                    process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
+
+                    status.current_cpu -= ncpu
+                    status.current_mem -= mem
+                    status.running_processes[jobid] = process
+
+                    os.chdir(curdir)
+                    
+                    #start monitoring
+                    t = threading.Thread(target=job_monitor, args=(jobid, process, ncpu, mem, logfile, logfile_path))
+                    t.start()
+                except Exception as e:
+                    import traceback
+                    sys.stderr.write(traceback.format_exc())
+                    sys.stderr.write(f"{xtime()}:{jobid} - ERROR; INFO: {ncpu} {mem} {command} {logfile_path} {str(e)}\n")
+                    status.return_codes[jobid] = -20
+                    os.chdir(curdir)
 
 
 
@@ -487,7 +504,7 @@ try :
         elif not idle:
             idle_start = 0
         try:
-            sys.stderr.write("%s - POLL; INFO: %s %s %s %s %s %s %s %s %s %s\n" % (xtime(), myid, str(cpu_usage), str(e_memtot), str(e_memtot_buffer), str(get_memory_avl()), str(mem_usage), str(load), str(mode), str(status.current_cpu_usage), str(status.current_mem_usage)))
+            sys.stderr.write(f"{xtime()} - POLL; INFO: {myid} {cpu_usage:.2f} {e_memtot:.2f} {e_memtot_buffer:.2f} {get_memory_avl():.2f} {mem_usage:.2f} {load:.2f} {mode} {status.current_cpu_usage} {status.current_mem_usage}\n")
             sys.stderr.flush()
             if idle_start == 0:
                 commands = s.poll(myid, cpu_usage, mem_usage, load,mode, 0.0, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
