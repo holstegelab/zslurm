@@ -200,6 +200,7 @@ class JobManager(object):
 
         self.jobs_by_id = OrderedDict()
         self.finished_jobs = deque()
+        self.finished_jobs_lock = threading.RLock()
 
         self.lock = threading.RLock()
 
@@ -384,34 +385,35 @@ class JobManager(object):
 
     def list_done_jobs(self):
         jobs = []
-        for job in self.finished_jobs:
-            if not job.starttime is None:
-                runtime = job.endtime - job.starttime
-            else:
-                runtime = 0.0
+        with self.finished_jobs_lock:
+            for job in self.finished_jobs:
+                if not job.starttime is None:
+                    runtime = job.endtime - job.starttime
+                else:
+                    runtime = 0.0
 
-            arch_use = job.archive_start_use_add - job.archive_end_use_remove
-            active_use = job.active_start_use_add - job.active_end_use_remove
-            dcache_use = job.dcache_start_use_add - job.dcache_end_use_remove
+                arch_use = job.archive_start_use_add - job.archive_end_use_remove
+                active_use = job.active_start_use_add - job.active_end_use_remove
+                dcache_use = job.dcache_start_use_add - job.dcache_end_use_remove
 
-            jobs.append(
-                [
-                    job.jobid,
-                    job.job_name,
-                    job.state,
-                    runtime,
-                    job.ncpu,
-                    job.partition,
-                    job.node_id,
-                    job.current_cpu_usage,
-                    job.current_mem_usage,
-                    arch_use,
-                    active_use,
-                    dcache_use,
-                    job.cwd,
-                    job.comment
-                ]
-            )
+                jobs.append(
+                    [
+                        job.jobid,
+                        job.job_name,
+                        job.state,
+                        runtime,
+                        job.ncpu,
+                        job.partition,
+                        job.node_id,
+                        job.current_cpu_usage,
+                        job.current_mem_usage,
+                        arch_use,
+                        active_use,
+                        dcache_use,
+                        job.cwd,
+                        job.comment
+                    ]
+                )
         return jobs
 
     def list_jobs(self):
@@ -775,11 +777,12 @@ class JobManager(object):
                         newstate = "COMPLETED"
 
                 job.done(return_code, reason, newstate)
-                self.finished_jobs.append(job)
+                with self.finished_jobs_lock:
+                    self.finished_jobs.append(job)
 
-                #remove job from beginning of queue if endtime is longer than 6 hours ago
-                while self.finished_jobs and self.finished_jobs[0].endtime < time.time() - 6 * 60 * 60:
-                    self.finished_jobs.popleft()
+                    #remove job from beginning of queue if endtime is longer than 6 hours ago
+                    while self.finished_jobs and self.finished_jobs[0].endtime < time.time() - 6 * 60 * 60:
+                        self.finished_jobs.popleft()
                 
 
         finally:
