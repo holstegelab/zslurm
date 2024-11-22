@@ -374,9 +374,16 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
             with open(logfile_path, 'r') as logfile:
                 log_insides = logfile.read()
             if 'error' not in log_insides.lower():
-               os.remove(logfile_path)
+                sys.stderr.write(f'Deleting log file {logfile_path} as there are no errors.\n')
+                sys.stderr.flush()
+                os.remove(logfile_path)
+            else:
+                sys.stderr.write(f'Keeping log file {logfile_path} as there are errors.\n')
+                sys.stderr.flush()
+
         except FileNotFoundError:
-            pass
+            sys.stderr.write(f'Log file {logfile_path} has disappeared.\n')
+            sys.stderr.flush()
 
 
 status.lock = threading.RLock()

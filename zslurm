@@ -589,14 +589,14 @@ class JobManager(object):
                     if not (job.ncpu <= current_cpu and job.mem <= current_mem):
                         add_log_line(
                             gb,
-                            f"Job {job.job_name} (id: {job.jobid}) cannot be scheduled on node {myid} ({current_cpu - job.ncpu}/{current_mem - job.mem:.2f} remaining)",
+                            f"Job {job.job_name} (id: {job.jobid}) assigned to node {myid} ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
                             BLUE,
                         )
                         job.assigned(myid)
                     else:
                         add_log_line(
                             gb,
-                            f"Job {job.job_name} (id: {job.jobid}) started on node {myid} ({current_cpu - job.ncpu}/{current_mem - job.mem:.2f} remaining)",
+                            f"Job {job.job_name} (id: {job.jobid}) started on node {myid} ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
                             BLUE,
                         )
                         job.started(myid)
