@@ -33,4 +33,4 @@ try:
             print('%s\t%s\t%s\t%.2g\t%.1fGb\t%s\t%s\t%d\t%.1f\t%.1f\t%.1f\t%s' % (engine_id, cluster_id, partition, cores, totmem/1024.0, runtime, timeleft, njobs, cpu_usage, mem_usage, load, status))
 
 except (socket.error, httplib.HTTPException) as serror:
-    print('Queue request failed, could not connect to ZSlurm manager on ' + zslurm_shared.job_url)
+    print('Queue request failed, could not connect to ZSlurm manager on ' + zslurm_shared.get_job_url())

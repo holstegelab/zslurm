@@ -23,4 +23,4 @@ try:
     for job_id in job_ids: 
         s.cancel_job(job_id.strip(), args.requeue)
 except (socket.error, httplib.HTTPException) as serror:
-    print('Job canceling failed, could not connect to ZSlurm manager on ' + zslurm_shared.job_url)
+    print('Job canceling failed, could not connect to ZSlurm manager on ' + zslurm_shared.get_job_url())

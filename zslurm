@@ -194,6 +194,33 @@ class Job(object):
         self.node_id = None
 
 
+class DummyJob(Job):
+    def __init__(self, jobid):
+        super(DummyJob, self).__init__(
+            "Dummy",
+            jobid,
+            "UNK",
+            "UNK",
+            {},
+            0,
+            0,
+            0,
+            0,
+            "",
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            "UNK",
+            0,
+            "",
+            "Dummy job",
+        )
+        self.starttime = time.time()
+
+
 class JobManager(object):
     def __init__(self):
         self.jobid_counter = numpy.random.randint(0, 1000000)
@@ -818,6 +845,13 @@ class JobManager(object):
                     "Unknown job (id: %s) completed at %s (%s)" % (jobid, myid, reason),
                     YELLOW,
                 )
+                #insert a Dummy Job with the correct id so that we correctly report back to snakemake
+                job = DummyJob(jobid)
+                state = 'COMPLETED' if return_code == 0 else 'FAILED'
+                job.done(return_code, reason, state)
+                with self.finished_jobs_lock:
+                    self.finished_jobs.append(job)
+
             else:
                 job = self.jobs_by_id[jobid]
                 comment = job.comment
@@ -980,7 +1014,7 @@ class EngineManager(object):
                     engine.status = PHASING_OUT
                     res = f"Engine {engine_id} is now phasing out."
                 res = engine.status
-            elif engine_id.strip().isdigit():
+            elif engine_id.lstrip('- ').rstrip().isdigit():
                 nr_of_engines = int(engine_id)
                 
                 if nr_of_engines > 0:
@@ -2384,7 +2418,7 @@ def main(scr, *args, **kwds):
                     status.prio_fillmem_context = max(int(cmd), 1)
                 add_log_line(gb, "Fill memory context size set to " + str(cmd), GREEN)
             elif c == ord("o"):
-                cmd = enter_command(gb, "Enter node name to toggle phase out: ")
+                cmd = enter_command(gb, "Enter name of node, or number of nodes to phase out (negative for reverting phase out): ")
                 r = engines.toggle_phasing_out(cmd)
                 add_log_line(gb, r)
 
