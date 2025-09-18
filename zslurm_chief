@@ -198,6 +198,7 @@ class status:
     reports = {}
     current_cpu_usage = {}
     current_mem_usage = {}
+    completed_jobs = set()
 
 def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     memcache = [] #stores memory usage at different snapshots over time
@@ -360,9 +361,15 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     status.reports[jobid] = report
     status.current_cpu_usage.pop(jobid, None)
     status.current_mem_usage.pop(jobid, None)
-    status.current_cpu += ncpu
-    status.current_mem += mem
-    del status.running_processes[jobid]
+    # Avoid double resource accounting if multiple monitors exist for the same job
+    if jobid not in status.completed_jobs:
+        status.completed_jobs.add(jobid)
+        status.current_cpu += ncpu
+        status.current_mem += mem
+    removed_proc = status.running_processes.pop(jobid, None)
+    if removed_proc is None:
+        sys.stderr.write(f"job_monitor cleanup: jobid {jobid} not in running_processes (already cleaned?)\n")
+        sys.stderr.flush()
 
     event_timer.set()
     status.lock.release()
@@ -457,6 +464,11 @@ try :
                         status.assigned_jobs[jobid] = job
                         continue
                 #print("%s - EXECUTE" % xtime())
+                # Prevent duplicate starts for the same jobid
+                if jobid in status.running_processes:
+                    sys.stderr.write(f"{xtime()} - DUPLICATE START SKIPPED; INFO: job {jobid} already running\n")
+                    sys.stderr.flush()
+                    continue
                 #start job
                 curdir = os.getcwd()
                 os.chdir(cwd)

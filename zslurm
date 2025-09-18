@@ -43,6 +43,11 @@ CYAN = 6
 
 TIMEOUT = 1200
 
+# Reduce managed/unmanaged flapping by requiring consecutive squeue observations
+# to (re)confirm managed state, and consecutive misses to consider unmanaged.
+SQUEUE_OBSERVED_CONFIRMS = 2
+SQUEUE_MISSING_TOLERANCE = 2
+
 
 # current screen info
 class gb:
@@ -489,6 +494,22 @@ class JobManager(object):
             engine = engines.engine_by_id[myid]
             if engine.status == PHASING_OUT:
                 return []
+            # Do not start or assign work to unmanaged cluster engines (seen as missing in squeue)
+            if engine.cluster_id not in (None, False) and not engine.managed:
+                add_log_line(
+                    gb,
+                    f"Node {myid} is currently unmanaged (cluster id {engine.cluster_id} not observed). No jobs will be assigned/started until managed again.",
+                    YELLOW,
+                )
+                return []
+            # Do not schedule work for engines that are stopping (teardown in progress)
+            if engine.stopping:
+                add_log_line(
+                    gb,
+                    f"Node {myid} is stopping. No jobs will be assigned/started until teardown completes.",
+                    YELLOW,
+                )
+                return []
             timeleft = int(engines.engine_by_id[myid].timeleft)
             cores = float(engines.engine_by_id[myid].cores)
             totmem = engines.engine_by_id[myid].totmem
@@ -663,6 +684,7 @@ class JobManager(object):
                         and job.mem <= current_mem
                         and job.partition == partition
                     ):
+                        # Ask the previous engine to drop assignment and reassign to this engine.
                         try:
                             engines.send_command(
                                 job.node_id, zslurm_shared.DEASSIGN, job.jobid
@@ -670,15 +692,13 @@ class JobManager(object):
                         except KeyError:
                             pass
 
+                        # Reassign but do not start here; require handshake via can_run_assigned_job
+                        job.assigned(myid)
                         add_log_line(
                             gb,
-                            f"Job {job.job_name} (id: {job.jobid}) reassigned and started on node {myid} ({current_cpu}/{current_mem} remaining)",
+                            f"Job {job.job_name} (id: {job.jobid}) reassigned to node {myid} (ASSIGNED; will start after handshake) ({current_cpu}/{current_mem} remaining)",
                             BLUE,
                         )
-                        self.running_jobs[job.partition] = (
-                            self.running_jobs.get(job.partition, 0) + 1
-                        )
-                        job.started(myid)
 
                         current_cpu -= job.ncpu
                         current_mem -= job.mem
@@ -723,7 +743,12 @@ class JobManager(object):
             res = False  # DROP
             if jobid in self.jobs_by_id:
                 job = self.jobs_by_id[jobid]
-                if job.state == "ASSIGNED":
+                # Only the engine currently assigned to this job may start it
+                engine = engines.engine_by_id.get(nodeid, None)
+                if engine and engine.stopping:
+                    # Do not allow starts on engines that are stopping
+                    res = False
+                elif job.state == "ASSIGNED" and job.node_id == nodeid:
                     self.job_start(nodeid, jobid)
                     res = True
         finally:
@@ -969,6 +994,9 @@ class Engine(object):
         self.engine_id = engine_id
         self.cluster_id = cluster_id
         self.managed = managed
+        self.stopping = False
+        self.observed_hits = 0
+        self.missing_hits = 0
 
         self.cores = cores
         self.totmem = totmem
@@ -1123,9 +1151,18 @@ class EngineManager(object):
                 if cstate == "CG":  # cleaning up
                     continue
 
-                # indicate this engine is managed
+                # indicate this engine is observed; apply gating to reduce flapping
                 if cid in self.engine_by_clusterid:
-                    self.engine_by_clusterid[cid].managed = True
+                    engine = self.engine_by_clusterid[cid]
+                    engine.missing_hits = 0
+                    engine.observed_hits = engine.observed_hits + 1
+                    if (not engine.managed) and engine.observed_hits >= SQUEUE_OBSERVED_CONFIRMS:
+                        engine.managed = True
+                        add_log_line(
+                            gb,
+                            f"Engine {engine.engine_id} @ {engine.cluster_id} is managed again after {engine.observed_hits} observations.",
+                            CYAN,
+                        )
 
                 if cpartition == "staging":
                     if cstate == "R":
@@ -1143,6 +1180,17 @@ class EngineManager(object):
                         nqueue += 1
             elif cstate == "R" and cid in self.engine_by_clusterid:
                 observed_cluster_ids.add(cid)
+                # also treat as observed for gating when zslurm name doesn't match
+                engine = self.engine_by_clusterid[cid]
+                engine.missing_hits = 0
+                engine.observed_hits = engine.observed_hits + 1
+                if (not engine.managed) and engine.observed_hits >= SQUEUE_OBSERVED_CONFIRMS:
+                    engine.managed = True
+                    add_log_line(
+                        gb,
+                        f"Engine {engine.engine_id} @ {engine.cluster_id} is managed again after {engine.observed_hits} observations.",
+                        CYAN,
+                    )
                 if cpartition == "staging":
                     nrunning_archive += 1
                 else:
@@ -1160,12 +1208,17 @@ class EngineManager(object):
                 not engine.cluster_id is False
                 and not engine.cluster_id in observed_cluster_ids
             ):
-                add_log_line(
-                    gb,
-                    f"Engine {engine.engine_id} @ {engine.cluster_id} disappeared from Slurm.",
-                    RED,
-                )
-                self._unregister(engine, "Engine disappeared")
+                # Missed this cycle; increment misses and reset observations
+                engine.observed_hits = 0
+                engine.missing_hits = engine.missing_hits + 1
+                # Only mark unmanaged after tolerance to avoid flapping
+                if engine.managed and engine.missing_hits >= SQUEUE_MISSING_TOLERANCE:
+                    engine.managed = False
+                    add_log_line(
+                        gb,
+                        f"Engine {engine.engine_id} @ {engine.cluster_id} not observed in Slurm {engine.missing_hits} times; deferring unregister until TIMEOUT.",
+                        YELLOW,
+                    )
 
         self.cluster_queued_engines = nqueue
         self.cluster_running_engines = nrunning
@@ -1376,7 +1429,7 @@ class EngineManager(object):
         finally:
             self.lock.release()
 
-    def cancel_cid(self, cid):
+    def cancel_cid(self, cid, unregister_after=True):
         self.lock.acquire()
         try:
             cmd = "scancel " + str(cid)
@@ -1390,9 +1443,42 @@ class EngineManager(object):
             if cid in self.engine_by_clusterid:
                 e = self.engine_by_clusterid[cid]
                 if not e is None:
-                    self._unregister(e, reason="Engine stopped")
+                    # mark as stopping while Slurm cancellation propagates
+                    e.stopping = True
+                    if unregister_after:
+                        self._unregister(e, reason="Engine stopped")
         finally:
             self.lock.release()
+
+    def _is_cid_present(self, cid):
+        """Return True if the given Slurm cluster job id is still present in squeue."""
+        try:
+            cmd = "squeue -h -r -j " + str(cid) + " -o '%i|%t'"
+            args = shlex.split(cmd)
+            p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            output = p.communicate()[0]
+            if isinstance(output, bytes):
+                output = output.decode("utf-8")
+            lines = [e.strip().split("|") for e in output.split("\n") if e]
+            for fields in lines:
+                if fields and fields[0] == str(cid):
+                    return True
+            return False
+        except OSError:
+            # If squeue failed, do not block requeue indefinitely; assume not present
+            return False
+
+    def _wait_for_cid_termination(self, cid, timeout_seconds=60, poll_interval=2):
+        """Wait up to timeout_seconds for the Slurm job cid to disappear from squeue."""
+        if cid is None or cid is False:
+            return
+        start = time.time()
+        while time.time() - start < timeout_seconds:
+            if not self._is_cid_present(cid):
+                add_log_line(gb, f"Confirmed SLURM job {cid} is no longer present.", CYAN)
+                return
+            time.sleep(poll_interval)
+        add_log_line(gb, f"Timed out waiting for SLURM job {cid} to disappear; proceeding.", YELLOW)
 
     def stop_all(self):
         if self.count_cluster_engines() > 0:
@@ -1460,6 +1546,15 @@ class EngineManager(object):
             e.load = load
             e.lastseen = time.time()
 
+            # If this engine is stopping, do not reconcile or assign; force STOP
+            if e.stopping:
+                self.lock.acquire()
+                commands = e.pending_commands
+                e.pending_commands = []
+                self.lock.release()
+                commands.append((zslurm_shared.STOP, None))
+                return commands
+
             commands = e.pending_commands
             # kill if idle for 3 minutes, but not if local engine or archive engine  (except if no extra jobs)
             if idle > 0.0 and e.status == PHASING_OUT:
@@ -1486,6 +1581,31 @@ class EngineManager(object):
                     job.current_cpu_usage = value
                     mem = current_mem_usage.get(jobid, 0.0)
                     job.current_mem_usage = mem
+
+            # Reconcile jobs after reregister events: if engine reports a job running
+            # that the manager currently does not consider RUNNING, mark it RUNNING
+            # and re-reserve resources if needed.
+            jobs.lock.acquire()
+            try:
+                for jobid in list(current_cpu_usage.keys()):
+                    job = jobs.jobs_by_id.get(jobid, None)
+                    if job is None:
+                        continue
+                    if job.state != "RUNNING":
+                        # If the job was queued (PENDING/REQUEUED), re-reserve storage resources
+                        if job.state in queue_states:
+                            jobs.active_inuse += job.active_start_use_add
+                            jobs.dcache_inuse += job.dcache_start_use_add
+                            jobs.archive_inuse += job.archive_start_use_add
+                        # Transition to RUNNING on this engine (increments running_jobs and updates node_id)
+                        jobs.job_start(myid, job.jobid)
+                        add_log_line(
+                            gb,
+                            f"Reconciled job {job.job_name} (id: {job.jobid}) back to RUNNING on node {myid}",
+                            BLUE,
+                        )
+            finally:
+                jobs.lock.release()
 
         except KeyError:
             commands = []
@@ -1520,6 +1640,8 @@ class EngineManager(object):
         self.lock.acquire()
         try:
             e = self.engine_by_id[myid]
+            # mark as stopping to prevent any further scheduling/starts
+            e.stopping = True
             if (
                 not (e.cluster_id is None or e.cluster_id is False)
                 and e.cluster_id in self.engine_by_clusterid
@@ -1560,7 +1682,28 @@ def thread_check_commands():
         now = time.time()
         for engine in all_engines:
             if now - engine.lastseen > TIMEOUT:
-                engines.terminate_engine(engine.engine_id)
+                # Attempt to kill SLURM allocation for this engine first without unregistering yet
+                cid = engine.cluster_id
+                # mark as stopping to avoid further assignments/starts and reconciliation
+                engine.stopping = True
+                try:
+                    if cid is False:
+                        # Local engine
+                        engines.stop_local(gb)
+                    elif cid is not None:
+                        engines.cancel_cid(cid, unregister_after=False)
+                except Exception as ex:
+                    import traceback
+                    add_log_line(gb, f"Exception when terminating engine {engine.engine_id} (cid={cid}): {ex}", RED)
+                    add_log_line(gb, traceback.format_exc(), RED)
+                # Wait briefly for the SLURM job to actually disappear
+                try:
+                    engines._wait_for_cid_termination(cid, timeout_seconds=60, poll_interval=2)
+                except Exception as ex:
+                    import traceback
+                    add_log_line(gb, f"Exception while waiting for SLURM job {cid} to disappear: {ex}", YELLOW)
+                    add_log_line(gb, traceback.format_exc(), YELLOW)
+                # Now unregister and requeue jobs
                 engines._unregister(engine, "Engine timed out")
                 add_log_line(
                     gb, "Engine with id " + engine.engine_id + " timed out", RED
