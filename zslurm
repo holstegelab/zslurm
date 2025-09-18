@@ -1320,9 +1320,10 @@ class EngineManager(object):
                     xlist = []
                     for eid, engine in self.engine_by_id.items():
                         if engine.partition == "archive":
+                            eid = eid.split('-')[0] #remove sequence nr. (e.g. srv10-2)
                             xlist.append(eid)
                     if xlist:
-                        cmd = cmd + " --exclude=" + ",".join(xlist) + " "
+                        cmd = cmd + " --exclude=" + ",".join(set(xlist)) + " "
 
                     lpartition = "archive"
                 else:
@@ -2561,7 +2562,7 @@ def main(scr, *args, **kwds):
                     status.prio_fillmem_context = max(int(cmd), 1)
                 add_log_line(gb, "Fill memory context size set to " + str(cmd), GREEN)
             elif c == ord("o"):
-                cmd = enter_command(gb, "Enter name of node, or number of nodes to phase out (negative for reverting phase out): ")
+                cmd = enter_command(gb, "Enter name to toggle, or nr (pos or neg):")
                 r = engines.toggle_phasing_out(cmd)
                 add_log_line(gb, r)
 
