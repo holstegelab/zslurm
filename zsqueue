@@ -7,36 +7,113 @@ try:
 except:
     import httplib
 import argparse
-
-s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = True)
+import sys
+import traceback
 
 parser = argparse.ArgumentParser(description='ZSlurm Job queue listing')
 parser.add_argument('--all', action='store_true', help='Show also completed jobs.')
 parser.add_argument('--done', action='store_true', help='Show only completed jobs.')
-parser.add_argument('--pretty', action='store_true', help='Pretty print the table.')
+parser.add_argument('--parseable', action='store_true', help='Output TSV table suitable for parsing.')
+parser.add_argument('--instance', action='append', metavar='NAME', help='Filter to a specific instance (can be given multiple times).')
 args = parser.parse_args()
-try:
-    if args.done:
-        jobs = s.list_done_jobs()
-    elif args.all:
-        jobs = s.list_done_jobs() + s.list_jobs()
-    else:
-        jobs = s.list_jobs()
-    user = getpass.getuser()
-  
-    if args.pretty:
+
+def _get_instances_from_args():
+    if args.instance:
+        return args.instance
+    try:
+        return zslurm_shared.get_instance_names()
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.write("Failed to enumerate instances; falling back to default instance.\n")
+        return [zslurm_shared.DEFAULT_INSTANCE_NAME]
+
+def _fetch_jobs(instance):
+    url = None
+    try:
+        url = zslurm_shared.get_job_url(instance=instance)
+        proxy = zslurm_shared.TimeoutServerProxy(url, allow_none=True)
+        if args.done:
+            return proxy.list_done_jobs()
+        if args.all:
+            return proxy.list_done_jobs() + proxy.list_jobs()
+        return proxy.list_jobs()
+    except (socket.error, httplib.HTTPException) as ex:
+        if url is None:
+            url = "<unresolved>"
+        sys.stderr.write(f"{instance}: failed to connect to ZSlurm manager at {url}: {ex}\n")
+        traceback.print_exc()
+    except KeyError:
+        sys.stderr.write(f"Instance '{instance}' not defined in configuration.\n")
+    except Exception as ex:
+        sys.stderr.write(f"{instance}: unexpected error while fetching jobs: {ex}\n")
+        traceback.print_exc()
+    return []
+
+instances = _get_instances_from_args()
+user = getpass.getuser()
+use_pretty = not args.parseable
+tabulate_module = None
+if use_pretty:
+    try:
+        import tabulate as tabulate_module
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.write("Pretty formatting unavailable; falling back to TSV output. Use --parseable to suppress this message.\n")
+        use_pretty = False
+
+if args.parseable:
+    header = [
+        "INSTANCE","JOBID","PARTITION","NAME","USER","STATE","TIME","CORES","NODE","CPU","MEM","ACTIVE","ARCH","DCACHE","CWD"
+    ]
+    print("\t".join(header))
+
+for instance in instances:
+    jobs = _fetch_jobs(instance)
+    if args.parseable:
+        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment in jobs:
+            runtime_fmt = zslurm_shared.format_time(runtime)
+            row = [
+                instance,
+                str(jobid),
+                str(partition),
+                str(job_name),
+                str(user),
+                str(state),
+                runtime_fmt,
+                str(cpus),
+                str(node),
+                f"{cpu_usage * 100.0:.1f}",
+                f"{mem_usage / 1024.0:.1f} Gb",
+                f"{active_use:.1f} Gb",
+                f"{arch_use:.1f} Gb",
+                f"{dcache_use:.1f} Gb",
+                str(cwd),
+            ]
+            print("\t".join(row))
+        continue
+
+    if use_pretty and tabulate_module is not None:
         table = []
         for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment in jobs:
-            runtime = zslurm_shared.format_time(runtime)
-            table.append([jobid, partition, job_name, user, state, runtime, cpus, node, '%.1f' % (cpu_usage * 100.0), '%.1f Gb' % (mem_usage / 1024.0), '%.1f Gb' % active_use, '%.1f Gb' % arch_use, '%.1f Gb' % dcache_use, cwd])
-        import tabulate
-        print(tabulate.tabulate(table, headers=['JOBID','PARTITION','NAME','USER','STATE','TIME','CORES','NODES','CPU','MEM','ACTIVE','ARCH','DCACHE','CWD']))
+            runtime_fmt = zslurm_shared.format_time(runtime)
+            table.append([
+                jobid, partition, job_name, user, state, runtime_fmt, cpus, node,
+                f"{cpu_usage * 100.0:.1f}", f"{mem_usage / 1024.0:.1f} Gb",
+                f"{active_use:.1f} Gb", f"{arch_use:.1f} Gb", f"{dcache_use:.1f} Gb", cwd
+            ])
+        if len(instances) > 1:
+            print(f"Instance: {instance}")
+        
+        print(tabulate_module.tabulate(table, headers=['JOBID','PARTITION','NAME','USER','STATE','TIME','CORES','NODE','CPU','MEM','ACTIVE','ARCH','DCACHE','CWD']))
+        
+        if len(instances) > 1:
+            print()
     else:
-        print("JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODES\tCPU\tMEM\tACTIVE\tARCH\tDCACHE\tCWD")
-        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use,cwd, job_comment in jobs:
-            runtime = zslurm_shared.format_time(runtime)
-            print(f'{jobid}\t{partition}\t{job_name}\t{user}\t{state}\t{runtime}\t{cpus}\t{node}\t{cpu_usage * 100.0:.1f}\t{mem_usage / 1024.0:.1f} Gb\t{active_use:.1f} Gb\t{arch_use:.1f} Gb\t{dcache_use:.1f} Gb\t{cwd}')
-            #print('%s\t%s\t%s\t%s\t%s\t%s\t%.2g\t%s\t%.1f\t%.1f Gb\t%.1f Gb\t%.1f Gb\t%.1f Gb\t%s' % (jobid, partition, job_name, user, state, runtime, cpus, node, cpu_usage * 100.0, mem_usage  / 1024.0, active_use, arch_use, dcache_use,cwd))
-
-except (socket.error, httplib.HTTPException) as serror:
-    print('Queue request failed, could not connect to ZSlurm manager on ' + zslurm_shared.get_job_url())
+        if len(instances) > 1:
+            print(f"Instance: {instance}")
+        print("JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODE\tCPU\tMEM\tACTIVE\tARCH\tDCACHE\tCWD")
+        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment in jobs:
+            runtime_fmt = zslurm_shared.format_time(runtime)
+            print(f'{jobid}\t{partition}\t{job_name}\t{user}\t{state}\t{runtime_fmt}\t{cpus}\t{node}\t{cpu_usage * 100.0:.1f}\t{mem_usage / 1024.0:.1f} Gb\t{active_use:.1f} Gb\t{arch_use:.1f} Gb\t{dcache_use:.1f} Gb\t{cwd}')
+        if len(instances) > 1:
+            print()

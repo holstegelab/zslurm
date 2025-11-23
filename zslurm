@@ -3,6 +3,7 @@ import curses, curses.textpad, curses.ascii
 import os
 import datetime
 import subprocess, sys, getopt, time, shlex
+import itertools
 from subprocess import Popen
 
 try:
@@ -16,15 +17,19 @@ import threading
 from collections import defaultdict, OrderedDict, deque
 
 import random
+import math
 import psutil
 import numpy
 import getpass
+import traceback
 
 import zslurm_shared
+import atexit
 import ipyparallel
 
 mylocal_id = zslurm_shared.short_name(zslurm_shared.get_hostname())
 PHASING_OUT = "PHASING_OUT"
+
 
 
 # return codes
@@ -75,7 +80,7 @@ class Status(object):
         self.stop_status_display = False
         self.address = ""
         self.port = 0
-        self.kill_idle = False
+        self.instance_name = None
         self.lastin_first = False
         self.prio_fillmem_context = 500
         self.used_load = numpy.array([], dtype=float)
@@ -83,6 +88,55 @@ class Status(object):
         self.used_mem = numpy.array([], dtype=float)
         self.total_cpus = numpy.array([], dtype=float)
         self.total_mem = numpy.array([], dtype=float)
+        self.sys_cpu_busy = numpy.array([], dtype=float)
+        self.sys_iowait = numpy.array([], dtype=float)
+        self.autoconsolidate_enable = True
+        self.consolidation_safety_fraction = 1.05
+        self.consolidation_min_engines = 0
+        self.consolidation_hysteresis_sec = 120.0
+        self.consolidation_cooldown_sec = 180.0
+        self.consolidation_min_runtime_sec = 300.0
+        self.consolidation_keep_weights = {
+            'jobs': 0.5,
+            'reserves': 0.3,
+            'time': 0.2,
+            'reserves_alpha_cpu': 0.5,
+        }
+        self.consolidation_allow_with_queue = True
+        self.consolidation_pending_min_age_sec = 60.0
+        self.consolidation_debug = True
+        self.consolidation_want = {}
+        self.consolidation_last_action_ts = 0.0
+        self.consolidation_last_action_ts_by_part = {}
+        self.ssd_prefer_bonus = 0.25
+        
+        self.autogrow_enable = True
+        self.autogrow_cooldown_sec = 500.0
+        self.autogrow_runtime_default = "5-0:0:0"
+        
+        self.autogrow_last_action_compute_ts = 0.0
+        self.autogrow_last_action_staging_ts = 0.0
+
+        self.autogrow_prefer_partitions = [
+            ("genoa", True),
+            ("genoa", False),
+            ("rome", True),
+            ("rome", False),
+            ("fat_genoa", True),
+            ("fat_rome", True),
+        ]
+        self.autogrow_debug = True
+        
+        self.node_profiles = {
+            "genoa": {"cores": 192, "mem_gb": 336},
+            "rome": {"cores": 128, "mem_gb": 224},
+            "fat_genoa": {"cores": 192, "mem_gb": 1440},
+            "fat_rome": {"cores": 128, "mem_gb": 960},
+        }
+        self.node_reports_file = None
+        self.reports_lock = threading.RLock()
+        self.autogrow_plan = None        
+        
 
     def set_address(self, address, port):
         self.address = address
@@ -149,7 +203,10 @@ class Job(object):
         partition,
         info_input_mb,
         info_output_file,
-        comment
+        comment,
+        ssd_use='no',
+        ssd_gb=0,
+        owner=None
     ):
         self.job_name = job_name
         self.jobid = jobid
@@ -163,14 +220,37 @@ class Job(object):
         self.dependency = dependency
         self.archive_start_use_add = arch_use_add
         self.archive_end_use_remove = arch_use_remove
-        self.active_start_use_add = active_use_add
-        self.active_end_use_remove = active_use_remove
         self.dcache_start_use_add = dcache_use_add
         self.dcache_end_use_remove = dcache_use_remove
+        self.active_start_use_add = active_use_add
+        self.active_end_use_remove = active_use_remove
         self.partition = partition
         self.input_mb = info_input_mb
         self.output_file = info_output_file
         self.comment = comment
+        self.owner = owner
+        try:
+            su = (ssd_use or 'no')
+            if isinstance(su, str):
+                su = su.strip().lower()
+            else:
+                su = 'no'
+            if su in ('yes', 'possible', 'can_use', 'can-use', 'canuse'):
+                su = 'possible'
+            elif su in ('required', 'require', 'must', 'need'):
+                su = 'required'
+            elif su in ('no', 'none', 'off', 'false'):
+                su = 'no'
+            else:
+                su = 'no'
+        except Exception:
+            su = 'no'
+        self.ssd_use = su
+        try:
+            self.ssd_gb = max(0.0, float(ssd_gb))
+        except Exception:
+            self.ssd_gb = 0.0
+        self.ssd_alloc_gb = 0.0
 
         self.state = "PENDING"
         self.node_id = None
@@ -178,6 +258,7 @@ class Job(object):
         self.endtime = None
         self.current_cpu_usage = 0.0
         self.current_mem_usage = 0.0
+        self.submit_ts = time.time()
 
     def started(self, nodeid):
         self.node_id = nodeid
@@ -222,6 +303,7 @@ class DummyJob(Job):
             0,
             "",
             "Dummy job",
+            owner=None
         )
         self.starttime = time.time()
 
@@ -231,8 +313,12 @@ class JobManager(object):
         self.jobid_counter = numpy.random.randint(0, 1000000)
 
         self.jobs_by_id = OrderedDict()
-        self.finished_jobs = deque()
+        
+        self.finished_jobs_by_owner = {}
+
+        #self.finished_jobs = deque()
         self.finished_jobs_lock = threading.RLock()
+        self.finished_jobs_max = 2000
 
         self.lock = threading.RLock()
 
@@ -241,6 +327,10 @@ class JobManager(object):
         self.running_jobs = {}  # count per partition (compute, archive)
         self.total_jobs = {}  # count per partition (compute, archive)
 
+        self.eligible_jobs = {}
+        self._eligible_cache_ts = 0.0
+        self._eligible_cache_ttl = 15.0
+
         self.active_total = 0
         self.active_inuse = 0
         self.archive_total = 0
@@ -248,8 +338,61 @@ class JobManager(object):
         self.dcache_total = 0
         self.dcache_inuse = 0
 
+    def _resource_fits_locked(self, total, inuse, needed):
+        try:
+            needed_val = float(needed)
+        except Exception:
+            needed_val = 0.0
+        if needed_val <= 0.0:
+            return True
+        try:
+            total_val = float(total)
+        except Exception:
+            total_val = 0.0
+        try:
+            inuse_val = float(inuse)
+        except Exception:
+            inuse_val = 0.0
+        return total_val >= (inuse_val + needed_val)
+
+    def _is_job_eligible_locked(self, job):
+        if getattr(job, 'state', None) not in queue_states:
+            return False
+        if not self._resource_fits_locked(self.active_total, self.active_inuse, getattr(job, 'active_start_use_add', 0.0)):
+            return False
+        if not self._resource_fits_locked(self.dcache_total, self.dcache_inuse, getattr(job, 'dcache_start_use_add', 0.0)):
+            return False
+        if not self._resource_fits_locked(self.archive_total, self.archive_inuse, getattr(job, 'archive_start_use_add', 0.0)):
+            return False
+        return True
+
+    def _recompute_eligible_counts_locked(self):
+        now = time.time()
+        if (now - self._eligible_cache_ts) < self._eligible_cache_ttl:
+            return
+
+        counts = {}
+        for job in list(self.jobs_by_id.values()):
+            if self._is_job_eligible_locked(job):
+                part = str(getattr(job, 'partition', 'compute') or 'compute')
+                counts[part] = counts.get(part, 0) + 1
+
+        self.eligible_jobs = counts
+        self._eligible_cache_ts = now
+
     def get_job_stats(self):
-        return (self.total_jobs, self.running_jobs, self.failed_jobs, self.done_jobs)
+        self.lock.acquire()
+        try:
+            self._recompute_eligible_counts_locked()
+            return (
+                self.total_jobs,
+                self.running_jobs,
+                self.eligible_jobs,
+                self.failed_jobs,
+                self.done_jobs,
+            )
+        finally:
+            self.lock.release()
 
     def active_engines(self):
         nodes = set()
@@ -307,7 +450,10 @@ class JobManager(object):
         partition,
         info_input_mb,
         info_output_file,
-        comment=""
+        comment="",
+        ssd_use='no',
+        ssd_gb=0,
+        owner=None
     ):
         self.lock.acquire()
         jobid = str(self.jobid_counter)
@@ -339,7 +485,10 @@ class JobManager(object):
             partition,
             info_input_mb,
             info_output_file,
-            comment
+            comment,
+            ssd_use,
+            ssd_gb,
+            owner
         )
 
         self.jobs_by_id[jobid] = job
@@ -400,6 +549,7 @@ class JobManager(object):
                         pass
                     self.job_done(job.jobid, RC_CANCELLED, "Cancelled by user")
                     job.state = "CANCELLED"
+                    
                 elif not requeue:
                     self.job_done(job.jobid, RC_CANCELLED, "Cancelled by user")
                     add_log_line(
@@ -408,6 +558,7 @@ class JobManager(object):
                         YELLOW,
                     )
                     job.state = "CANCELLED"
+                    
             else:
                 add_log_line(
                     gb, "Attempt to cancel unknown job (id: %s)." % jobid, YELLOW
@@ -415,42 +566,119 @@ class JobManager(object):
         finally:
             self.lock.release()
 
-    def list_done_jobs(self):
+    def list_done_jobs(self, last_seen_jobid=None, owner=None):
+        def serialize(job):
+            if not job.starttime is None:
+                runtime = job.endtime - job.starttime
+            else:
+                runtime = 0.0
+
+            arch_use = job.archive_start_use_add - job.archive_end_use_remove
+            active_use = job.active_start_use_add - job.active_end_use_remove
+            dcache_use = job.dcache_start_use_add - job.dcache_end_use_remove
+
+            return [
+                job.jobid,
+                job.job_name,
+                job.state,
+                runtime,
+                job.ncpu,
+                job.partition,
+                job.node_id,
+                job.current_cpu_usage,
+                job.current_mem_usage,
+                arch_use,
+                active_use,
+                dcache_use,
+                job.cwd,
+                job.comment,
+            ]
+
         jobs = []
-        with self.finished_jobs_lock:
-            for job in self.finished_jobs:
-                if not job.starttime is None:
-                    runtime = job.endtime - job.starttime
-                else:
-                    runtime = 0.0
+        target_jobid = None if last_seen_jobid is None else str(last_seen_jobid)
+        target_owner = None if owner is None else str(owner)
 
-                arch_use = job.archive_start_use_add - job.archive_end_use_remove
-                active_use = job.active_start_use_add - job.active_end_use_remove
-                dcache_use = job.dcache_start_use_add - job.dcache_end_use_remove
+        if owner is not None:
+            jobs = self.finished_jobs_by_owner.get(target_owner, [])
+        else:
+            jobs = itertools.chain(*self.finished_jobs_by_owner.values())
+        
 
-                jobs.append(
-                    [
-                        job.jobid,
-                        job.job_name,
-                        job.state,
-                        runtime,
-                        job.ncpu,
-                        job.partition,
-                        job.node_id,
-                        job.current_cpu_usage,
-                        job.current_mem_usage,
-                        arch_use,
-                        active_use,
-                        dcache_use,
-                        job.cwd,
-                        job.comment
-                    ]
-                )
-        return jobs
+        results = []
+        if target_jobid is not None and target_owner is not None:
+            for job in reversed(jobs):            
+                if str(job.jobid) == target_jobid:            
+                    break           
+                results.append(serialize(job))
+        else:
+            results = [serialize(job) for job in reversed(jobs)]
 
-    def list_jobs(self):
+        return results
+
+    def queue_stats(self):
+        # Aggregate cores/mem by status and partition
+        totals = {
+            'running': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
+            'pending': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
+        }
+        by_part = {}
+        states = {}
+
+
+        for j in list(self.jobs_by_id.values()):
+            part = str(getattr(j, 'partition', 'compute') or 'compute')
+            st = str(getattr(j, 'state', ''))
+            states[st] = states.get(st, 0) + 1
+            try:
+                cores = float(getattr(j, 'ncpu', 0.0))
+            except Exception:
+                cores = 0.0
+            try:
+                mem_mb = float(getattr(j, 'mem', 0.0))
+            except Exception:
+                mem_mb = 0.0
+            if part not in by_part:
+                by_part[part] = {
+                    'running': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
+                    'pending': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
+                }
+            is_pending = (st in queue_states) or (st == 'ASSIGNED')
+            if st == 'RUNNING':
+                buckets = (totals['running'], by_part[part]['running'])
+            elif is_pending:
+                buckets = (totals['pending'], by_part[part]['pending'])
+            else:
+                buckets = None
+            if buckets is not None:
+                for b in buckets:
+                    b['jobs'] += 1
+                    b['cores'] += cores
+                    b['mem_mb'] += mem_mb
+
+        qb = getattr(engines, 'cluster_queued_by_partition', {}) or {}
+        rb = getattr(engines, 'cluster_running_by_partition', {}) or {}
+        qa = getattr(engines, 'cluster_queued_age_by_partition', {}) or {}
+        qa_s = getattr(engines, 'cluster_queued_age_by_partition_by_scratch', {}) or {}
+        engines_info = {
+            'running_by_partition': dict(rb),
+            'queued_by_partition': dict(qb),
+            'queued_age_by_partition': dict(qa),
+            'queued_age_by_partition_by_scratch': dict(qa_s),
+            'running_total': int(getattr(engines, 'cluster_running_engines', 0)),
+            'queued_total': int(getattr(engines, 'cluster_queued_engines', 0)),
+        }
+        return {
+            'total': totals,
+            'by_partition': by_part,
+            'states': states,
+            'engines': engines_info,
+        }
+
+    def list_jobs(self, owner=None):
         jobs = []
         for job in list(self.jobs_by_id.values()):
+            if owner is not None and str(getattr(job, 'owner', None)) != str(owner):
+                continue
             if not job.starttime is None:
                 runtime = time.time() - job.starttime
             else:
@@ -513,61 +741,94 @@ class JobManager(object):
             timeleft = int(engines.engine_by_id[myid].timeleft)
             cores = float(engines.engine_by_id[myid].cores)
             totmem = engines.engine_by_id[myid].totmem
+        e = engines.engine_by_id.get(myid, None)
 
         self.lock.acquire()
         try:
-            allres = []
-            joblist = list(self.jobs_by_id.values())
-            if status.lastin_first:
-                joblist = joblist[::-1]
+            queued = []
+            assigned = []
 
+            jobs_view = self.jobs_by_id.values()
+
+            if status.lastin_first and partition != 'archive':
+                jobs_view = reversed(jobs_view)
+            
+            jobs_view_iter = iter(jobs_view)
+
+            allres = []
             average_mem_core = float(totmem) / float(cores)
-            while joblist:
+
+            def eligible(job):
+                if job.partition != partition:
+                    return False
+                if job.reqtime > timeleft:
+                    return False
+                if job.ncpu > cores:
+                    return False
+                if job.mem > totmem:
+                    return False
+                if job.ssd_use == 'required' and not (e is not None and e.has_ssd):
+                    return False    
+                if job.active_start_use_add > 0 and (self.active_inuse + job.active_start_use_add) > self.active_total:
+                    return False
+                if job.dcache_start_use_add > 0 and (self.dcache_inuse + job.dcache_start_use_add) > self.dcache_total:
+                    return False
+                if job.archive_start_use_add > 0 and (self.archive_inuse + job.archive_start_use_add) > self.archive_total:
+                    return False
+                return True
+
+
+            while len(queued) < (status.prio_fillmem_context + float(current_cpu)):
+                try: 
+                    next_job = next(jobs_view_iter)
+                except StopIteration:
+                    break
+                if not eligible(next_job):
+                    continue                
+                if next_job.state in queue_states:
+                    queued.append(next_job)
+                elif next_job.state == 'ASSIGNED':
+                    assigned.append(next_job)
+
+            while queued:
                 # prioritize jobs with a good memory profile (reorder jobs)
                 if status.prio_fillmem_context > 1:
-                    # first make a list of applicable jobs
-                    joblist_temp = list(joblist)
-                    rest = []
-                    toconsider = []
+                    # Greedy best-of-window selection without sorting or rebuilding the list
+                    startpos = 0
+                    best_idx = None
+                    best_score = None
+                    found = 0
 
-                    while (
-                        joblist_temp and len(toconsider) < status.prio_fillmem_context
-                    ):
-                        job = joblist_temp.pop(0)
-                        # can the job run?
-                        if (
-                            job.state in queue_states
-                            and job.reqtime <= timeleft
-                            and job.ncpu <= cores
-                            and job.mem <= totmem
-                            and job.partition == partition
-                            and (
+                    while startpos < len(queued) and found < status.prio_fillmem_context:
+                        job_candidate = queued[startpos]
+                        # can the job run? recheck as constraints may have changed due to other jobs being assigned
+                        if ((
                                 (
                                     self.active_total
-                                    >= (self.active_inuse + job.active_start_use_add)
+                                    >= (self.active_inuse + job_candidate.active_start_use_add)
                                 )
-                                or job.active_start_use_add == 0
+                                or job_candidate.active_start_use_add == 0
                             )
                             and (
                                 (
                                     self.dcache_total
-                                    >= (self.dcache_inuse + job.dcache_start_use_add)
+                                    >= (self.dcache_inuse + job_candidate.dcache_start_use_add)
                                 )
-                                or job.dcache_start_use_add == 0
+                                or job_candidate.dcache_start_use_add == 0
                             )
                             and (
                                 (
                                     self.archive_total
-                                    >= (self.archive_inuse + job.archive_start_use_add)
+                                    >= (self.archive_inuse + job_candidate.archive_start_use_add)
                                 )
-                                or job.archive_start_use_add == 0
+                                or job_candidate.archive_start_use_add == 0
                             )
                         ):
                             remain_cores = (
-                                current_cpu - job.ncpu
+                                current_cpu - job_candidate.ncpu
                             )  # remain cores after scheduling this job
                             remain_mem = (
-                                current_mem - job.mem
+                                current_mem - job_candidate.mem
                             )  # remain mem after scheduling this job
 
                             over_use_penalty = -(
@@ -577,39 +838,39 @@ class JobManager(object):
                                     / 1024.0
                                 )
                             )  # penalty for over using cores (equal to n cores not yet available) or over using mem (too much used, in gb).
-                            memory_penalty = (
-                                max(
-                                    (float(max(remain_mem, 0)) / max(remain_cores, 1))
-                                    - average_mem_core,
-                                    0,
-                                )
-                                / 1024.0
-                            )  # penalty for having memory/core > average after scheduling (in gb)
+                            memory_penalty = abs((max(remain_mem, 0) / max(remain_cores, 1)) - average_mem_core) / 1024.0
+                            # penalty for having memory/core > average after scheduling (in gb)
+                            ssd_bonus = 0.0
+                            try:
+                                if job_candidate.ssd_use == 'possible' and e is not None and getattr(e, 'has_ssd', False):
+                                    cap = float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0))
+                                    need = float(getattr(job_candidate, 'ssd_gb', 0.0))
+                                    if need <= 0.0 or cap >= need:
+                                        ssd_bonus = float(getattr(status, 'ssd_prefer_bonus', 0.25))
+                            except Exception:
+                                import traceback
+                                traceback.print_exc()
+                                ssd_bonus = 0.0
 
-                            toconsider.append(
-                                (
-                                    job,
-                                    float(job.mem) / job.ncpu,
-                                    memory_penalty + over_use_penalty,
-                                )
-                            )
-                        else:
-                            rest.append(job)
+                            score = memory_penalty + over_use_penalty - ssd_bonus
+                            if (best_score is None) or (score < best_score):
+                                best_score = score
+                                best_idx = startpos
+                            found += 1
+                        startpos += 1
 
-                    toconsider.sort(key=lambda x: x[2])
-                    joblist = [e[0] for e in toconsider] + rest + joblist_temp
-
-                # FIXME; assume 5 days of time
-                job = joblist.pop(0)
+                    if best_idx is not None:
+                        job = queued.pop(best_idx)
+                    else:
+                        # No eligible found in the window; default to pop fallback
+                        fallback_idx = min(startpos, len(queued) - 1)
+                        job = queued.pop(fallback_idx)
+                        
+                else:                    
+                    job = queued.pop(0)
                 # add_log_line(gb, str((job.state, job.reqtime, timeleft, job.ncpu, cores, job.mem, totmem, job.partition, partition)))
                 # add_log_line(gb, str((self.active_total, self.active_inuse, job.active_start_use_add)))
-                if (
-                    job.state in queue_states
-                    and job.reqtime <= timeleft
-                    and job.ncpu <= cores
-                    and job.mem <= totmem
-                    and job.partition == partition
-                    and (
+                if ((
                         (
                             self.active_total
                             >= (self.active_inuse + job.active_start_use_add)
@@ -631,7 +892,7 @@ class JobManager(object):
                         or job.archive_start_use_add == 0
                     )
                 ):
-                    # add_log_line(gb, 'SELECT')
+
                     self.active_inuse += job.active_start_use_add
                     self.dcache_inuse += job.dcache_start_use_add
                     self.archive_inuse += job.archive_start_use_add
@@ -657,6 +918,24 @@ class JobManager(object):
                     current_cpu -= job.ncpu
                     current_mem -= job.mem
 
+                    if job.state == "RUNNING": #set by job.started
+                        e = engines.engine_by_id.get(myid, None)
+                        if e is not None:
+                            e.res_cpu_reserved += float(job.ncpu)
+                            e.res_mem_reserved_mb += float(job.mem)
+                            try:
+                                if getattr(job, 'ssd_use', 'no') != 'no' and getattr(e, 'has_ssd', False):
+                                    need = float(getattr(job, 'ssd_gb', 0.0))
+                                    if need > 0.0:
+                                        cap = max(0.0, float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0)))
+                                        alloc = min(need, cap)
+                                        if alloc > 0:
+                                            e.res_ssd_reserved_gb += alloc
+                                            job.ssd_alloc_gb = alloc
+                            except Exception:
+                                import traceback
+                                traceback.print_exc()
+
                     res = (
                         job.jobid,
                         job.job_name,
@@ -670,19 +949,47 @@ class JobManager(object):
                     allres.append(res)
                     if current_cpu <= 0 or current_mem <= 0:
                         break
+                else:
+                    #rescan queued jobs instead of popping one by one
+                    new_queued = []
+                    for job in queued:
+                        if (job.active_start_use_add > 0 and (self.active_inuse + job.active_start_use_add) > self.active_total):
+                            continue
+                        if (job.dcache_start_use_add > 0 and (self.dcache_inuse + job.dcache_start_use_add) > self.dcache_total):
+                            continue
+                        if (job.archive_start_use_add > 0 and (self.archive_inuse + job.archive_start_use_add) > self.archive_total):
+                            continue
+                        new_queued.append(job)
+                    queued = new_queued
 
-            if current_cpu > 0:
-                joblist = list(self.jobs_by_id.values())
-                if status.lastin_first:
-                    joblist = joblist[::-1]
-                for job in joblist:
-                    # FIXME; assume 5 days of time
-                    if (
-                        job.state == "ASSIGNED"
-                        and job.reqtime <= timeleft
-                        and job.ncpu <= current_cpu
-                        and job.mem <= current_mem
-                        and job.partition == partition
+                #refill queued
+                while len(queued) < (status.prio_fillmem_context + float(current_cpu)):
+                    try: 
+                        next_job = next(jobs_view_iter)
+                    except StopIteration:
+                        break
+                    if not eligible(next_job):
+                        continue                    
+                    if next_job.state in queue_states:
+                        queued.append(next_job)
+                    elif next_job.state == 'ASSIGNED':
+                        assigned.append(next_job)
+
+                    
+
+            if current_cpu > 0:                                
+                for job in assigned:
+                    # FIXME; assume 5 days of time                    
+                    if (                                                
+                        job.ncpu <= current_cpu
+                        and job.mem <= current_mem  
+                        and (
+                            (getattr(job, 'ssd_use', 'no') != 'required')
+                            or (
+                                e is not None and getattr(e, 'has_ssd', False)
+                                and (float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0))) >= float(getattr(job, 'ssd_gb', 0.0))
+                            )
+                        )
                     ):
                         # Ask the previous engine to drop assignment and reassign to this engine.
                         try:
@@ -763,6 +1070,22 @@ class JobManager(object):
                 self.running_jobs.get(job.partition, 0) + 1
             )
             job.started(node_id)
+            e = engines.engine_by_id.get(node_id, None)
+            if e is not None:
+                e.res_cpu_reserved += float(job.ncpu)
+                e.res_mem_reserved_mb += float(job.mem)
+                try:
+                    if getattr(job, 'ssd_use', 'no') != 'no' and getattr(e, 'has_ssd', False):
+                        need = float(getattr(job, 'ssd_gb', 0.0))
+                        if need > 0.0:
+                            cap = max(0.0, float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0)))
+                            alloc = min(need, cap)
+                            if alloc > 0:
+                                e.res_ssd_reserved_gb += alloc
+                                job.ssd_alloc_gb = alloc
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
         finally:
             self.lock.release()
 
@@ -781,10 +1104,32 @@ class JobManager(object):
                         self.active_inuse -= job.active_start_use_add
                         self.archive_inuse -= job.archive_start_use_add
                         self.dcache_inuse -= job.dcache_start_use_add
+                    e = engines.engine_by_id.get(job.node_id, None)
+                    if e is not None:
+                        e.res_cpu_reserved -= float(job.ncpu)
+                        e.res_mem_reserved_mb -= float(job.mem)
+                        try:
+                            alloc = float(getattr(job, 'ssd_alloc_gb', 0.0))
+                            if alloc > 0.0:
+                                e.res_ssd_reserved_gb -= alloc
+                                if e.res_ssd_reserved_gb < 0:
+                                    e.res_ssd_reserved_gb = 0.0
+                            job.ssd_alloc_gb = 0.0
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
+                        if e.res_cpu_reserved < 0:
+                            e.res_cpu_reserved = 0.0
+                        if e.res_mem_reserved_mb < 0:
+                            e.res_mem_reserved_mb = 0.0
 
-                if not job.node_id is None and not return_code == RC_CANCELLED:
-                    self.running_jobs[job.partition] = (
-                        self.running_jobs.get(job.partition, 0) - 1
+                if (
+                    job.state == "RUNNING"
+                    and job.node_id is not None
+                    and return_code != RC_CANCELLED
+                ):
+                    self.running_jobs[job.partition] = max(
+                        0, self.running_jobs.get(job.partition, 0) - 1
                     )
 
                 if (
@@ -796,17 +1141,16 @@ class JobManager(object):
                     job.mem = job.mem * 2
                     newstate = "REQUEUED"
                     job.starttime = None
+                    job.node_id = None
                 elif (
                     return_code == RC_ENGINE_TERMINATED
                 ):  # ENGINE DISAPPEARED/TERMINATED
                     newstate = "REQUEUED"
                     job.starttime = None
+                    job.node_id = None
                 else:
                     job = self.jobs_by_id[jobid]
                     
-
-
-
                     del self.jobs_by_id[jobid]
                     self.done_jobs[job.partition] = (
                         self.done_jobs.get(job.partition, 0) + 1
@@ -830,11 +1174,14 @@ class JobManager(object):
 
                 job.done(return_code, reason, newstate)
                 with self.finished_jobs_lock:
-                    self.finished_jobs.append(job)
-
-                    #remove job from beginning of queue if endtime is longer than 6 hours ago
-                    while self.finished_jobs and self.finished_jobs[0].endtime < time.time() - 6 * 60 * 60:
-                        self.finished_jobs.popleft()
+                    if job.owner not in self.finished_jobs_by_owner:
+                        self.finished_jobs_by_owner[job.owner] = []
+                    
+                    self.finished_jobs_by_owner[job.owner].append(job)
+                    
+                    if len(self.finished_jobs_by_owner[job.owner]) > (self.finished_jobs_max + 100):
+                        self.finished_jobs_by_owner[job.owner] = self.finished_jobs_by_owner[job.owner][-self.finished_jobs_max:]                    
+                        
                 
 
         finally:
@@ -853,6 +1200,8 @@ class JobManager(object):
             reason = "Job Killed"
         elif return_code == 130:
             reason = "Job Interrupted"
+        elif return_code == -254:
+            reason = "Job Stuck (terminated by monitor)"
         else:
             reason = "Job Failed (errorcode: %d)" % return_code
 
@@ -874,8 +1223,6 @@ class JobManager(object):
                 job = DummyJob(jobid)
                 state = 'COMPLETED' if return_code == 0 else 'FAILED'
                 job.done(return_code, reason, state)
-                with self.finished_jobs_lock:
-                    self.finished_jobs.append(job)
 
             else:
                 job = self.jobs_by_id[jobid]
@@ -950,6 +1297,7 @@ submit_job = lambda *args: jobs.submit_job(*args)
 cancel_job = lambda *args: jobs.cancel_job(*args)
 list_jobs = lambda *args: jobs.list_jobs(*args)
 list_done_jobs = lambda *args: jobs.list_done_jobs(*args)
+queue_stats = lambda *args: jobs.queue_stats(*args)
 request_jobs = lambda *args: jobs.request_jobs(*args)
 job_finished = lambda *args: jobs.job_finished(*args)
 can_run_assigned_job = lambda *args: jobs.can_run_assigned_job(*args)
@@ -973,7 +1321,9 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(cancel_job, "cancel_job")
         server.register_function(list_jobs, "list_jobs")
         server.register_function(list_done_jobs, "list_done_jobs")
+        server.register_function(queue_stats, "queue_stats")
         server.register_function(list_nodes, "list_nodes")
+        add_log_line(gb, f"[job] started on port {port} with rpc path {rpc_path}", GREEN)
         Servers.job_server = server
         server.serve_forever()
 
@@ -990,29 +1340,40 @@ class Engine(object):
         partition="",
         cluster_id=None,
         managed=False,
+        instance=None,
     ):
         self.engine_id = engine_id
         self.cluster_id = cluster_id
+        self.instance = instance
         self.managed = managed
-        self.stopping = False
-        self.observed_hits = 0
-        self.missing_hits = 0
+        self.partition = partition
 
         self.cores = cores
         self.totmem = totmem
+        self.jobs = set()
+        self.status = ""
+
+        self.cpu_usage = 0.0
+        self.mem_usage = 0.0
+        self.load = 0.0
+        self.sys_cpu_busy = 0.0
+        self.sys_iowait = 0.0
+        self.res_cpu_reserved = 0.0
+        self.res_mem_reserved_mb = 0.0
+
         self.starttime = time.time()
         self.timeleft = 5 * 24 * 60 * 60
         self.lastseen = time.time()
 
         self.pending_commands = []
-        self.jobs = set()
+        self.observed_hits = 0
+        self.missing_hits = 0
+        self.stopping = False
 
-        self.cpu_usage = 0.0
-        self.mem_usage = 0.0
-        self.load = 0.0
-
-        self.partition = partition
-        self.status = ""
+        self.has_ssd = False
+        self.ssd_total_gb = 0.0
+        self.ssd_used_gb = 0.0        
+        self.res_ssd_reserved_gb = 0.0
 
 
 class EngineManager(object):
@@ -1028,46 +1389,111 @@ class EngineManager(object):
 
         self.cluster_queued_engines_archive = 0
         self.cluster_running_engines_archive = 0
+        self.cluster_queued_age_by_partition = {}
+        self.cluster_queued_age_by_partition_by_scratch = {}
+        self.last_squeue_ts = 0.0
+        self.archive_failed_nodes = set()
 
     def toggle_phasing_out(self, engine_id):
-        self.lock.acquire()
-        res = None
-        try:
-            if engine_id in self.engine_by_id:
-                engine = self.engine_by_id[engine_id]
+        with self.lock:
+            cmd = ("" if engine_id is None else str(engine_id)).strip()
+
+            if not cmd:
+                return "No engine specified."
+
+            engine = self.engine_by_id.get(cmd)
+            if engine is not None:
                 if engine.status == PHASING_OUT:
                     engine.status = ""
-                    res = f"Engine {engine_id} is no longer phasing out."
-                else:
-                    engine.status = PHASING_OUT
-                    res = f"Engine {engine_id} is now phasing out."
-                res = engine.status
-            elif engine_id.lstrip('- ').rstrip().isdigit():
-                nr_of_engines = int(engine_id)
-                
-                if nr_of_engines > 0:
-                    engines = [e for e in self.engine_by_id.values() if e.status != PHASING_OUT] #only consider engines that are not already phasing out
-                    #sort by number of jobs, phase out the ones with the least jobs
-                    engines.sort(key=lambda x: len(x.jobs))
-                    nr_of_engines = min(nr_of_engines, len(engines))
-                    for i in range(nr_of_engines):
-                        engines[i].status = PHASING_OUT
+                    return f"Engine {cmd} is no longer phasing out."
+                engine.status = PHASING_OUT
+                return f"Engine {cmd} is now phasing out."
 
-                    res = f"Phasing out {nr_of_engines} engines: {[e.engine_id for e in engines[:nr_of_engines]]}."
-                else:
-                    engines = [e for e in self.engine_by_id.values() if e.status == PHASING_OUT] #only consider engines that are phasing out
-                    #sort by number of jobs, dephase out the ones with the most jobs
-                    engines.sort(key=lambda x: len(x.jobs), reverse=True)
-                    nr_of_engines = min(-nr_of_engines, len(engines))
-                    for i in range(nr_of_engines):
-                        engines[i].status = ""
-                    res = f"Dephasing out {nr_of_engines} engines: {[e.engine_id for e in engines[:nr_of_engines]]}."
-            else:
-                res = f"Engine {engine_id} not found in list of engines: {list(self.engine_by_id.keys())}."
+            partition_map = {
+                "archive": "archive",
+                "arch": "archive",
+                "a": "archive",
+                "compute": "compute",
+                "comp": "compute",
+                "c": "compute",
+            }
 
-        finally:
-            self.lock.release()
-        return res
+            partition_hint = None
+            nr_str = cmd
+
+            parts = cmd.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() in partition_map:
+                partition_hint = partition_map[parts[0].lower()]
+                nr_str = parts[1].strip()
+
+            try:
+                nr_of_engines = int(nr_str)
+            except ValueError:
+                known = ", ".join(sorted(self.engine_by_id.keys()))
+                return f"Engine '{cmd}' not found. Known engines: {known}."
+
+            target_partition = (partition_hint or "compute").lower()
+
+            def matches_partition(candidate):
+                part = (getattr(candidate, "partition", "") or "").lower()
+                if target_partition == "archive":
+                    return part == "archive"
+                return part != "archive"
+
+            if nr_of_engines == 0:
+                return "No engines selected for phase change (0 requested)."
+
+            if nr_of_engines > 0:
+                candidates = [
+                    e
+                    for e in self.engine_by_id.values()
+                    if e.status != PHASING_OUT and matches_partition(e)
+                ]
+                candidates.sort(key=lambda e: len(e.jobs))
+                selected = candidates[: nr_of_engines]
+                for item in selected:
+                    item.status = PHASING_OUT
+                count = len(selected)
+                if count == 0:
+                    return f"No {target_partition} engines available to phase out."
+                names = ", ".join(e.engine_id for e in selected)
+                msg = (
+                    f"Phasing out {count} {target_partition}"
+                    f" engine{'s' if count != 1 else ''}: {names}."
+                )
+                if count < nr_of_engines:
+                    missing = nr_of_engines - count
+                    msg += (
+                        f" Skipped {missing} requested engine"
+                        f"{'s' if missing != 1 else ''} due to availability."
+                    )
+                return msg
+
+            desired = -nr_of_engines
+            candidates = [
+                e
+                for e in self.engine_by_id.values()
+                if e.status == PHASING_OUT and matches_partition(e)
+            ]
+            candidates.sort(key=lambda e: len(e.jobs), reverse=True)
+            selected = candidates[:desired]
+            for item in selected:
+                item.status = ""
+            count = len(selected)
+            if count == 0:
+                return f"No phased-out {target_partition} engines to restore."
+            names = ", ".join(e.engine_id for e in selected)
+            msg = (
+                f"Dephasing {count} {target_partition}"
+                f" engine{'s' if count != 1 else ''}: {names}."
+            )
+            if count < desired:
+                missing = desired - count
+                msg += (
+                    f" Skipped {missing} requested engine"
+                    f"{'s' if missing != 1 else ''} due to availability."
+                )
+            return msg
 
     def job_running(self, eid, job):
         engine = self.engine_by_id.get(eid, None)
@@ -1096,6 +1522,14 @@ class EngineManager(object):
                     e.mem_usage,
                     e.load,
                     e.status,
+                    e.sys_cpu_busy,
+                    e.sys_iowait,
+                    getattr(e, 'res_cpu_reserved', 0.0),
+                    getattr(e, 'res_mem_reserved_mb', 0.0),
+                    bool(getattr(e, 'has_ssd', False)),
+                    float(getattr(e, 'ssd_total_gb', 0.0)),
+                    float(getattr(e, 'ssd_used_gb', 0.0)),
+                    float(getattr(e, 'res_ssd_reserved_gb', 0.0)),                    
                 )
             )
         return result
@@ -1123,7 +1557,7 @@ class EngineManager(object):
         return self.local_engine_process != None
 
     def _check_cluster_engines(self):
-        cmd = "squeue -h -r --user " + getpass.getuser() + "  -o '%i|%j|%L|%t|%N|%P'"
+        cmd = "squeue -h -r --user " + getpass.getuser() + " --name " + status.instance_name + " -O arrayjobid:|,arraytaskid:|,name:|,timeleft:|,statecompact:|,nodelist:|,partition:|,pendingtime:|,feature"
 
         args = shlex.split(cmd)
         try:
@@ -1140,68 +1574,93 @@ class EngineManager(object):
         z = defaultdict(int)
 
         observed_cluster_ids = set()
+        ages_any = defaultdict(float)
+        ages_scratch = defaultdict(float)
+        ages_noscratch = defaultdict(float)
         nqueue = 0
         nqueue_archive = 0
         nrunning = 0
         nrunning_archive = 0
-        for cid, cname, ctime, cstate, cnode, cpartition in output:
-            if cname == "zslurm":
+        queued_by = defaultdict(int)
+        running_by = defaultdict(int)
+        
+        
+        try:
+            for jid_raw, atask, cname, ctime, cstate, cnode, cpartition, cpending, cfeatures in output:
+                task = (atask or "").strip()
+                if task and task != "N/A":
+                    cid = f"{jid_raw}_{task}"
+                else:
+                    cid = jid_raw
+        
+
                 observed_cluster_ids.add(cid)
 
                 if cstate == "CG":  # cleaning up
                     continue
 
-                # indicate this engine is observed; apply gating to reduce flapping
+                # indicate this engine is observed; apply gating to reduce flapping                
                 if cid in self.engine_by_clusterid:
                     engine = self.engine_by_clusterid[cid]
                     engine.missing_hits = 0
-                    engine.observed_hits = engine.observed_hits + 1
+                    engine.observed_hits = engine.observed_hits + 1                    
                     if (not engine.managed) and engine.observed_hits >= SQUEUE_OBSERVED_CONFIRMS:
                         engine.managed = True
                         add_log_line(
                             gb,
                             f"Engine {engine.engine_id} @ {engine.cluster_id} is managed again after {engine.observed_hits} observations.",
                             CYAN,
-                        )
+                        )            
+                    if cstate == "R":
+                        engine.timeleft = parse_timeleft(ctime)
+
+                # Track max pending age per Slurm partition for zslurm engine jobs; split by constraint (scratch-node)
+                if cstate != "R":
+                    try:
+                        age_sec = parse_timeleft(cpending)
+                    except Exception:
+                        age_sec = 0.0
+                    try:
+                        features_str = (cfeatures or "").strip()
+                    except Exception:
+                        features_str = ""
+                    try:
+                        ages_any[cpartition] = max(float(ages_any.get(cpartition, 0.0)), float(age_sec))
+                        if "scratch-node" in features_str:
+                            ages_scratch[cpartition] = max(float(ages_scratch.get(cpartition, 0.0)), float(age_sec))
+                        else:
+                            ages_noscratch[cpartition] = max(float(ages_noscratch.get(cpartition, 0.0)), float(age_sec))
+                    except Exception:
+                        pass
 
                 if cpartition == "staging":
                     if cstate == "R":
-                        if not cid in self.engine_by_clusterid:
-                            continue  # needs to register first
+                        # Count running engines even if not yet registered; they occupy cluster capacity
                         nrunning_archive += 1
+                        running_by[cpartition] += 1
                     else:
                         nqueue_archive += 1
+                        queued_by[cpartition] += 1
                 else:
                     if cstate == "R":
-                        if not cid in self.engine_by_clusterid:
-                            continue  # needs to register first
+                        # Count running engines even if not yet registered; they occupy cluster capacity
                         nrunning += 1
+                        running_by[cpartition] += 1
                     else:
                         nqueue += 1
-            elif cstate == "R" and cid in self.engine_by_clusterid:
-                observed_cluster_ids.add(cid)
-                # also treat as observed for gating when zslurm name doesn't match
-                engine = self.engine_by_clusterid[cid]
-                engine.missing_hits = 0
-                engine.observed_hits = engine.observed_hits + 1
-                if (not engine.managed) and engine.observed_hits >= SQUEUE_OBSERVED_CONFIRMS:
-                    engine.managed = True
-                    add_log_line(
-                        gb,
-                        f"Engine {engine.engine_id} @ {engine.cluster_id} is managed again after {engine.observed_hits} observations.",
-                        CYAN,
-                    )
-                if cpartition == "staging":
-                    nrunning_archive += 1
-                else:
-                    nrunning += 1
+                        queued_by[cpartition] += 1
 
-            if cid in self.engine_by_clusterid:
-                engine = self.engine_by_clusterid[cid]
-                if cstate == "R":
-                    engine.timeleft = parse_timeleft(ctime)
 
-            z[cstate] += 1
+
+                z[cstate] += 1
+        except Exception as ex:
+            add_log_line(
+                gb,
+                f"Exception while parsing squeue output in _check_cluster_engines: {ex}",
+                RED,
+            )
+            add_log_line(gb, traceback.format_exc(), RED)
+            return
 
         for cid, engine in list(self.engine_by_clusterid.items()):
             if (
@@ -1224,6 +1683,27 @@ class EngineManager(object):
         self.cluster_running_engines = nrunning
         self.cluster_queued_engines_archive = nqueue_archive
         self.cluster_running_engines_archive = nrunning_archive
+        self.last_observed_cids = set(observed_cluster_ids)
+        # Per-Slurm-partition counts (e.g., genoa, rome, fat_genoa, fat_rome)
+        try:
+            self.cluster_queued_by_partition = dict(queued_by)
+            self.cluster_running_by_partition = dict(running_by)
+        except Exception:
+            self.cluster_queued_by_partition = {}
+            self.cluster_running_by_partition = {}
+        try:
+            self.cluster_queued_age_by_partition = dict(ages_any)
+            keys = set(list(ages_scratch.keys()) + list(ages_noscratch.keys()))
+            by_s = {}
+            for p in keys:
+                by_s[p] = {
+                    'scratch': float(ages_scratch.get(p, 0.0)),
+                    'no_scratch': float(ages_noscratch.get(p, 0.0)),
+                }
+            self.cluster_queued_age_by_partition_by_scratch = by_s
+            self.last_squeue_ts = time.time()
+        except Exception:
+            pass
 
     def count_cluster_engines(self):
         return len(self.engine_by_clusterid)
@@ -1245,7 +1725,7 @@ class EngineManager(object):
                 chief_path = "zslurm_chief"
                 cmd = (
                     chief_path
-                    + f" -a {status.address} -p {status.port} -c {ncpu} -m {mem}"
+                    + f" -a {status.address} -p {status.port} -c {ncpu} -m {mem} -u"
                 )
                 add_log_line(gb, "Starting local engine using: " + cmd, GREEN)
                 args = shlex.split(cmd)
@@ -1294,6 +1774,7 @@ class EngineManager(object):
     # FIXME
     def start_slurm(self, gb, n, stime, partition, constraint, cores):
         self.lock.acquire()
+        started_engines = []
         try:
             if n < 0:
                 set_status_message(
@@ -1301,47 +1782,45 @@ class EngineManager(object):
                 )
             else:
                 set_status_message(gb, "Starting SLURM engines", YELLOW)
-                engine_path = "slurm_to_zslurm"
-                if constraint:
-                    constraint = "--constraint " + constraint
+                # Build sbatch command as a list to avoid quoting issues
+                args = [
+                    "sbatch", "-N", "1", "-p", str(partition),
+                ]
                 if cores > 0:
-                    allocation = f"--cpus-per-task={cores}"
+                    args.append(f"--cpus-per-task={int(cores)}")
                 else:
-                    allocation = "--exclusive"
+                    args.append("--exclusive")
+                if constraint:
+                    args.extend(["--constraint", str(constraint)])
+                args.append("--parsable")
                 if n > 1:
-                    cmd = f"sbatch -N 1 -p {partition} {allocation} {constraint} --parsable --array=0-{n-1} -J zslurm -t "
-                else:
-                    cmd = f"sbatch -N 1 -p {partition} {allocation} {constraint} --parsable -J zslurm -t "
+                    args.append(f"--array=0-{int(n)-1}")
+                args.extend(["-J", str(status.instance_name), "-t", str(stime)])
 
-                cmd = cmd + stime
-
+                # Partition mapping for manager side
                 if partition == "staging":
-                    # check for existing nodes
+                    # check for existing and failed archive nodes to exclude
                     xlist = []
                     for eid, engine in self.engine_by_id.items():
                         if engine.partition == "archive":
-                            eid = eid.split('-')[0] #remove sequence nr. (e.g. srv10-2)
+                            eid = eid.split('-')[0]
                             xlist.append(eid)
+                    xlist.extend(list(self.archive_failed_nodes))
                     if xlist:
-                        cmd = cmd + " --exclude=" + ",".join(set(xlist)) + " "
-
+                        args.append("--exclude=" + ",".join(sorted(set(filter(None, xlist)))))
                     lpartition = "archive"
                 else:
                     lpartition = "compute"
 
-                cmd = (
-                    cmd
-                    + " slurm_to_zslurm -a "
-                    + str(status.address)
-                    + " -p "
-                    + str(status.port)
-                )
-                cmd = cmd + " -t " + lpartition
-
+                # Add command to run under sbatch and its arguments
+                args.extend([
+                    "slurm_to_zslurm",
+                    "-a", str(status.address),
+                    "-p", str(status.port),
+                    "-t", str(lpartition),
+                ])
                 if cores > 0:
-                    cmd = cmd + f" -c {cores}"
-
-                args = shlex.split(cmd)
+                    args.extend(["-c", str(int(cores))])
 
                 eid = Popen(
                     args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -1350,25 +1829,31 @@ class EngineManager(object):
                     eid = eid.decode("utf-8")
 
                 eid = eid.strip()
-                add_log_line(gb, "Queueing engines (%s) using: " % eid + cmd, GREEN)
+                try:
+                    log_cmd = " ".join(shlex.quote(str(a)) for a in args)
+                except Exception:
+                    log_cmd = "sbatch ..."
+                add_log_line(gb, "Queueing engines (%s) using: " % eid + log_cmd, GREEN)
                 if "error" in eid or not eid:
                     add_log_line(gb, "Error during SLURM submission.", RED)
                     return
 
                 if n == 1:
-                    self.engine_by_clusterid[eid] = Engine(cluster_id=eid, managed=True)
+                    self.engine_by_clusterid[eid] = Engine(cluster_id=eid, managed=True, instance=status.instance_name)
+                    started_engines.append(self.engine_by_clusterid[eid])
                 else:
                     for i in range(n):
-                        cid = eid + "_" + str(i)
+                        cid = eid + "_" + str(i)                        
                         self.engine_by_clusterid[cid] = Engine(
-                            cluster_id=cid, managed=True
+                            cluster_id=cid, managed=True, instance=status.instance_name
                         )
-
+                        started_engines.append(self.engine_by_clusterid[cid])
                 time.sleep(3)
                 set_status_message(gb, "SLURM engines queued", GREEN)
                 add_log_line(gb, str(n) + " SLURM engines queued", MAGENTA)
         finally:
             self.lock.release()
+        return started_engines
 
     # FIXME: jobs running removal, priority of cancelling less active nodes
     def stop_slurm(self, gb, n):
@@ -1414,6 +1899,12 @@ class EngineManager(object):
                     stop_engines2.sort()  # cancel oldest running engine
                     stop_engines = stop_engines + stop_engines2
 
+                # as a last resort, include any remaining engines regardless of managed state
+                if len(stop_engines) < n:
+                    for cid, engine in list(self.engine_by_clusterid.items()):
+                        if cid not in stop_engines:
+                            stop_engines.append(cid)
+
                 stop_engines = stop_engines[:n]
                 if stop_engines:
                     add_log_line(gb, "Stop engines: %s" % str(stop_engines), CYAN)
@@ -1454,19 +1945,9 @@ class EngineManager(object):
     def _is_cid_present(self, cid):
         """Return True if the given Slurm cluster job id is still present in squeue."""
         try:
-            cmd = "squeue -h -r -j " + str(cid) + " -o '%i|%t'"
-            args = shlex.split(cmd)
-            p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            output = p.communicate()[0]
-            if isinstance(output, bytes):
-                output = output.decode("utf-8")
-            lines = [e.strip().split("|") for e in output.split("\n") if e]
-            for fields in lines:
-                if fields and fields[0] == str(cid):
-                    return True
-            return False
-        except OSError:
-            # If squeue failed, do not block requeue indefinitely; assume not present
+            cids = getattr(self, 'last_observed_cids', set()) or set()
+            return str(cid) in cids
+        except Exception:
             return False
 
     def _wait_for_cid_termination(self, cid, timeout_seconds=60, poll_interval=2):
@@ -1489,7 +1970,26 @@ class EngineManager(object):
             add_log_line(gb, "Terminating local engine.", RED)
             self.stop_local(gb)
 
-    def register(self, myip, cores, totmem, partition, cluster_jobid):
+
+    def failed_node(self, myip, partition, cluster_jobid):        
+        add_log_line(gb, f"Node {myip} at {cluster_jobid} in {partition} reports a failed node, and will exit.")
+        if str(partition) == "archive" and myip:
+            self.lock.acquire()
+            try:
+                self.archive_failed_nodes.add(myip)
+            finally:
+                self.lock.release()
+
+    def register(
+        self,
+        myip,
+        cores,
+        totmem,
+        partition,
+        cluster_jobid,
+        ssd_total_gb,
+        ssd_used_gb,      
+    ):
         self.lock.acquire()
         try:
             myid = zslurm_shared.short_name(myip)
@@ -1501,7 +2001,22 @@ class EngineManager(object):
                 myx = f"{myid}-{counter}"
             myid = myx
 
-            e = Engine(myid, cores, totmem, partition)
+            prev = self.engine_by_clusterid.get(cluster_jobid, None) if cluster_jobid not in (None, "", False) else None
+            if prev is not None:
+                # Reuse placeholder to preserve managed/observed state
+                e = prev
+                e.engine_id = myid
+                e.cores = cores
+                e.totmem = totmem
+                e.partition = partition
+                e.status = ""
+            else:
+                e = Engine(myid, cores, totmem, partition)
+                # Capture pre-existing engines as managed on registration; squeue will demote if missing later
+                if cluster_jobid not in (None, "", False):
+                    e.managed = True
+                if cluster_jobid not in (None, "", False):
+                    self.engine_by_clusterid[cluster_jobid] = e
 
             self.engine_by_id[myid] = e
             if myid == zslurm_shared.short_name(status.address) or cluster_jobid == "":
@@ -1509,6 +2024,12 @@ class EngineManager(object):
             else:
                 e.cluster_id = cluster_jobid
                 self.engine_by_clusterid[cluster_jobid] = e
+
+            e.has_ssd = False
+            e.ssd_total_gb = float(ssd_total_gb)
+            e.ssd_used_gb = float(ssd_used_gb)            
+            e.res_ssd_reserved_gb = 0.0
+            e.has_ssd = e.ssd_total_gb > 0.0
 
             totalgb = totmem / 1024.0
             average_use = totalgb / float(cores)
@@ -1519,7 +2040,7 @@ class EngineManager(object):
                 + str(cores)
                 + "C:"
                 + "{:1.1f}".format(average_use)
-                + f" GB, {partition}) on {myid} is now online @ {cluster_jobid}",
+                + f" GB, {e.ssd_total_gb:.1f} GB SSD, {partition}) on {myid} is now online @ {cluster_jobid}",
                 CYAN,
             )
 
@@ -1539,13 +2060,124 @@ class EngineManager(object):
         idle,
         current_cpu_usage,
         current_mem_usage,
+        sys_cpu_busy,
+        sys_iowait,
+        ssd_total_gb,
+        ssd_used_gb
     ):
         try:
             e = self.engine_by_id[myid]
             e.cpu_usage = cpu_usage
             e.mem_usage = mem_usage
             e.load = load
+            try:
+                e.sys_cpu_busy = float(sys_cpu_busy) if not sys_cpu_busy is None else 0.0
+            except Exception:
+                e.sys_cpu_busy = 0.0
+            try:
+                e.sys_iowait = float(sys_iowait) if not sys_iowait is None else 0.0
+            except Exception:
+                e.sys_iowait = 0.0
+
+            def _to_float(value, default=None):
+                if value is None:
+                    return default
+                try:
+                    return float(value)
+                except Exception:
+                    return default
+
+            total_ssd = _to_float(ssd_total_gb, None)
+            if total_ssd is not None:
+                total_ssd = max(0.0, total_ssd)
+                e.ssd_total_gb = total_ssd
+                e.has_ssd = total_ssd > 0.0
+            elif getattr(e, "ssd_total_gb", None) is None:
+                e.ssd_total_gb = 0.0
+                e.has_ssd = False
+
+            used_ssd = _to_float(ssd_used_gb, None)
+            if used_ssd is not None:
+                used_ssd = max(0.0, used_ssd)
+                if getattr(e, "ssd_total_gb", 0.0) > 0.0:
+                    used_ssd = min(used_ssd, e.ssd_total_gb)
+                e.ssd_used_gb = used_ssd
+            elif getattr(e, "ssd_used_gb", None) is None:
+                e.ssd_used_gb = 0.0
+            
             e.lastseen = time.time()
+
+            # Node usage report: write one line per poll
+            try:
+                if getattr(status, 'node_reports_file', None):
+                    if e.partition  == 'compute':
+                        ts_iso = datetime.datetime.now().isoformat()
+                        # Queue stats for this partition
+                        pending_jobs = 0
+                        pending_cores = 0.0
+                        pending_mem_mb = 0.0
+                        try:
+                            for j in list(jobs.jobs_by_id.values()):
+                                if j.partition == e.partition and j.state in queue_states:
+                                    pending_jobs += 1
+                                    try:
+                                        pending_cores += float(j.ncpu)
+                                    except Exception:
+                                        pending_cores += 0.0
+                                    try:
+                                        pending_mem_mb += float(j.mem)
+                                    except Exception:
+                                        pending_mem_mb += 0.0
+                        except Exception:
+                            # ensure we still log a line even if queue scan fails
+                            pass
+
+                        row = [
+                            ts_iso,
+                            e.engine_id,
+                            (e.cluster_id if e.cluster_id is not False else "NA"),
+                            e.partition,
+                            e.status,
+                            1 if getattr(e, 'managed', False) else 0,
+                            1 if getattr(e, 'stopping', False) else 0,
+                            int(e.cores),
+                            float(e.totmem),
+                            float(e.cpu_usage),
+                            float(e.mem_usage),
+                            float(e.load),
+                            float(getattr(e, 'sys_cpu_busy', 0.0)),
+                            float(getattr(e, 'sys_iowait', 0.0)),
+                            float(getattr(e, 'res_cpu_reserved', 0.0)),
+                            float(getattr(e, 'res_mem_reserved_mb', 0.0)),
+                            int(len(getattr(e, 'jobs', []))),
+                            1 if bool(getattr(e, 'has_ssd', False)) else 0,
+                            float(getattr(e, 'ssd_total_gb', 0.0)),
+                            float(getattr(e, 'ssd_used_gb', 0.0)),
+                            float(getattr(e, 'res_ssd_reserved_gb', 0.0)),
+                            float(getattr(e, 'timeleft', 0.0)),
+                            float(time.time() - float(getattr(e, 'starttime', time.time()))),
+                            int(pending_jobs),
+                            float(pending_cores),
+                            float(pending_mem_mb),
+                        ]
+                        try:
+                            status.reports_lock.acquire()
+                            status.node_reports_file.write("\t".join([str(x) for x in row]) + "\n")
+                            status.node_reports_file.flush()
+                        finally:
+                            status.reports_lock.release()
+            except Exception as ex:
+                try:
+                    import traceback
+                    add_log_line(
+                        gb,
+                        f"Exception writing node usage report for engine {myid}: {ex}",
+                        RED,
+                    )
+                    add_log_line(gb, traceback.format_exc(), RED)
+                    traceback.print_exc()
+                except Exception:
+                    pass
 
             # If this engine is stopping, do not reconcile or assign; force STOP
             if e.stopping:
@@ -1561,14 +2193,7 @@ class EngineManager(object):
             if idle > 0.0 and e.status == PHASING_OUT:
                 add_log_line(gb, "Stopping phased out engine: " + myid, YELLOW)
                 commands.append((zslurm_shared.STOP, None))
-            elif (
-                idle > 180.0
-                and (e.partition != "archive" or (sum(jobs.running_jobs.values()) == 0))
-                and status.kill_idle
-                and not myid == zslurm_shared.get_hostname()
-            ):
-                add_log_line(gb, "Stopping idle engine: " + myid, YELLOW)
-                commands.append((zslurm_shared.STOP, None))
+            
 
             if commands:
                 self.lock.acquire()
@@ -1617,7 +2242,7 @@ class EngineManager(object):
                     RED,
                 )
                 commands.append((zslurm_shared.STOP, None))
-            else:
+            else:                
                 add_log_line(
                     gb,
                     "Poll for unknown engine id: " + myid + ". Taking ownership.",
@@ -1669,9 +2294,192 @@ unregister = lambda *args: engines.unregister(*args)
 poll = lambda *args: engines.poll(*args)
 register = lambda *args: engines.register(*args)
 list_nodes = lambda *args: engines.list_nodes(*args)
+failed_node = lambda *args: engines.failed_node(*args)
 
+
+def compute_autogrow_plan(all_engines, partition):    
+    eligible = []
+    for j in list(jobs.jobs_by_id.values()):
+        if (
+            j.partition == partition
+            and j.state in queue_states
+            and ((jobs.active_total >= (jobs.active_inuse + j.active_start_use_add)) or j.active_start_use_add == 0)
+            and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
+            and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
+        ):
+            eligible.append(j)
+
+    unique_part = list(set([part_name for part_name,_ in status.autogrow_prefer_partitions]))
+
+    #Reserved resources
+    res_cpu = sum(float(getattr(e, 'res_cpu_reserved', 0.0)) for e in all_engines if e.partition == partition)
+    res_mem_mb = sum(float(getattr(e, 'res_mem_reserved_mb', 0.0)) for e in all_engines if e.partition == partition)
+
+    #Pending resources
+    pend_cpu = sum(float(j.ncpu) for j in eligible)
+    pend_mem_mb = sum(float(j.mem) for j in eligible)
+
+    #Total capacity of the partition
+    tot_cpu_cap = sum(float(getattr(e, 'cores', 0.0)) for e in all_engines if e.partition == partition)
+    tot_mem_cap_mb = sum(float(getattr(e, 'totmem', 0.0)) for e in all_engines if e.partition == partition)
+
+
+    #Add queued resources
+    queue_cpu_cap = 0.0
+    queue_mem_cap_mb = 0.0
+
+    for part_name in unique_part:
+        nqueued_engines = engines.cluster_queued_by_partition.get(part_name, 0)      
+        prof = status.node_profiles.get(part_name)
+        
+        queue_cpu_cap += nqueued_engines * float(prof.get('cores', 0.0))
+        queue_mem_cap_mb += nqueued_engines * float(prof.get('mem_gb', 0.0)) * 1024.0
+
+        
+    genoa_prof = status.node_profiles.get('genoa')
+    largest_cores = int(genoa_prof.get('cores', 0))
+    
+    # Free cluster capacity across currently running engines after pending jobs
+    free_cpu_total = max(0.0, tot_cpu_cap - res_cpu)
+    free_mem_total_mb = max(0.0, tot_mem_cap_mb - res_mem_mb)
+    
+    #Required resources.
+    #The 1.1 is to not overgrow the cluster too much and have to shrink it too soon.
+    required_cpu = max(0.0, pend_cpu - free_cpu_total * 1.1 - queue_cpu_cap)
+    required_mem_mb = max(0.0, pend_mem_mb - free_mem_total_mb * 1.1 - queue_mem_cap_mb)
+
+    # Memory-per-core pressure for info only
+    avail_mpc = ((tot_mem_cap_mb + queue_mem_cap_mb) / 1024.0) / max(1.0, (tot_cpu_cap + queue_cpu_cap))
+    required_mpc = ((res_mem_mb + pend_mem_mb) / 1024.0) / max(1.0, (res_cpu + pend_cpu))
+
+    
+    if required_cpu <= largest_cores and tot_cpu_cap > 0: #if there is already an engine, only grow if we can fill a full engine
+        return {
+            'has_eligible': len(eligible) > 0,
+            'eligible_n': len(eligible),
+            'plan_part': None,
+            'plan_nodes': 0.0,
+            'plan_use_scratch': True,
+            'needed_cpu': required_cpu / (genoa_prof.get('cores', 0.0)),
+            'needed_mem': required_mem_mb / (genoa_prof.get('mem_gb', 0.0) * 1024.0),
+            'avail_mpc': avail_mpc,
+            'required_mpc': required_mpc,
+            'raw_best_nodes': 0.0,
+            'fat_cap_applied': False,
+        }
+
+    #parts_states_by_scratch = zslurm_shared.slurm_partition_state_counts_by_scratch(60)
+
+    best_part = None
+    best_use_scratch = True
+    best_score = -1e18
+
+    def safe_float(x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    for part, scratch in status.autogrow_prefer_partitions:
+        prof = status.node_profiles.get(part) or {}
+        if not prof:
+            continue
+
+        # Scratch-aware idle nodes
+        #pinfo = parts_states_by_scratch.get(part, {}) or {}
+        #grp = pinfo.get('scratch' if scratch else 'no_scratch', {}) or {}
+        #idle = int((grp.get('states', {}) or {}).get('IDLE', 0))
+        #FIXME
+        idle = 1
+
+        # Estimate nodes needed for this profile
+        ncores = safe_float(prof.get('cores', 0.0), 0.0)
+        nmem_mb = safe_float(prof.get('mem_gb', 0.0), 0.0) * 1024.0
+        nc = max(0.0, required_cpu / max(ncores, 1.0))
+        nm = max(0.0, required_mem_mb / max(nmem_mb, 1.0))
+        need_nodes = int(math.ceil(max(nc, nm))) if (required_cpu > 0.0 or required_mem_mb > 0.0) else 0
+
+        # Scoring
+        sc = 0.0
+
+        # penalize fat by default
+        if str(part).startswith('fat'):
+            sc -= 4.0
+
+        # prefer genoa slightly, detract non-genoa
+        if 'genoa' not in str(part):
+            sc -= 4.0
+
+        # prefer scratch, detract non-scratch
+        if not scratch:
+            sc -= 1.0
+
+        # reward partitions that have idle close to the need
+        sc += float(min(min(idle, max(need_nodes, 1)), 3)) * 5.0
+
+        # add score if adding this profile improves memory/core availability when under memory pressure
+        candidate_avail_mpc = ((tot_mem_cap_mb + nmem_mb) / 1024.0) / max(1.0, (tot_cpu_cap + ncores))
+        if avail_mpc < required_mpc and candidate_avail_mpc > avail_mpc:
+            sc += 5.0
+
+        if sc > best_score:
+            best_score = sc
+            best_part = part
+            best_use_scratch = bool(scratch)
+
+    if best_part is None:
+        best_part = 'genoa'
+        best_use_scratch = False
+
+    prof = status.node_profiles.get(best_part) or {}
+    try:
+        nodes_cpu = max(0.0, required_cpu / float(max(1.0, float(prof.get('cores', 0.0)))))
+    except Exception:
+        nodes_cpu = 0.0
+    try:
+        nodes_mem = max(0.0, required_mem_mb / (float(max(1.0, float(prof.get('mem_gb', 0.0)))) * 1024.0))
+    except Exception:
+        nodes_mem = 0.0
+
+    raw_best_nodes = int(math.ceil(max(nodes_cpu, nodes_mem))) if (required_cpu > 0.0 or required_mem_mb > 0.0) else 0
+    best_nodes = raw_best_nodes
+
+    if best_nodes > 1 and not str(best_part).startswith('fat'):
+        best_nodes = max(int(math.ceil(0.2 * best_nodes)), 1)
+
+    fat_cap_applied = False
+    if str(best_part).startswith('fat') and best_nodes > 1:
+        best_nodes = 1
+        fat_cap_applied = True
+
+    plan = {
+        'has_eligible': len(eligible) > 0,
+        'eligible_n': len(eligible),
+
+        'plan_part': best_part,
+        'plan_use_scratch': best_use_scratch,
+        'plan_nodes': best_nodes,
+        'best_part': best_part,
+        'best_nodes': best_nodes,
+
+        'needed_cpu': nodes_cpu,
+        'needed_mem': nodes_mem,
+        
+        'avail_mpc': avail_mpc,
+        'required_mpc': required_mpc,
+        'raw_best_nodes': raw_best_nodes,
+        'fat_cap_applied': fat_cap_applied,
+    }
+    
+    return plan
 
 def thread_check_commands():
+    
+    autogrow_last_plan_ts = 0.0
+    autoconsolidate_last_plan_ts = 0.0
+
+    
+
     while 1:
         engines.lock.acquire()
         try:
@@ -1715,6 +2523,10 @@ def thread_check_commands():
         used_load = []
         total_cpus = []
         total_mem = []
+        sys_busy = []
+        sys_iow = []
+        ssd_used = []
+        ssd_total = []
         for engine in all_engines:
             if not engine.partition == "archive":
                 total_cpus.append(engine.cores)
@@ -1723,12 +2535,263 @@ def thread_check_commands():
                 used_cpus.append(engine.cores * (engine.cpu_usage / 100.0))
                 used_mem.append((engine.totmem / 1024.0) * (engine.mem_usage / 100.0))
                 used_load.append(engine.cores * engine.load)
+                sys_busy.append(engine.sys_cpu_busy)
+                sys_iow.append(engine.sys_iowait)
+                if getattr(engine, 'has_ssd', False) and getattr(engine, 'ssd_total_gb', 0.0) > 0.0:
+                    ssd_total.append(float(getattr(engine, 'ssd_total_gb', 0.0)))
+                    ssd_used.append(float(getattr(engine, 'ssd_used_gb', 0.0)))
+        status.total_ssd = numpy.array(ssd_total, dtype=float)
+        status.used_ssd = numpy.array(ssd_used, dtype=float)
+        status.ssd_total_gb = float(status.total_ssd.sum()) if status.total_ssd.size else 0.0
+        status.ssd_used_gb = float(status.used_ssd.sum()) if status.used_ssd.size else 0.0
 
         status.used_cpus = numpy.array(used_cpus)
         status.used_load = numpy.array(used_load)
         status.total_cpus = numpy.array(total_cpus, dtype=float)
         status.used_mem = numpy.array(used_mem, dtype=float)
         status.total_mem = numpy.array(total_mem, dtype=float)
+        status.sys_cpu_busy = numpy.array(sys_busy, dtype=float)
+        status.sys_iowait = numpy.array(sys_iow, dtype=float)
+
+        now = time.time()
+        try:            
+            safety_fraction = float(status.config.get("consolidation_safety_fraction", status.consolidation_safety_fraction))
+            min_engines = int(status.config.get("consolidation_min_engines", status.consolidation_min_engines))
+            hysteresis_sec = float(status.config.get("consolidation_hysteresis_sec", status.consolidation_hysteresis_sec))
+            cooldown_sec = float(status.config.get("consolidation_cooldown_sec", status.consolidation_cooldown_sec))
+            min_runtime_sec = float(status.config.get("consolidation_min_runtime_sec", status.consolidation_min_runtime_sec))
+            allow_with_queue = bool(status.config.get("consolidation_allow_with_queue", status.consolidation_allow_with_queue))
+            pending_min_age_sec = float(status.config.get("consolidation_pending_min_age_sec", status.consolidation_pending_min_age_sec))
+            dbg_consolidation = bool(status.config.get("consolidation_debug", status.consolidation_debug))
+            keep_weights = dict(status.config.get("consolidation_keep_weights", status.consolidation_keep_weights))
+
+            if status.autoconsolidate_enable and now - autoconsolidate_last_plan_ts > 60:
+                autoconsolidate_last_plan_ts = now
+
+                parts = set(e.partition for e in all_engines)
+                for part in parts:
+                    part_engines = [e for e in all_engines if e.partition == part]
+                    if not part_engines:
+                        continue
+
+                    # Determine max capacity of any engine in this partition
+                    try:
+                        cap_cpu_max = max(int(getattr(e, 'cores', 0)) for e in part_engines)
+                        cap_mem_mb_max = max(float(getattr(e, 'totmem', 0.0)) for e in part_engines)
+                    except Exception:
+                        cap_cpu_max = 0
+                        cap_mem_mb_max = 0.0
+
+                    pending_eligible = []
+                    for j in list(jobs.jobs_by_id.values()):
+                        if (
+                            j.partition == part
+                            and j.state in queue_states
+                            and float(j.ncpu) <= float(cap_cpu_max)
+                            and float(j.mem) <= float(cap_mem_mb_max)
+                            and (
+                                part == 'archive'
+                                or not hasattr(j, 'submit_ts')
+                                or (now - float(getattr(j, 'submit_ts', now)) >= pending_min_age_sec)
+                            )
+                            and ((jobs.active_total >= (jobs.active_inuse + j.active_start_use_add)) or j.active_start_use_add == 0)
+                            and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
+                            and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
+                        ):
+                            pending_eligible.append(j)
+                      
+                    if pending_eligible and (not allow_with_queue or part == 'archive'):
+                        # Skip consolidation when queued jobs exist; do NOT reset cooldown.
+                        # Clear hysteresis desire and unphase any prior targets so engines are usable.
+                        status.consolidation_want[part] = None
+                        unphased = []
+                        for e in part_engines:
+                            if e.status == PHASING_OUT:
+                                e.status = ""
+                                unphased.append(e.engine_id)
+                        if dbg_consolidation:
+                            try:
+                                add_log_line(gb, f"[cons] part={part} skip consolidation due to {len(pending_eligible)} eligible queued job(s); unphased={len(unphased)}", CYAN)
+                            except Exception:
+                                pass
+                        continue
+
+                    running_jobs = [
+                        j for j in list(jobs.jobs_by_id.values())
+                        if j.partition == part and j.state == "RUNNING"
+                    ]
+
+                    total_req_cpu = sum(float(j.ncpu) for j in running_jobs)
+                    total_req_mem_mb = sum(float(j.mem) for j in running_jobs)
+                    needed_cpu = max(0, int(math.ceil(total_req_cpu * safety_fraction)))
+                    needed_mem_mb = max(0, int(math.ceil(total_req_mem_mb * safety_fraction)))
+
+                    def keep_score(e):
+                        res_cpu_frac = float(getattr(e, 'res_cpu_reserved', 0.0)) / max(1.0, float(e.cores))
+                        res_mem_frac = (float(getattr(e, 'res_mem_reserved_mb', 0.0)) / 1024.0) / max(1.0, float(e.totmem) / 1024.0)
+                        jobs_factor = float(len(e.jobs))
+                        tl = float(min(float(e.timeleft), 5 * 24 * 3600)) if hasattr(e, 'timeleft') else (5 * 24 * 3600.0)
+                        time_factor = tl / float(5 * 24 * 3600)
+                        w_jobs = float(keep_weights.get('jobs', 0.5))
+                        w_res = float(keep_weights.get('reserves', 0.3))
+                        w_time = float(keep_weights.get('time', 0.2))
+                        alpha = float(keep_weights.get('reserves_alpha_cpu', 0.5))
+                        return w_jobs * jobs_factor + w_res * (alpha * res_cpu_frac + (1.0 - alpha) * res_mem_frac) + w_time * time_factor
+
+                    engines_sorted = sorted(part_engines, key=keep_score, reverse=True)
+
+                    keep = []
+                    acc_cpu = 0
+                    acc_mem_mb = 0
+                    for e in engines_sorted:
+                        if acc_cpu >= needed_cpu and acc_mem_mb >= needed_mem_mb:
+                            break
+                        keep.append(e)
+                        acc_cpu += int(e.cores)
+                        acc_mem_mb += int(e.totmem)
+
+                    if len(keep) < min_engines and part_engines:
+                        need_more = min_engines - len(keep)
+                        for e in engines_sorted[len(keep):len(keep)+need_more]:
+                            keep.append(e)
+
+                    keep_ids = set(e.engine_id for e in keep)
+                    if dbg_consolidation:
+                        try:
+                            sum_keep_cpu = sum(int(e.cores) for e in keep)
+                            sum_keep_mem_mb = sum(int(e.totmem) for e in keep)
+                            add_log_line(gb, f"[cons] part={part} needed_cpu={needed_cpu} needed_mem_mb={int(needed_mem_mb)} keep={len(keep)}/{len(part_engines)} keep_cpu={sum_keep_cpu} keep_mem_mb={int(sum_keep_mem_mb)}", CYAN)
+                        except Exception:
+                            pass
+
+                    unphase_changed = False
+                    for e in part_engines:
+                        if e.engine_id in keep_ids and e.status == PHASING_OUT:
+                            e.status = ""
+                            unphase_changed = True
+
+                    needs_phaseout = len(keep) < len(part_engines)
+                    want_ts = status.consolidation_want.get(part)
+                    last_action_ts_by_part = getattr(status, 'consolidation_last_action_ts_by_part', {}) or {}
+                    last_action_ts = float(last_action_ts_by_part.get(part, 0.0))
+                    phase_changed = False
+                    if needs_phaseout and (now - last_action_ts) >= cooldown_sec:
+                        if want_ts is None:
+                            status.consolidation_want[part] = now
+                            if dbg_consolidation:
+                                try:
+                                    add_log_line(gb, f"[cons] part={part} start hysteresis window ({int(hysteresis_sec)}s)", CYAN)
+                                except Exception:
+                                    pass
+                        elif (now - want_ts) >= hysteresis_sec:
+                            for e in part_engines:
+                                if e.engine_id not in keep_ids:
+                                    if (now - float(e.starttime)) >= min_runtime_sec:
+                                        if e.status != PHASING_OUT:
+                                            e.status = PHASING_OUT
+                                            phase_changed = True                            
+                                
+                            if unphase_changed or phase_changed:
+                                # update per-part cooldown timestamp
+                                last_action_ts_by_part[part] = now
+                                status.consolidation_last_action_ts_by_part = dict(last_action_ts_by_part)
+                    else:
+                        if not needs_phaseout:
+                            status.consolidation_want[part] = None                            
+
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        # Autogrow controller
+        try:
+            now = time.time()            
+            if autogrow_last_plan_ts < now - 60.0 and status.autogrow_enable:
+                autogrow_last_plan_ts = now
+                
+                plan = compute_autogrow_plan(all_engines, "compute")
+                cooldown_remaining_compute = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_compute_ts)))
+                
+                if plan.get('best_nodes', 0) > 0:
+                    plan_compute = f"grow: {plan.get('best_nodes', 0)} @ {plan.get('best_part', 'compute')}, cooldown {int(cooldown_remaining_compute)}s left"                                            
+                else:
+                    plan_compute = f"no nodes needed"
+
+                if cooldown_remaining_compute <= 0: # Autogrow cooldown expired, lets see if we need to start some engines
+                    if plan.get('best_part',None) is not None:
+                        to_start = plan.get('best_nodes', 0)
+                        if to_start > 0:
+                            try:
+                                max_compute_nodes = int(status.config.get('autogrow_max_compute_nodes', 45))
+                            except Exception:
+                                max_compute_nodes = 45
+                            current_compute = int(getattr(engines, 'cluster_running_engines', 0)) + int(getattr(engines, 'cluster_queued_engines', 0))
+                            cap_remaining = max(0, int(max_compute_nodes) - int(current_compute))
+                            clamped = False
+                            if to_start > cap_remaining:
+                                to_start = cap_remaining
+                                clamped = True
+                            if to_start > 0:
+                                msg = f"Autogrow: starting {to_start} node(s) on {plan.get('best_part')}"
+                                if clamped:
+                                    msg += f" (cap {current_compute}+{to_start} <= {max_compute_nodes})"
+                                add_log_line(
+                                    gb,
+                                    msg,
+                                    CYAN,
+                                )
+                                constraint = "scratch-node" if bool(plan.get('plan_use_scratch', True)) else None
+                                engines.start_slurm(gb, to_start, status.autogrow_runtime_default, plan.get('best_part'), constraint, 0)
+                                status.autogrow_last_action_compute_ts = now
+                                plan_compute = f"growed: {to_start} @ {plan.get('best_part', 'compute')}"
+
+                
+                staging_pending = 0
+                try:
+                    for job in list(jobs.jobs_by_id.values()):
+                        part = str(getattr(job, 'partition', '') or '')
+                        if part in ('archive', 'staging') and getattr(job, 'state', '') in queue_states:
+                            staging_pending += 1
+                except Exception:
+                    staging_pending = 0
+
+                desired_staging = 0
+                if staging_pending >= 50:
+                    desired_staging = 4
+                elif staging_pending > 0:
+                    desired_staging = 1
+                
+                queued_map = getattr(engines, 'cluster_queued_by_partition', {}) or {}
+                running_map = getattr(engines, 'cluster_running_by_partition', {}) or {}
+                current_staging = int(queued_map.get('staging', 0)) + int(running_map.get('staging', 0))
+
+                cooldown_remaining_staging = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_staging_ts)))
+
+                if desired_staging > current_staging:
+                    plan_staging = f"grow {desired_staging  - current_staging}, cooldown {int(cooldown_remaining_staging)}s left"
+                else:
+                    plan_staging = f"no nodes needed"
+                
+                
+                if cooldown_remaining_staging <= 0:    
+                    if desired_staging > 0:
+                        if desired_staging > current_staging:
+                            to_start_staging = min(desired_staging - current_staging, 4 - current_staging)
+                            if to_start_staging > 0:
+                                add_log_line(
+                                    gb,
+                                    f"Staging autogrow: {staging_pending} archive jobs pending, starting 1 of {to_start_staging} nodes.",
+                                    CYAN,
+                                )
+                                engines.start_slurm(gb, 1, status.autogrow_runtime_default, "staging", None, 1)                                
+                                status.autogrow_last_action_staging_ts = now
+                                plan_staging = f"growed: 1"
+
+
+                status.autogrow_plan =f"Compute: {plan_compute} | Staging: {plan_staging}"              
+
+        except Exception:
+            import traceback
+            traceback.print_exc()            
 
         time.sleep(5)
 
@@ -1744,6 +2807,7 @@ def thread_start_manager_server(port, rpc_path):
     server.register_introspection_functions()
 
     server.register_function(register, "register")
+    server.register_function(failed_node, "failed_node")
     server.register_function(unregister, "unregister")
     server.register_function(poll, "poll")
     server.register_function(request_jobs, "request_jobs")
@@ -1751,6 +2815,7 @@ def thread_start_manager_server(port, rpc_path):
     server.register_function(can_run_assigned_job, "can_run_assigned_job")
 
     Servers.manager_server = server
+    add_log_line(gb, f"[manager] started on port {port} with rpc path {rpc_path}", GREEN)
     server.serve_forever()
 
 
@@ -1844,7 +2909,7 @@ def thread_display_status(gb, status):
         equeue_archive = engines.cluster_queued_engines_archive
         erunning_archive = engines.cluster_running_engines_archive
 
-        njobs, nrunning, nfailed, ncompleted = jobs.get_job_stats()
+        njobs, nrunning, neligible, nfailed, ncompleted = jobs.get_job_stats()
 
         # active_engines = jobs.active_engines()
         # active_engines.discard(mylocal_id)
@@ -1897,16 +2962,29 @@ def thread_display_status(gb, status):
             if gb.wcom_status and gb.wcom_status.getmaxyx()[1] > 50:
                 sizey = gb.wcom_status.getmaxyx()[1]
                 gb.wcom_status.erase()
+                compute_running = nrunning.get("compute", 0)
+                compute_eligible = neligible.get("compute", 0)
+                compute_total = njobs.get("compute", 0)
+                compute_completed = ncompleted.get("compute", 0)
+                compute_failed = nfailed.get("compute", 0)
+
+                archive_running = nrunning.get("archive", 0)
+                archive_eligible = neligible.get("archive", 0)
+                archive_total = njobs.get("archive", 0)
+                archive_completed = ncompleted.get("archive", 0)
+                archive_failed = nfailed.get("archive", 0)
+
                 gb.wcom_status.addstr(1, 1, "Compute jobs: ")
                 gb.wcom_status.addstr(
                     1,
                     18,
-                    "%d/%d (%d completed, %d failed)"
+                    "%d/%d/%d (%d completed, %d failed)"
                     % (
-                        nrunning.get("compute", 0),
-                        njobs.get("compute", 0),
-                        ncompleted.get("compute", 0),
-                        nfailed.get("compute", 0),
+                        compute_running,
+                        compute_eligible,
+                        compute_total,
+                        compute_completed,
+                        compute_failed,
                     ),
                     curses.color_pair(GREEN),
                 )
@@ -1914,15 +2992,71 @@ def thread_display_status(gb, status):
                 gb.wcom_status.addstr(
                     2,
                     18,
-                    "%d/%d (%d completed, %d failed)"
+                    "%d/%d/%d (%d completed, %d failed)"
                     % (
-                        nrunning.get("archive", 0),
-                        njobs.get("archive", 0),
-                        ncompleted.get("archive", 0),
-                        nfailed.get("archive", 0),
+                        archive_running,
+                        archive_eligible,
+                        archive_total,
+                        archive_completed,
+                        archive_failed,
                     ),
                     curses.color_pair(GREEN),
                 )
+
+
+                total_ssd_arr = numpy.asarray(getattr(status, 'total_ssd', []), dtype=float)
+                used_ssd_arr = numpy.asarray(getattr(status, 'used_ssd', []), dtype=float)
+
+
+                
+                if total_ssd_arr.size:
+                    gb.wcom_status.addstr(10, 1, "SSD usage (TB): ")
+                    ssd_display = "n/a"
+                    ssd_color = GREEN
+
+                    ssd_used_sum = float(used_ssd_arr.sum())
+                    ssd_total_sum = float(total_ssd_arr.sum())
+                    ratio = used_ssd_arr / total_ssd_arr
+                    
+
+                    if total_ssd_arr.size > 5:
+                        
+                        ssd_usage = numpy.percentile(ratio, [0, 25, 50, 75, 100])
+                        if (
+                            ssd_usage[-1] > 0.99
+                            or ssd_usage[-2] > 0.95
+                            or ssd_usage[-3] > 0.90
+                        ):
+                            ssd_color = RED
+                        elif (
+                            ssd_usage[-1] > 0.90
+                            or ssd_usage[-2] > 0.80
+                            or ssd_usage[-3] > 0.70
+                        ):
+                            ssd_color = YELLOW
+
+                        format_str = "(" + " - ".join(["%.2f"] * 5) + ")"
+                    else:                                                
+                        if ratio.size and ratio.max() > 0.95:
+                            ssd_color = RED
+                        elif ratio.size and ratio.max() > 0.75:
+                            ssd_color = YELLOW
+
+                        ssd_usage = numpy.sort(ratio)
+                        format_str = "(" + " - ".join(["%.2f"] * len(ratio)) + ")"
+
+
+
+                    ssd_display = (
+                        "%.1f/%.1f " + format_str
+                    ) % ((ssd_used_sum / 1024.0, ssd_total_sum / 1024.0) + tuple(ssd_usage.tolist()))
+
+                    gb.wcom_status.addstr(
+                        10,
+                        18,
+                        ssd_display[: max(0, sizey - 2)],
+                        curses.color_pair(ssd_color),
+                    )
 
                 gb.wcom_status.addstr(4, 1, "Local engine: ")
                 if not local_running:
@@ -1932,7 +3066,7 @@ def thread_display_status(gb, status):
                 else:
                     gb.wcom_status.addstr(4, 18, "RUNNING", curses.color_pair(GREEN))
 
-                gb.wcom_status.addstr(6, 1, "SLURM engines: ")
+                gb.wcom_status.addstr(5, 1, "SLURM engines: ")
                 enodes = erunning + equeue
 
                 cpu_c = GREEN
@@ -2001,12 +3135,12 @@ def thread_display_status(gb, status):
                     mem_usage = ("",)
                     load = ("",)
 
-                gb.wcom_status.addstr(7, 1, "Archive engines: ")
+                gb.wcom_status.addstr(5, 30, "Archive engines: ")
                 enodes_archive = erunning_archive + equeue_archive
 
-                gb.wcom_status.addstr(9, 1, "CPU usage: ")
+                gb.wcom_status.addstr(7, 1, "CPU usage: ")
                 gb.wcom_status.addstr(
-                    9,
+                    7,
                     18,
                     ("%d/%d " + format_str)
                     % (
@@ -2016,9 +3150,9 @@ def thread_display_status(gb, status):
                     curses.color_pair(cpu_c),
                 )
 
-                gb.wcom_status.addstr(10, 1, "Load: ")
+                gb.wcom_status.addstr(8, 1, "Load: ")
                 gb.wcom_status.addstr(
-                    10,
+                    8,
                     18,
                     ("%.0f/%d " + format_str)
                     % (
@@ -2028,9 +3162,9 @@ def thread_display_status(gb, status):
                     curses.color_pair(load_c),
                 )
 
-                gb.wcom_status.addstr(11, 1, "Mem usage (GB): ")
+                gb.wcom_status.addstr(9, 1, "Mem usage (GB): ")
                 gb.wcom_status.addstr(
-                    11,
+                    9,
                     18,
                     ("%d/%d " + format_str)
                     % (
@@ -2040,49 +3174,123 @@ def thread_display_status(gb, status):
                     curses.color_pair(mem_c),
                 )
 
-                if not rc is None:
-                    gb.wcom_status.addstr(13, 1, "IPEngines: ")
+                if numpy.sum(status.total_cpus) > 0 and len(status.sys_cpu_busy) == len(status.total_cpus):
+                    xav = float((status.sys_cpu_busy * status.total_cpus).sum() / numpy.sum(status.total_cpus))
+                    yav = float((status.sys_iowait * status.total_cpus).sum() / numpy.sum(status.total_cpus))
+                else:
+                    xav = 0.0
+                    yav = 0.0
+                
+                gb.wcom_status.addstr(11, 1, "Sys CPU/IO (%): ")
+                gb.wcom_status.addstr(
+                    11,
+                    18,
+                    "%.0f | %.0f" % (xav, yav),
+                    curses.color_pair(GREEN),
+                )
+
+                # Mem reserved (GB) – place inside CPU/Load/Mem block (just after Mem usage)
+                try:
+                    rem_gb = 0.0
+                    tot_gb = 0.0
+                    for e in list(engines.engine_by_id.values()):
+                        if e.partition != "archive":
+                            rem_gb += float(getattr(e, 'res_mem_reserved_mb', 0.0)) / 1024.0
+                            tot_gb += float(e.totmem) / 1024.0
+                    gb.wcom_status.addstr(11, 30, "Mem resv (GB): ")
                     gb.wcom_status.addstr(
-                        13,
+                        11,
+                        48,
+                        "%d/%d" % (int(rem_gb), int(tot_gb)),
+                        curses.color_pair(GREEN),
+                    )
+                except Exception:
+                    pass
+
+                
+
+                if not rc is None:
+                    gb.wcom_status.addstr(12, 1, "IPEngines: ")
+                    gb.wcom_status.addstr(
+                        12,
                         18,
                         "%d / %d / %d" % (running, queue, completed),
                         curses.color_pair(GREEN),
                     )
 
-                gb.wcom_status.addstr(15, 1, "Archive: ")
-                gb.wcom_status.addstr(16, 1, "Active: ")
-                gb.wcom_status.addstr(17, 1, "DCache: ")
+                gb.wcom_status.addstr(13, 1, "Archive: ")
+                gb.wcom_status.addstr(14, 1, "Active: ")
+                gb.wcom_status.addstr(15, 1, "DCache: ")
                 gb.wcom_status.addstr(
-                    15,
+                    13,
                     18,
                     "%d / %d" % (jobs.archive_inuse, jobs.archive_total),
                     curses.color_pair(GREEN),
                 )
                 gb.wcom_status.addstr(
-                    16,
+                    14,
                     18,
                     "%d / %d" % (jobs.active_inuse, jobs.active_total),
                     curses.color_pair(GREEN),
                 )
                 gb.wcom_status.addstr(
-                    17,
+                    15,
                     18,
                     "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total),
                     curses.color_pair(GREEN),
                 )
 
-                if equeue == 0:
-                    color = GREEN
-                else:
-                    color = YELLOW
+
+                # Consolidation status (compute only if present)
+                try:
+                    gb.wcom_status.addstr(17, 1, "Consolidation: ")
+                    if not status.autoconsolidate_enable:
+                        color = YELLOW
+                        txt = "disabled"
+                        gb.wcom_status.addstr(17, 18, txt, curses.color_pair(color))                
+                    else:                    
+                        p_eng = [e for e in list(engines.engine_by_id.values()) if e.partition == 'compute']
+                        m = len(p_eng)
+                        k = len([e for e in p_eng if e.status == PHASING_OUT])
+                        n = m - k
+                        gb.wcom_status.addstr(
+                            17,
+                            18,
+                            "keep %d/%d | phased-out %d" % (n, m, k),
+                            curses.color_pair(GREEN),
+                        )
+                    # Autogrow status: display closeness to adding a node
+                    
+                    gb.wcom_status.addstr(18, 1, "Autogrow: ")
+                    if not status.autogrow_enable:
+                        color = YELLOW
+                        txt = "disabled"
+                    else:
+                        plan = getattr(status, 'autogrow_plan', None)
+                        
+                        if not plan:
+                            color = CYAN
+                            txt = "no data"                                    
+                        else:
+                            color = CYAN
+                            txt = plan
+                    gb.wcom_status.addstr(18, 18, txt, curses.color_pair(color))
+                    
+                    
+                      
+                except Exception:
+                    pass
+
+                color = GREEN if equeue == 0 else YELLOW
                 gb.wcom_status.addstr(
-                    6, 18, "%d/%d" % (erunning, enodes), curses.color_pair(color)
+                    5, 18, "%d/%d" % (erunning, enodes), curses.color_pair(color)
                 )
+                color_archive = GREEN if equeue_archive == 0 else YELLOW
                 gb.wcom_status.addstr(
-                    7,
-                    18,
+                    5,
+                    48,
                     "%d/%d" % (erunning_archive, enodes_archive),
-                    curses.color_pair(color),
+                    curses.color_pair(color_archive),
                 )
 
                 gb.wcom_status.refresh()
@@ -2123,6 +3331,11 @@ def build_windows(gb):
         try:
             curses.curs_set(0)
         except:
+            pass
+        # Enable keypad mode globally to better capture special keys
+        try:
+            gb.scr.keypad(True)
+        except Exception:
             pass
 
         # curses getmaxyx does not work for resize screens to smaller sizes. Use stty instead.
@@ -2285,18 +3498,72 @@ def init_commands(gb):
     gb.lock.acquire()
     try:
         if not gb.wcom is None:
+            try:
+                max_rows, _ = gb.wcom.getmaxyx()
+            except Exception:
+                max_rows = 20
+            inst_row = max(1, min(max_rows - 2, 18))
             gb.wcom.addstr(1, 1, "Start/stop local engine: s/x")
             gb.wcom.addstr(2, 1, "Start/stop SLURM engines: d/c [n]")
+            gb.wcom.addstr(3, 1, "Toggle auto consolidate: a")
             gb.wcom.addstr(4, 1, "Toggle phaseout engine: o")
-            gb.wcom.addstr(5, 1, "Toggle autostop idle engines: k")
+            
             gb.wcom.addstr(6, 1, "Prioritize jobs: p")
             gb.wcom.addstr(7, 1, "Deprioritize jobs: n")
             gb.wcom.addstr(8, 1, "Set archive/active/dcache total capacity: 1/2/3")
             gb.wcom.addstr(9, 1, "Toggle last in/first out: l")
-            gb.wcom_addstr(10, 1, "Set memory optimization job search window: m")
+            gb.wcom.addstr(10, 1, "Set memory optimization job search window: m")
+            gb.wcom.addstr(11, 1, "Toggle autogrow: g")
             gb.wcom.addstr(12, 1, "Shutdown: q")
+            gb.wcom.addstr(inst_row, 1, "Instance:")
             gb.wcom.refresh()
     except Exception as e:
+        pass
+    finally:
+        gb.lock.release()
+
+
+def render_control_status(gb, status):
+    gb.lock.acquire()
+    try:
+        if gb.wcom:
+            try:
+                rows, width = gb.wcom.getmaxyx()
+            except Exception:
+                rows, width = (20, 80)
+            right = max(2, width - 2)
+            def draw_right(row, text, color):
+                try:
+                    t = str(text)
+                    field_width = max(4, min(24, right - 1))
+                    field_start = max(1, right - field_width)
+                    gb.wcom.move(row, field_start)
+                    gb.wcom.clrtoeol()
+                    start = max(field_start, right - len(t))
+                    gb.wcom.addstr(row, start, t, curses.color_pair(color))
+                except Exception:
+                    pass
+            col = GREEN if getattr(status, 'autoconsolidate_enable', True) else YELLOW
+            draw_right(3, ("ON" if status.autoconsolidate_enable else "OFF"), col)
+            col = GREEN if status.lastin_first else YELLOW
+            draw_right(9, ("ON" if status.lastin_first else "OFF"), col)
+            try:
+                val = int(status.prio_fillmem_context)
+            except Exception:
+                val = 0
+            draw_right(10, str(val), GREEN)
+            col = GREEN if getattr(status, 'autogrow_enable', True) else YELLOW
+            draw_right(11, ("ON" if status.autogrow_enable else "OFF"), col)
+            try:
+                inst_row = max(1, min(rows - 2, 18))
+                inst_name = str(getattr(status, 'instance_name', '') or '-')
+                gb.wcom.move(inst_row, 1)
+                gb.wcom.clrtoeol()
+                gb.wcom.addstr(inst_row, 1, f"Instance: {inst_name}", curses.color_pair(GREEN))
+            except Exception:
+                pass
+            gb.wcom.refresh()
+    except Exception:
         pass
     finally:
         gb.lock.release()
@@ -2311,23 +3578,37 @@ def enter_command(gb, argument="Command: "):
         command = ""
         size = gb.wcom.getmaxyx()
         x = size[0] - 1
-        gb.wcom.addstr(x, 1, argument)
+        # Compute available width and draw a truncated prompt if needed
+        width = max(0, size[1] - 2)
+        shown_arg = argument[:width]
+        gb.wcom.addstr(x, 1, shown_arg)
         gb.wcom.clrtoeol()
         gb.wcom.refresh()
+        # Ensure keypad mode so special keys like KEY_ENTER/KEY_BACKSPACE are recognized
+        try:
+            gb.scr.keypad(True)
+        except Exception:
+            pass
         while 1:
             gb.lock.release()
             c = gb.scr.getch()
             gb.lock.acquire()
-            if c == curses.ascii.LF:
+            # Enter pressed (handle LF, CR, keypad enter)
+            if c in (curses.ascii.LF, curses.ascii.CR, getattr(curses, 'KEY_ENTER', -1)):
                 break
-            elif c == curses.ascii.DEL:
+            # Backspace/Delete handling (cover multiple keycodes)
+            elif c in (curses.ascii.DEL, curses.ascii.BS, 127, getattr(curses, 'KEY_BACKSPACE', -1)):
                 command = command[:-1]
             else:
                 if c > 256:
+                    # Ignore unsupported special keys
                     set_status_message(gb, "Keycode not supported: " + str(c))
                 else:
                     command += chr(c)
-            gb.wcom.addstr(x, 1, argument + command[: (size[1] - len(argument) - 2)])
+            # Redraw prompt + current command, truncated to fit available width
+            avail_cmd = max(0, width - len(shown_arg))
+            shown_cmd = command[-avail_cmd:] if avail_cmd > 0 else ""
+            gb.wcom.addstr(x, 1, shown_arg + shown_cmd)
             gb.wcom.clrtoeol()
             gb.wcom.refresh()
 
@@ -2354,14 +3635,115 @@ def get_number(gb, argument, default=0):
     return n
 
 
-def main(scr, *args, **kwds):
-    address = zslurm_shared.get_hostname()
+def _is_port_available(host, port):
+    try:
+        base_port = int(port)
+    except Exception:
+        base_port = int(zslurm_shared.port)
 
-    config = zslurm_shared.get_config()
+    for candidate in (base_port, base_port + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                if s.connect_ex((host, candidate)) == 0:
+                    return False
+        except Exception:
+            return True
+    return True
+
+
+def _find_available_port(bind_host, start_port, attempts=100):
+    try:
+        base_port = int(start_port)
+    except Exception:
+        base_port = int(zslurm_shared.port)
+
+    for offset in range(attempts):
+        candidate = base_port + (offset * 2)
+        if _is_port_available(bind_host, candidate):
+            return candidate
+    raise RuntimeError(f"Unable to find available port near {start_port} on host {bind_host}")
+
+
+def _ping_instance(instance_name, timeout=10.0):
+    try:
+        url = zslurm_shared.get_manager_url(instance=instance_name)
+        proxy = zslurm_shared.TimeoutServerProxy(url, timeout=timeout, allow_none=True)
+        proxy.system.listMethods()
+        return True
+    except Exception:
+        return False
+
+
+def _cleanup_unreachable_instances():
+    names = zslurm_shared.get_instance_names()
+    now = time.time()
+    for name in list(names):
+        if _ping_instance(name):
+            continue
+        try:
+            zslurm_shared.remove_instance(name)
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+
+
+def _ensure_unique_instance(address):
+    #ensure instance name does not exist yet
+    instance_name = f'zslurm_{address}'
+    pos = 0
+    active = zslurm_shared.get_instance_names()
+    while instance_name in active:
+        pos += 1
+        instance_name = f"zslurm_{address}_{pos}"
+        
+    base_port = zslurm_shared.port
+
+    free_port = _find_available_port(address, base_port)
+    inst_cfg = zslurm_shared.set_instance_config(instance_name, {
+        "bind_host": address,
+        "advertise_host": address,
+        "base_port": free_port,
+    })
+
+    return instance_name
+
+
+def main(scr, *args, **kwds):
+    _cleanup_unreachable_instances()
+    address = zslurm_shared.get_hostname()    
+    instance_name =  _ensure_unique_instance(address)
+    config = zslurm_shared.get_config(instance=instance_name)
+
+
+
+    status.instance_name = instance_name
+    status.config = config
+
+    def _remove_own_instance():
+        try:
+            zslurm_shared.remove_instance(instance_name)
+        except Exception as ex:
+            try:
+                sys.stderr.write(f"Failed to remove instance file for '{instance_name}' on exit: {ex}\n")
+                sys.stderr.write(traceback.format_exc())
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    try:
+        atexit.register(_remove_own_instance)
+    except Exception as ex:
+        try:
+            sys.stderr.write(f"Failed to register exit cleanup: {ex}\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     status.set_address(address, int(config["port"]))
     current_date = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
-    status.reports_file = open(config["reports_file_prefix"] + f'-{current_date}.tsv', "w")
+    status.reports_file = open(config.get("reports_file_prefix", "report") + f'-{current_date}.tsv', "w")
     fieldnames = [
         "jobname",
         "comment",
@@ -2401,10 +3783,57 @@ def main(scr, *args, **kwds):
     status.reports_file.write("\t".join(fieldnames) + "\n")
     status.reports_file.flush()
 
+    # Open node usage report file and write header
+    try:
+        if bool(config.get("node_reports_enable", True)):
+            status.node_reports_file = open(config.get("node_reports_file_prefix",'node_usage') + f'-{current_date}.tsv', "w")
+            node_fields = [
+                "ts_iso",
+                "engine_id",
+                "cluster_id",
+                "partition",
+                "status",
+                "managed",
+                "stopping",
+                "cores",
+                "totmem_mb",
+                "cpu_pct",
+                "mem_pct",
+                "load",
+                "sys_cpu_busy_pct",
+                "sys_iowait_pct",
+                "res_cores_reserved",
+                "res_mem_reserved_mb",
+                "jobs_running",
+                "has_ssd",
+                "ssd_total_gb",
+                "ssd_used_gb",
+                "res_ssd_reserved_gb",                
+                "timeleft_sec",
+                "uptime_sec",
+                "pending_jobs",
+                "pending_cores",
+                "pending_mem_mb",
+            ]
+            status.node_reports_file.write("\t".join(node_fields) + "\n")
+            status.node_reports_file.flush()
+    except Exception as ex:
+        try:
+            import traceback
+            add_log_line(gb, f"Exception opening node usage report file: {ex}", RED)
+            add_log_line(gb, traceback.format_exc(), RED)
+            traceback.print_exc()
+        except Exception:
+            pass
+
     gb.scr = scr
     gb.log_file = open("cluster.log", "w")
 
     build_windows(gb)
+    try:
+        render_control_status(gb, status)
+    except Exception:
+        pass
     t = start_status_display(gb, status)
 
     add_log_line(
@@ -2414,6 +3843,7 @@ def main(scr, *args, **kwds):
         CYAN,
     )
 
+    add_log_line(gb, f"[manager] config {config}", CYAN)
     start_server(int(config["port"]), config["rpcpath"])
 
     # workaround for bug in curses: no resize messages
@@ -2427,6 +3857,10 @@ def main(scr, *args, **kwds):
             c = gb.scr.getch()
             if c == curses.KEY_RESIZE:
                 build_windows(gb)
+                try:
+                    render_control_status(gb, status)
+                except Exception:
+                    pass
             elif c == ord("q"):  # QUIT
                 if engines.check_local_engine() or engines.count_cluster_engines() > 0:
                     ans = enter_command(
@@ -2468,10 +3902,14 @@ def main(scr, *args, **kwds):
                     constraint = ""
                 else:
                     cmd = get_number(gb, "Number of engines (def=1): ", 1)
-                    if not on_snellius:
-                        constraint = enter_command(gb, "Enter feature (default=): ")
+                    if on_snellius:
+                        ans = enter_command(gb, "Reserve SSD scratch node? (Y/n): ")
+                        if ans.lower() in ("", "y", "yes", "1"):
+                            constraint = "scratch-node"
+                        else:
+                            constraint = ""
                     else:
-                        constraint = ""
+                        constraint = enter_command(gb, "Enter feature (default=): ")
                     cores = get_number(
                         gb, "Enter number of cores (default=exclusive): ", 0
                     )
@@ -2540,14 +3978,18 @@ def main(scr, *args, **kwds):
                 if not cmd is None:
                     engines.stop_slurm(gb, cmd)
 
-            elif c == ord("k"):  # KILL IDLE toggle
-                status.kill_idle = not status.kill_idle
+            
+            elif c == ord("a"):  # auto consolidate toggle
+                status.autoconsolidate_enable = not status.autoconsolidate_enable
                 add_log_line(
                     gb,
-                    "Autostop idle engine set to "
-                    + ("ON" if status.kill_idle else "OFF"),
+                    "Auto consolidate set to " + ("ON" if status.autoconsolidate_enable else "OFF"),
                     GREEN,
                 )
+                try:
+                    render_control_status(gb, status)
+                except Exception:
+                    pass
             elif c == ord("l"):  # last in/first out toggle
                 status.lastin_first = not status.lastin_first
                 add_log_line(
@@ -2556,13 +3998,32 @@ def main(scr, *args, **kwds):
                     + ("ON" if status.lastin_first else "OFF"),
                     GREEN,
                 )
+                try:
+                    render_control_status(gb, status)
+                except Exception:
+                    pass
             elif c == ord("m"):  # set context size to search for good fitting jobs
-                cmd = get_number(gb, "Search context size for jobs [n=1]: ", 1)
+                cmd = get_number(gb, "Search context size for jobs [n=500]: ", 500)
                 if not cmd is None:
                     status.prio_fillmem_context = max(int(cmd), 1)
                 add_log_line(gb, "Fill memory context size set to " + str(cmd), GREEN)
+                try:
+                    render_control_status(gb, status)
+                except Exception:
+                    pass
+            elif c == ord("g"):  # autogrow toggle
+                status.autogrow_enable = not status.autogrow_enable
+                add_log_line(
+                    gb,
+                    "Autogrow set to " + ("ON" if status.autogrow_enable else "OFF"),
+                    GREEN,
+                )
+                try:
+                    render_control_status(gb, status)
+                except Exception:
+                    pass
             elif c == ord("o"):
-                cmd = enter_command(gb, "Enter name to toggle, or nr (pos or neg):")
+                cmd = enter_command(gb, "Enter name or [archive|compute] +/-nr:")
                 r = engines.toggle_phasing_out(cmd)
                 add_log_line(gb, r)
 

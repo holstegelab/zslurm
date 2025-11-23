@@ -177,3 +177,70 @@ options:
 
 Example: zsqueue  | cut -f1 | xargs zscancel
 
+
+Node Usage Viewer
+-----------------
+
+Generates an interactive HTML report (Chart.js) of cluster fill rates over time from node usage logs written by `zslurm`.
+
+- **Script**: `node_usage_viewer.py`
+- **Inputs**: `node_usage-*.tsv` files produced by `zslurm`
+- **Output**: An HTML file you can open locally in your browser (no server needed)
+
+Usage
+-----
+
+```
+python3 node_usage_viewer.py \
+  -i 'node_usage-*.tsv' \
+  -o node_usage_report.html \
+  --bin-sec 60
+```
+
+- **`-i/--input`**: Glob(s) for TSV inputs. Repeatable.
+- **`-o/--output`**: HTML output path (default: `node_usage_report.html`).
+- **`--bin-sec`**: Time bin size in seconds (default: 60).
+- **`--include-partition`**: Only include specific partitions. Repeat per partition.
+- **`--include-unmanaged`**: Include unmanaged engines.
+- **`--include-stopping`**: Include engines with `stopping==1`.
+- **`--include-phasing-out`**: Include engines with status `PHASING_OUT`.
+
+Examples
+--------
+
+- **All logs in current directory**:
+```
+python3 node_usage_viewer.py -i 'node_usage-*.tsv' -o viewer.html
+```
+
+- **Specific days / multiple globs**:
+```
+python3 node_usage_viewer.py \
+  -i 'node_usage-2025-09-16_*.tsv' \
+  -i 'node_usage-2025-09-18_*.tsv' \
+  -o viewer_sep16_18.html
+```
+
+- **Only the `compute` partition**:
+```
+python3 node_usage_viewer.py -i 'node_usage-*.tsv' --include-partition compute
+```
+
+Where logs are written
+----------------------
+
+- **ZSlurm node usage logs**: Written by `zslurm` to files named `node_usage-YYYY-MM-DD_HH-MM.tsv` in the working directory. Names are controlled by:
+  - `node_reports_enable` (default: `True`)
+  - `node_reports_file_prefix` (default: `node_usage`)
+  - `node_reports_include_partitions` (default: `["compute"]`)
+
+  See `zslurm_shared.py` for defaults. The header includes fields such as `ts_iso`, `partition`, `cores`, `totmem_mb`, `res_cores_reserved`, `res_mem_reserved_mb`, etc.
+
+- **ZSlurm logs**: General logs are written to `cluster.log`.
+
+Notes
+-----
+
+- If no input files match, the viewer exits with an error and prints a traceback to stderr.
+- The HTML viewer shows lines for `ALL` and each partition present in the inputs.
+- Fill rate is computed as `reserved / total * 100` per bin for cores and memory.

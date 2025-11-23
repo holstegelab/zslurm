@@ -1,0 +1,154 @@
+#!/usr/bin/env python
+import argparse
+import json
+import traceback
+import socket
+try:
+    import http.client as httplib
+except Exception:
+    import httplib
+
+import zslurm_shared
+
+
+def _get_instances(args):
+    if args.instance:
+        return args.instance
+    try:
+        return zslurm_shared.get_instance_names()
+    except Exception:
+        traceback.print_exc()
+        print("Failed to enumerate instances; falling back to default instance.")
+        return [zslurm_shared.DEFAULT_INSTANCE_NAME]
+
+
+def _fetch_stats(instance):
+    url = None
+    try:
+        url = zslurm_shared.get_job_url(instance=instance)
+        proxy = zslurm_shared.TimeoutServerProxy(url, allow_none=True)
+        return proxy.queue_stats()
+    except (socket.error, httplib.HTTPException) as ex:
+        if url is None:
+            url = "<unresolved>"
+        print(f"{instance}: queue stats request failed, could not connect to ZSlurm manager at {url}: {ex}")
+        traceback.print_exc()
+    except KeyError:
+        print(f"Instance '{instance}' not defined in configuration.")
+    except Exception as ex:
+        print(f"{instance}: unexpected error while fetching stats: {ex}")
+        traceback.print_exc()
+    return None
+
+
+def _fmt_int(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+
+def _render_instance(instance, stats, args):
+    if stats is None:
+        return
+    total = stats.get("total", {})
+    by_part = stats.get("by_partition", {})
+    engines = stats.get("engines", {})
+    states = stats.get("states", {})
+
+    parts = sorted(by_part.keys())
+    if args.partition:
+        parts = [p for p in parts if p == args.partition]
+
+    print(f"=== Instance: {instance} ===")
+    print("== Queue totals ==")
+    run = total.get("running", {})
+    pend = total.get("pending", {})
+    print("Running:  jobs=%d  cores=%d  mem=%.1f GiB" % (
+        _fmt_int(run.get("jobs")),
+        _fmt_int(run.get("cores")),
+        _fmt_int(run.get("mem_mb")) / 1024.0,
+    ))
+    print("Pending:  jobs=%d  cores=%d  mem=%.1f GiB" % (
+        _fmt_int(pend.get("jobs")),
+        _fmt_int(pend.get("cores")),
+        _fmt_int(pend.get("mem_mb")) / 1024.0,
+    ))
+    print()
+
+    erp = engines.get("running_by_partition", {}) or {}
+    eqp = engines.get("queued_by_partition", {}) or {}
+    er_agg = {'compute': 0, 'archive': 0}
+    eq_agg = {'compute': 0, 'archive': 0}
+    for k, v in erp.items():
+        mp = 'archive' if str(k) == 'staging' else 'compute'
+        try:
+            val = int(v) if isinstance(v, (int, float)) else int(str(v))
+        except Exception:
+            traceback.print_exc()
+            val = 0
+        er_agg[mp] += val
+    for k, v in eqp.items():
+        mp = 'archive' if str(k) == 'staging' else 'compute'
+        try:
+            val = int(v) if isinstance(v, (int, float)) else int(str(v))
+        except Exception:
+            traceback.print_exc()
+            val = 0
+        eq_agg[mp] += val
+
+    print("== By partition ==")
+    if not parts:
+        print("(no partitions)")
+    for p in parts:
+        ps = by_part.get(p, {})
+        pr = ps.get("running", {})
+        pp = ps.get("pending", {})
+        rq = int(er_agg.get(p, 0))
+        qq = int(eq_agg.get(p, 0))
+        print("[%s] running: jobs=%d cores=%d mem=%.1f GiB | pending: jobs=%d cores=%d mem=%.1f GiB | engines: running=%d queued=%d" % (
+            p,
+            _fmt_int(pr.get("jobs")), _fmt_int(pr.get("cores")), _fmt_int(pr.get("mem_mb")) / 1024.0,
+            _fmt_int(pp.get("jobs")), _fmt_int(pp.get("cores")), _fmt_int(pp.get("mem_mb")) / 1024.0,
+            rq, qq,
+        ))
+
+    print()
+    print("== States ==")
+    if not states:
+        print("(no states reported)")
+    for st in sorted(states.keys()):
+        print("%s: %d" % (st, int(states.get(st, 0))))
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="zsqueue_stats", description="Show aggregated ZSlurm queue stats (running/pending cores and memory)")
+    ap.add_argument("--json", dest="as_json", action="store_true", help="Output JSON")
+    ap.add_argument("--partition", default=None, help="Filter to a single partition (e.g., genoa, rome, fat_genoa)")
+    ap.add_argument("--instance", action="append", metavar="NAME", help="Filter to specific instance(s)")
+    args = ap.parse_args()
+
+    instances = _get_instances(args)
+    collected = {}
+    for instance in instances:
+        stats = _fetch_stats(instance)
+        if stats is not None:
+            collected[instance] = stats
+
+    if not collected:
+        return 2
+
+    if args.as_json:
+        print(json.dumps(collected, indent=2, sort_keys=True))
+        return 0
+
+    for instance in instances:
+        stats = collected.get(instance)
+        _render_instance(instance, stats, args)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

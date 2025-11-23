@@ -7,10 +7,11 @@ except:
     import httplib
 import argparse
 import sys
-s = zslurm_shared.TimeoutServerProxy(zslurm_shared.get_job_url(), allow_none = True)
+import traceback
 
 parser = argparse.ArgumentParser(description='Cancel ZSlurm job')
 parser.add_argument('--requeue', action='store_true', help='Requeue after cancel. Will skip non-running jobs.')
+parser.add_argument('--instance', action='append', metavar='NAME', help='Cancel jobs only on specific instance (can be given multiple times).')
 parser.add_argument('job_id', nargs='*')
 args = parser.parse_args()
 
@@ -19,8 +20,43 @@ if not args.job_id:
 else:
     job_ids = args.job_id
 
-try:
-    for job_id in job_ids: 
-        s.cancel_job(job_id.strip(), args.requeue)
-except (socket.error, httplib.HTTPException) as serror:
-    print('Job canceling failed, could not connect to ZSlurm manager on ' + zslurm_shared.get_job_url())
+def _get_instances_from_args():
+    if args.instance:
+        return args.instance
+    try:
+        return zslurm_shared.get_instance_names()
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.write("Failed to enumerate instances; falling back to default instance.\n")
+        return [zslurm_shared.DEFAULT_INSTANCE_NAME]
+
+
+def _cancel_on_instance(instance, job_ids):
+    url = None
+    try:
+        url = zslurm_shared.get_job_url(instance=instance)
+        proxy = zslurm_shared.TimeoutServerProxy(url, allow_none=True)
+        for job_id in job_ids:
+            proxy.cancel_job(job_id.strip(), args.requeue)
+        return True
+    except (socket.error, httplib.HTTPException) as ex:
+        if url is None:
+            url = "<unresolved>"
+        sys.stderr.write(f"{instance}: cancel request failed, could not connect to ZSlurm manager at {url}: {ex}\n")
+        traceback.print_exc()
+    except KeyError:
+        sys.stderr.write(f"Instance '{instance}' not defined in configuration.\n")
+    except Exception as ex:
+        sys.stderr.write(f"{instance}: unexpected error while cancelling jobs: {ex}\n")
+        traceback.print_exc()
+    return False
+
+
+instances = _get_instances_from_args()
+overall_success = True
+for instance in instances:
+    ok = _cancel_on_instance(instance, job_ids)
+    overall_success = overall_success and ok
+
+if not overall_success:
+    sys.exit(1)

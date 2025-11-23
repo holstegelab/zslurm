@@ -8,7 +8,7 @@ import os.path
 setup(
     name="ZSlurm",
     version="0.1",
-    scripts = ['zsqueue', 'zsbatch', 'zscancel','zslurm','zsnodes', 'zslurm_chief','slurm_to_zslurm'],
+    scripts = ['zsqueue', 'zsbatch', 'zscancel','zslurm','zsnodes', 'zslurm_chief','slurm_to_zslurm','zsqueue_stats','zsoccupancy'],
      install_requires=['numpy>=1.4.1','psutil','dnspython','ipyparallel', 'tabulate'],
      py_modules=['zslurm_shared','zsb'],
      author = "M. Hulsman",

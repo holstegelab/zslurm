@@ -7,8 +7,11 @@ import psutil
 import shutil
 import random
 import threading
+import traceback
+import getpass
 import zslurm_shared
 import socket
+
 try:
     import http.client as httplib
 except:
@@ -46,7 +49,7 @@ REGISTRATION_SLEEP_RANDOM = 180
 
 address = zslurm_shared.address
 config = zslurm_shared.get_config()
-port = int(config['port'])
+port = None
 
 
 cpu = psutil.cpu_count()
@@ -55,13 +58,18 @@ cluster_managed = True
 keep_logfiles = False
 mem = None
 
+ARCHIVE_MOUNT_PATH = '/archive'
 
-opts, args = getopt.getopt(sys.argv[1:],"a:p:c:m:t:u",["address=","port=","cpu=","mem=","partition=","unmanaged"])
+
+opts, args = getopt.getopt(sys.argv[1:],"a:p:c:m:t:uk",["address=","port=","cpu=","mem=","partition=","unmanaged","keep"])
 for o, a in opts:
     if o in ('-a', '--address'):
         address = a
     elif o in ('-p', '--port'):
-        port = a
+        try:
+            port = int(a)
+        except Exception:
+            port = None
     elif o in ('-c', '--cpu'):
         cpu = int(a)
     elif o in ('-m', '--mem'):
@@ -72,6 +80,24 @@ for o, a in opts:
         cluster_managed=False
     elif o in ('-k', '--keep'):
         keep_logfiles = True
+
+
+def ensure_archive_mount_if_needed(partition_name):
+    if str(partition_name).strip().lower() != 'archive':
+        return True
+
+    mount_path = ARCHIVE_MOUNT_PATH
+
+    #make sure it is mounted
+    if os.path.isdir(mount_path):
+        try:
+            os.listdir(mount_path)
+            return True
+        except Exception:
+            pass
+    return False
+
+
 myip = zslurm_shared.get_hostname()
 myid = myip #for now
 
@@ -82,9 +108,148 @@ myid = myip #for now
 e_ncpu = float(min(psutil.cpu_count(), cpu))
 
 
+
 def get_memory_avl():
     memory_mb = (psutil.virtual_memory().total / (1024.0 ** 2))
-    return memory_mb * (e_ncpu / float(psutil.cpu_count()))
+    if config.get('mem_scale_with_cpu', False):
+        return memory_mb * (e_ncpu / float(psutil.cpu_count()))
+    return memory_mb
+
+
+CGROUP_MEM_LIMIT_FILE = None
+CGROUP_MEM_CURRENT_FILE = None
+CGROUP_V2 = False
+
+def detect_cgroup_memory_files():
+    global CGROUP_MEM_LIMIT_FILE, CGROUP_MEM_CURRENT_FILE, CGROUP_V2
+    CGROUP_MEM_LIMIT_FILE = None
+    CGROUP_MEM_CURRENT_FILE = None
+    CGROUP_V2 = False
+    try:
+        with open('/proc/self/cgroup','r') as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+    except Exception:
+        return False
+    v2_path = None
+    v1_mem_path = None
+    for line in lines:
+        parts = line.split(':')
+        if len(parts) == 3 and parts[0] == '0' and parts[1] == '':
+            v2_path = parts[2]
+            break
+        if len(parts) == 3 and 'memory' in parts[1].split(','):
+            v1_mem_path = parts[2]
+    if v2_path is not None:
+        base = '/sys/fs/cgroup' + (v2_path if v2_path != '/' else '')
+        limit = os.path.join(base, 'memory.max')
+        current = os.path.join(base, 'memory.current')
+        if os.path.exists(limit) and os.path.exists(current):
+            CGROUP_MEM_LIMIT_FILE = limit
+            CGROUP_MEM_CURRENT_FILE = current
+            CGROUP_V2 = True
+            return True
+        return False
+    if v1_mem_path is not None:
+        base = '/sys/fs/cgroup/memory' + (v1_mem_path if v1_mem_path != '/' else '')
+        limit = os.path.join(base, 'memory.limit_in_bytes')
+        current = os.path.join(base, 'memory.usage_in_bytes')
+        if os.path.exists(limit) and os.path.exists(current):
+            CGROUP_MEM_LIMIT_FILE = limit
+            CGROUP_MEM_CURRENT_FILE = current
+            CGROUP_V2 = False
+            return True
+        return False
+    return False
+
+def get_cgroup_remaining_mb():
+    try:
+        if CGROUP_MEM_LIMIT_FILE is None or CGROUP_MEM_CURRENT_FILE is None:
+            return None
+        with open(CGROUP_MEM_LIMIT_FILE,'r') as f:
+            limit_s = f.read().strip()
+        if CGROUP_V2 and limit_s == 'max':
+            return None
+        try:
+            limit = float(limit_s)
+        except ValueError:
+            return None
+        if limit > 1e15:
+            return None
+        with open(CGROUP_MEM_CURRENT_FILE,'r') as f:
+            current = float(f.read().strip())
+        rem = max(0.0, (limit - current) / (1024.0**2))
+        return rem
+    except Exception as ex:
+        sys.stderr.write('cgroup memory read failed: ' + str(ex) + '\n')
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.flush()
+        return None
+
+
+
+
+def detect_scratch_path(cluster_jobid):
+    """Return the scratch directory for this job if it exists."""
+    try:
+        user = getpass.getuser()
+    except Exception as ex:
+        sys.stderr.write(f"{xtime()} - Failed to detect current user for scratch path: {ex}\n")
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.flush()
+        return None
+
+    if not user:
+        return None
+
+    candidates = []
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if job_id:
+        candidates.append(str(job_id))
+    array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
+    if array_job_id:
+        candidates.append(str(array_job_id))
+        array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+        if array_task_id:
+            candidates.append(f"{array_job_id}_{array_task_id}")
+
+    if cluster_jobid:
+        cid = str(cluster_jobid)
+        if cid:
+            candidates.append(cid)
+            if "_" in cid:
+                candidates.append(cid.split("_", 1)[0])
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        path = f"/scratch-node/{user}.{candidate}"
+        try:
+            if os.path.isdir(path):
+                return path
+        except Exception as ex:
+            sys.stderr.write(f"{xtime()} - Scratch path probe failed for {path}: {ex}\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+
+    return None
+
+
+def read_scratch_usage(path):
+    """Return (total_gb, used_gb) for the scratch path."""
+    if not path:
+        return 0.0, 0.0
+    try:
+        usage = shutil.disk_usage(path)
+        total_gb = max(0.0, usage.total / (1024.0 ** 3))
+        used_gb = max(0.0, (usage.total - usage.free) / (1024.0 ** 3))
+        return total_gb, used_gb
+    except Exception as ex:
+        sys.stderr.write(f"{xtime()} - SSD usage read failed for {path}: {ex}\n")
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.flush()
+        return 0.0, 0.0
 
 
 memory_mb_available = get_memory_avl()
@@ -93,9 +258,18 @@ memory_core_mb = memory_mb_available / e_ncpu
 if mem is not None:
     memory_core_mb = min(mem / float(e_ncpu), memory_core_mb)
 
-e_memtot = memory_core_mb * e_ncpu - 100.0 #reserve some space for self
-e_memtot_buffer = min(0.95 * memory_mb_available, 0.85 * e_memtot) #keep some reserve room for system data, caching, etc.
+e_memtot = max(0.0, memory_core_mb * e_ncpu - float(config.get('mem_static_reserve_mb', 100.0)))
+headroom_fraction = float(config.get('mem_headroom_fraction', 0.08))
+cap_fraction = float(config.get('mem_cap_fraction_of_total', 0.99))
+e_memtot_buffer = min(cap_fraction * memory_mb_available, (1.0 - headroom_fraction) * e_memtot)
 print(f'Buffer space {e_memtot} - {e_memtot_buffer}')
+if bool(config.get('mem_use_cgroup_available', True)):
+    try:
+        detect_cgroup_memory_files()
+    except Exception as ex:
+        sys.stderr.write('cgroup detection failed: ' + str(ex) + '\n')
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.flush()
 
 
 if 'SLURM_ARRAY_JOB_ID' in os.environ:
@@ -120,17 +294,89 @@ else:
 if not cluster_managed:
     clusterid = ''
 
+ssd_refresh_interval = max(1.0, float(config.get('ssd_usage_refresh_interval_sec', 60.0)))
+scratch_path = detect_scratch_path(clusterid)
+ssd_total_gb = 0.0
+ssd_used_gb = 0.0
+ssd_last_refresh = 0.0
+
+if scratch_path and os.path.isdir(scratch_path):
+    total, used = read_scratch_usage(scratch_path)
+    ssd_total_gb = total
+    ssd_used_gb = used
+    ssd_last_refresh = time.time()
+
 
 #self register
-uri=zslurm_shared.get_manager_url(address)
+def _resolve_instance_for_chief(addr, port_override):
+    try:
+        # Prefer explicit env var if set
+        env_inst = os.environ.get("ZSLURM_INSTANCE")
+        resolved = zslurm_shared.resolve_instance_name(env_inst)
+        if resolved:
+            return resolved
+        # Try to match by address+port if provided
+        names = zslurm_shared.get_instance_names()
+        for nm in names:
+            inst = zslurm_shared.get_instance_config(nm) or {}
+            try:
+                base_port = int(inst.get("base_port", -1))
+            except Exception:
+                base_port = -1
+            if port_override is not None and base_port != int(port_override):
+                continue
+            ih = inst.get("advertise_host") or inst.get("bind_host")
+            if not ih:
+                return nm if port_override is not None else None
+            if not addr:
+                return nm
+            # Accept if host matches in common forms
+            if str(addr) in (str(ih), zslurm_shared.short_name(str(ih)), "127.0.0.1", "localhost"):
+                return nm
+        # Single instance fallback
+        if isinstance(names, list) and len(names) == 1:
+            return names[0]
+    except Exception:
+        pass
+    return None
+
+inst_name = _resolve_instance_for_chief(address, port)
+inst_cfg = zslurm_shared.get_instance_config(inst_name) if inst_name else None
+if not inst_cfg:
+    sys.stderr.write("zslurm_chief: failed to resolve ZSlurm instance; set ZSLURM_INSTANCE or ensure a single instance exists, or pass -a/-p matching an instance.\n")
+    sys.stderr.flush()
+    sys.exit(2)
+
+host = address or inst_cfg.get("advertise_host") or inst_cfg.get("bind_host") or "127.0.0.1"
+base_port = int(port) if port is not None else int(inst_cfg.get("base_port", zslurm_shared.port))
+rpcpath = inst_cfg.get("rpcpath")
+uri = f"http://{host}:{base_port}/{rpcpath}"
 print(" Preparing to register on "+ uri)
 s = zslurm_shared.TimeoutServerProxy(uri, timeout = REQUEST_TIMEOUT, allow_none = True)
+
+
+
+#check if hte node has the archive mount
+failed_node = not ensure_archive_mount_if_needed(partition)
+
 
 myid = None
 attempt = REGISTRATION_ATTEMPTS
 while attempt > 0 :
     try:
-        myid = s.register(myip, e_ncpu, e_memtot_buffer, partition, clusterid)
+        if failed_node:
+            s.failed_node(myip, partition, clusterid)
+            sys.exit()
+        else:
+            myid = s.register(
+                myip,
+                e_ncpu,
+                e_memtot_buffer,
+                partition,
+                clusterid,
+                ssd_total_gb,
+                ssd_used_gb
+            )
     except (socket.error, httplib.HTTPException) as serror :
         attempt -= 1
         sleep_time = random.randint(REGISTRATION_SLEEP, REGISTRATION_SLEEP + REGISTRATION_SLEEP_RANDOM)
@@ -209,6 +455,12 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     resources = None
     lastcpureport = None
     spend_time = 0
+    last_io_total = None
+    iodeltas = []
+    monitor_initial_delay = float(config.get('monitor_initial_delay_sec', 0.0))
+    stuck_cpu_thr = float(config.get('stuck_cpu_core_threshold', 0.05))
+    stuck_io_thr = float(config.get('stuck_io_activity_bytes_threshold', 4096.0))
+    stuck_enabled = bool(config.get('stuck_detection_enable', True))
 
     pid = process.pid
     try:
@@ -226,7 +478,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
         try:
             res = os.wait4(process.pid,os.WNOHANG)
             if res[0] > 0:
-                retcode = res[1]
+                retcode = os.waitstatus_to_exitcode(res[1])
                 resources = res[2]
         except OSError:
             retcode = process.poll()
@@ -234,7 +486,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
         
         cur_time = time.time()
         
-        if (cur_time - report_time) > 30.0:
+        if (cur_time - report_time) > float(config.get('monitor_interval_sec', 10.0)):
             report_time = cur_time
             prevspend_time = spend_time
             if retcode is None and not ps is None:
@@ -242,6 +494,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
                     with ps.oneshot():
                         c = ps.cpu_times()
                         nt = ps.num_threads()
+                        #children_user and children_system record the cpu time of FINISHED children processes
                         lastcpureport={'user':c.user,'system':c.system,'children_user':c.children_user,'children_system':c.children_system, 'iowait':c.iowait, 'nthreads':nt}
 
                         m = ps.memory_full_info()
@@ -269,43 +522,53 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
                                 continue #process did probably end
                             except psutil.NoSuchProcess:
                                 continue
+                    io_total = float(sum([float(v.get('read_bytes',0.0)) + float(v.get('write_bytes',0.0)) for v in iocache.values()]))
+                    if last_io_total is None:
+                        io_delta = 0.0
+                    else:
+                        io_delta = max(0.0, io_total - last_io_total)
+                    last_io_total = io_total
+                    iodeltas.append(io_delta)
                     memcache.append(r)
 
+                    # Total CPU time across the tree without double counting
                     spend_time = (lastcpureport['user'] + lastcpureport['system'] + lastcpureport['children_user'] + lastcpureport['children_system']) 
-                    cpu_percentage = ((spend_time - prevspend_time) / (report_time - last_report_time))
+                    if prevspend_time <= 0:
+                        cpu_percentage = spend_time / max(report_time - start_time, 1e-3)
+                    else:
+                        cpu_percentage = ((spend_time - prevspend_time) / (report_time - last_report_time))
+                    # Uncapped core-equivalent usage (non-negative)
+
+                    cpu_percentage = max(0.0, float(cpu_percentage))                
                     lastcpureport['cpu_perc'] = cpu_percentage
                     cpucache.append(lastcpureport)
 
                     last_report_time = report_time
-                    if prevspend_time > 0:
-                        status.lock.acquire()
-                        status.current_cpu_usage[jobid] = cpu_percentage
-                        status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
-                        status.lock.release()
+                    status.lock.acquire()
+                    status.current_cpu_usage[jobid] = cpu_percentage
+                    status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
+                    status.lock.release()
 
-                    if lastcpureport['cpu_perc'] < 0.05:
-                        if partition == 'compute' and len(cpucache) > STOP_THRESHOLD and all([e['cpu_perc'] < 0.05 for e in cpucache[::-1][:STOP_THRESHOLD]]):
-                            print('%s - [%s] Job stuck, terminating.' % (xtime(), myid))
-                            #job seems to be stuck, terminate.
-                            procs = []
-                            try:
-                                for proc in ps.children(recursive=True):
-                                    proc.terminate()
-                                    procs.append(proc)
-                                ps.terminate()
-                                procs.append(ps)
-                            except psutil.NoSuchProces:
-                                pass
-                            time.sleep(10) #allow jobs some time to terminate normally
-
-                            #kill any remaining jobs
-                            for proc in procs:
+                    if stuck_enabled and (report_time - start_time) >= monitor_initial_delay:
+                        if partition == 'compute' and len(cpucache) > STOP_THRESHOLD and len(iodeltas) > STOP_THRESHOLD:
+                            if all([e['cpu_perc'] < stuck_cpu_thr for e in cpucache[::-1][:STOP_THRESHOLD]]) and all([d <= stuck_io_thr for d in iodeltas[::-1][:STOP_THRESHOLD]]):
+                                print('%s - [%s] Job stuck, terminating job %s.' % (xtime(), myid, str(jobid)))
+                                procs = []
                                 try:
-                                    proc.kill()
+                                    for proc in ps.children(recursive=True):
+                                        proc.terminate()
+                                        procs.append(proc)
+                                    ps.terminate()
+                                    procs.append(ps)
                                 except psutil.NoSuchProcess:
                                     pass
-
-                            retcode=RC_STUCK
+                                time.sleep(10)
+                                for proc in procs:
+                                    try:
+                                        proc.kill()
+                                    except psutil.NoSuchProcess:
+                                        pass
+                                retcode=RC_STUCK
 
 
 
@@ -380,7 +643,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
         try:
             with open(logfile_path, 'r') as logfile:
                 log_insides = logfile.read()
-            if 'error' not in log_insides.lower():
+            if 'error in file' not in log_insides.lower() or retcode == 0:
                 sys.stderr.write(f'Deleting log file {logfile_path} as there are no errors.\n')
                 sys.stderr.flush()
                 os.remove(logfile_path)
@@ -403,6 +666,8 @@ last_seen = time.time()
 mode = zslurm_shared.RUNNING
 idle_start = 0
 event_timer = threading.Event()
+last_cpu_times = psutil.cpu_times()
+last_cpu_total = sum(last_cpu_times)
 
 try :
     #lengine_monitor = psutil.Process(lengine.pid)
@@ -431,18 +696,25 @@ try :
        
        
         #check memory available (reserved, actual use)
-        mb_memory_available = min(e_memtot_buffer - sum(status.current_mem_usage.values(),0.0),  0.95 * get_memory_avl())
+        ps_avail_mb = (psutil.virtual_memory().available / (1024.0 ** 2))
+        dyn_available_mb = cap_fraction * ps_avail_mb
+        if bool(config.get('mem_use_cgroup_available', True)) and not (CGROUP_MEM_LIMIT_FILE is None or CGROUP_MEM_CURRENT_FILE is None):
+            cgroup_rem_mb = get_cgroup_remaining_mb()
+            if not cgroup_rem_mb is None:
+                dyn_available_mb = cap_fraction * min(ps_avail_mb, cgroup_rem_mb)
+        mb_memory_available = min(e_memtot_buffer - sum(status.current_mem_usage.values(),0.0), dyn_available_mb)
 
         
         status.lock.acquire()  
         #print("%s - CYCLE" % xtime(), str(status.current_cpu), str(status.current_mem), str(mb_memory_available))
-        if mode == zslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0 and mb_memory_available > 1024.0:
+        if mode == zslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0 and mb_memory_available > float(config.get('mem_min_requestable_mb', 256.0)):
             if status.assigned_jobs:
                 jobs = list(status.assigned_jobs.values())
             else:
                 try:
                     #print("%s - REQUEST"%xtime(), myid, str(status.current_cpu), str(status.current_mem), str(mb_memory_available), partition)
-                    jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available), partition)
+                    overcommit = float(config.get('mem_overcommit_fraction', 1.0))
+                    jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available) * overcommit, partition)
                     #print('%s - REQUEST RESULT' % xtime(), len(jobs))
                 except (socket.error, httplib.HTTPException) as serror :
                     print ("%s - REQUEST HTTP Error" % xtime())
@@ -517,18 +789,47 @@ try :
         cpu_usage = (sum(status.current_cpu_usage.values(),0.0) / e_ncpu) * 100.0
         mem_usage = (sum(status.current_mem_usage.values(), 0.0) / e_memtot_buffer) * 100.0
         load = psutil.getloadavg()[0] / float(psutil.cpu_count())
+        # System CPU busy and iowait (percent over this poll interval)
+        cur_cpu_times = psutil.cpu_times()
+        cur_cpu_total = sum(cur_cpu_times)
+        dtotal = max(1e-9, (cur_cpu_total - last_cpu_total))
+        didle = getattr(cur_cpu_times, 'idle', 0.0) - getattr(last_cpu_times, 'idle', 0.0)
+        diowait = getattr(cur_cpu_times, 'iowait', 0.0) - getattr(last_cpu_times, 'iowait', 0.0)
+        sys_cpu_busy = max(0.0, 100.0 * (1.0 - (didle / dtotal)))
+        sys_iowait = max(0.0, 100.0 * (diowait / dtotal))
+        last_cpu_times = cur_cpu_times
+        last_cpu_total = cur_cpu_total
         idle = len(status.running_processes) == 0
         if idle and idle_start == 0:
             idle_start = time.time()
         elif not idle:
             idle_start = 0
         try:
-            sys.stderr.write(f"{xtime()} - POLL; INFO: {myid} {cpu_usage:.2f} {e_memtot:.2f} {e_memtot_buffer:.2f} {get_memory_avl():.2f} {mem_usage:.2f} {load:.2f} {mode} {status.current_cpu_usage} {status.current_mem_usage}\n")
+            sys.stderr.write(f"{xtime()} - POLL; INFO: {myid} {cpu_usage:.2f} {e_memtot:.2f} {e_memtot_buffer:.2f} {get_memory_avl():.2f} {mem_usage:.2f} {load:.2f} {sys_cpu_busy:.2f} {sys_iowait:.2f} {mode} {status.current_cpu_usage} {status.current_mem_usage}\n")
             sys.stderr.flush()
-            if idle_start == 0:
-                commands = s.poll(myid, cpu_usage, mem_usage, load,mode, 0.0, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
-            else:
-                commands = s.poll(myid, cpu_usage, mem_usage, load, mode, time.time() - idle_start, status.current_cpu_usage.copy(), status.current_mem_usage.copy())
+
+            now = time.time()
+            if now - ssd_last_refresh >= ssd_refresh_interval:
+                if not scratch_path or not os.path.isdir(scratch_path):
+                    scratch_path = detect_scratch_path(clusterid)
+                ssd_total_gb, ssd_used_gb = read_scratch_usage(scratch_path)
+                ssd_last_refresh = now
+
+            idle_duration = 0.0 if idle_start == 0 else (now - idle_start)
+            commands = s.poll(
+                myid,
+                cpu_usage,
+                mem_usage,
+                load,
+                mode,
+                idle_duration,
+                status.current_cpu_usage.copy(),
+                status.current_mem_usage.copy(),
+                sys_cpu_busy,
+                sys_iowait,
+                ssd_total_gb,
+                ssd_used_gb,
+            )
             last_seen = time.time()
         except (socket.error, httplib.HTTPException) as serror :
             print('%s - [%s] Caught a socket error for command poll !' % (xtime(), myid))
@@ -560,7 +861,15 @@ try :
             elif (cmd == zslurm_shared.REREGISTER):
                 print(('[%s] Received command to reregister.' % myid))
                 try:
-                    myid = s.register(myip, e_ncpu, e_memtot_buffer, partition, clusterid)
+                    myid = s.register(
+                        myip,
+                        e_ncpu,
+                        e_memtot_buffer,
+                        partition,
+                        clusterid,
+                        ssd_total_gb,
+                        ssd_used_gb
+                    )
                 except (socket.error, httplib.HTTPException) as serror :
                     pass
                 if myid == 'DENIED':

@@ -1,0 +1,565 @@
+#!/usr/bin/env python
+import argparse
+import csv
+import glob
+import json
+import math
+import os
+import sys
+from collections import defaultdict, OrderedDict
+from statistics import mean, median
+
+try:
+    import matplotlib
+    import os as _os
+    if _os.environ.get("DISPLAY", "") == "" and _os.environ.get("MPLBACKEND", "") == "":
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+
+def _to_float(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    v = str(v).strip()
+    if v == "" or v.lower() == "nan":
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _to_int(v):
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    try:
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def _percentile_columns(prefix):
+    return [
+        f"{prefix}_0",
+        f"{prefix}_5",
+        f"{prefix}_25",
+        f"{prefix}_50",
+        f"{prefix}_75",
+        f"{prefix}_95",
+        f"{prefix}_100",
+    ]
+
+
+class Agg:
+    def __init__(self):
+        self.count = 0
+        self.fail = 0
+
+        self.cores_reserved = []
+        self.mem_reserved_mb = []
+
+        self.avg_cpu_percentage = []
+
+        self.rss_med = []
+        self.rss_max = []
+        self.maxrss = []
+
+        self.iowait = []
+
+        self.read_bytes = 0.0
+        self.write_bytes = 0.0
+        self.read_count = 0.0
+        self.write_count = 0.0
+
+        self.runtime_sum = 0.0
+        self.res_core_seconds = 0.0
+        self.used_core_seconds = 0.0
+
+    def add(self, row):
+        self.count += 1
+        rc = _to_int(row.get("retcode"))
+        if rc is not None and rc != 0:
+            self.fail += 1
+
+        v = _to_float(row.get("cores_reserved"))
+        if v is not None:
+            self.cores_reserved.append(v)
+        v = _to_float(row.get("mem_reserved_mb"))
+        if v is not None:
+            self.mem_reserved_mb.append(v)
+
+        v = _to_float(row.get("avg_cpu_percentage"))
+        if v is not None:
+            self.avg_cpu_percentage.append(v)
+
+        v = _to_float(row.get("rss_50"))
+        if v is not None:
+            self.rss_med.append(v)
+        v = _to_float(row.get("rss_100"))
+        if v is not None:
+            self.rss_max.append(v)
+        v = _to_float(row.get("maxrss"))
+        if v is not None:
+            self.maxrss.append(v)
+
+        v = _to_float(row.get("iowait"))
+        if v is not None:
+            self.iowait.append(v)
+
+        v = _to_float(row.get("read_bytes"))
+        if v is not None:
+            self.read_bytes += v
+        v = _to_float(row.get("write_bytes"))
+        if v is not None:
+            self.write_bytes += v
+        v = _to_float(row.get("read_count"))
+        if v is not None:
+            self.read_count += v
+        v = _to_float(row.get("write_count"))
+        if v is not None:
+            self.write_count += v
+
+        v = _to_float(row.get("runtime"))
+        if v is not None and v > 0:
+            self.runtime_sum += v
+            cr = _to_float(row.get("cores_reserved"))
+            if cr is not None:
+                self.res_core_seconds += (cr * v)
+            acpu = _to_float(row.get("avg_cpu_percentage"))
+            if acpu is not None:
+                self.used_core_seconds += (acpu * v)
+
+    def _safe_mean(self, arr):
+        return float(mean(arr)) if arr else None
+
+    def _safe_median(self, arr):
+        return float(median(arr)) if arr else None
+
+    def _safe_max(self, arr):
+        return float(max(arr)) if arr else None
+
+    def finalize(self):
+        # Prefer per-job maxrss if available; otherwise fall back to rss_100
+        rss_max_list = self.maxrss if self.maxrss else self.rss_max
+        rss_med_list = self.rss_med
+
+        # IO/sec
+        rsec = (self.read_bytes / self.runtime_sum) if self.runtime_sum > 0 else None
+        wsec = (self.write_bytes / self.runtime_sum) if self.runtime_sum > 0 else None
+
+        res_ch = self.res_core_seconds / 3600.0 if self.res_core_seconds > 0 else 0.0
+        used_ch = self.used_core_seconds / 3600.0 if self.used_core_seconds > 0 else 0.0
+
+        return {
+            "count": self.count,
+            "success": (self.count - self.fail),
+            "error_rate": (float(self.fail) / float(self.count)) if self.count > 0 else None,
+
+            "cores_reserved_mean": self._safe_mean(self.cores_reserved),
+            "cores_reserved_median": self._safe_median(self.cores_reserved),
+            "cores_reserved_max": self._safe_max(self.cores_reserved),
+
+            "mem_reserved_mb_mean": self._safe_mean(self.mem_reserved_mb),
+            "mem_reserved_mb_median": self._safe_median(self.mem_reserved_mb),
+            "mem_reserved_mb_max": self._safe_max(self.mem_reserved_mb),
+
+            "avg_cpu_usage_mean": self._safe_mean(self.avg_cpu_percentage),
+            "avg_cpu_usage_median": self._safe_median(self.avg_cpu_percentage),
+            "avg_cpu_usage_max": self._safe_max(self.avg_cpu_percentage),
+
+            "rss_mb_mean": self._safe_mean(rss_med_list),
+            "rss_mb_median": self._safe_median(rss_med_list),
+            "rss_mb_max": self._safe_max(rss_max_list),
+
+            "iowait_mean": self._safe_mean(self.iowait),
+            "iowait_median": self._safe_median(self.iowait),
+            "iowait_max": self._safe_max(self.iowait),
+
+            "read_bytes_sum": self.read_bytes or 0.0,
+            "write_bytes_sum": self.write_bytes or 0.0,
+            "read_ops_sum": self.read_count or 0.0,
+            "write_ops_sum": self.write_count or 0.0,
+            "read_MiB_s": (rsec / (1024.0 * 1024.0)) if rsec is not None else None,
+            "write_MiB_s": (wsec / (1024.0 * 1024.0)) if wsec is not None else None,
+
+            "runtime_sum": self.runtime_sum or 0.0,
+            "reserved_core_hours": res_ch,
+            "used_core_hours": used_ch,
+            "cpu_efficiency": (used_ch / res_ch) if res_ch > 0 else None,
+        }
+
+
+def _normalize_row(header, row_dict):
+    out = {}
+    for k in header:
+        out[k] = row_dict.get(k, "")
+    # Flatten percentile arrays if present as separate columns
+    for prefix in ("uss", "rss", "vms", "cpu_percentage"):
+        for c in _percentile_columns(prefix):
+            if c not in out and c in row_dict:
+                out[c] = row_dict.get(c, "")
+    # Provide rss_50 and rss_100 if percentiles exist
+    if ("rss_50" not in out) and ("rss_50" in row_dict):
+        out["rss_50"] = row_dict.get("rss_50")
+    if ("rss_100" not in out) and ("rss_100" in row_dict):
+        out["rss_100"] = row_dict.get("rss_100")
+    return out
+
+
+def _detect_cwd(row):
+    cwd = row.get("cwd")
+    if cwd:
+        return cwd
+    ofile = row.get("output_file")
+    if ofile:
+        try:
+            return os.path.dirname(ofile) or "."
+        except Exception:
+            return None
+    return None
+
+
+def load_rows(paths):
+    for p in paths:
+        with open(p, "r", newline="") as fh:
+            # Use DictReader to be robust to column order
+            header_line = fh.readline()
+            if not header_line:
+                continue
+            header = [h.strip() for h in header_line.rstrip("\n").split("\t")]
+            # Continue reading rows after header using explicit fieldnames
+            reader = csv.DictReader(fh, fieldnames=header, delimiter="\t")
+            for row in reader:
+                if not row:
+                    continue
+                if len(row) == 1 and list(row.values())[0] == "":
+                    continue
+                yield header, row
+
+
+def aggregate(files, group_fields, include_failed=False):
+    groups = {}
+    for header, row_dict in load_rows(files):
+        row = _normalize_row(header, row_dict)
+        # Enrich derived fields for grouping if needed
+        if "cwd" in group_fields and "cwd" not in row:
+            row["cwd"] = _detect_cwd(row) or ""
+
+        rc = _to_int(row.get("retcode"))
+        if (not include_failed) and rc is not None and rc != 0:
+            continue
+
+        key_vals = []
+        for gf in group_fields:
+            key_vals.append(str(row.get(gf, "")))
+        gkey = tuple(key_vals)
+
+        if gkey not in groups:
+            groups[gkey] = Agg()
+        groups[gkey].add(row)
+
+    return groups
+
+
+def _aggregate_metric_by_label(rows, xfield, metric):
+    acc = defaultdict(float)
+    for r in rows:
+        lab = str(r.get(xfield, ""))
+        v = r.get(metric, None)
+        try:
+            v = float(v)
+        except Exception:
+            v = 0.0
+        if not math.isfinite(v):
+            v = 0.0
+        acc[lab] += v
+    return acc
+
+
+def _prepare_used_reserved(rows, xfield):
+    used = defaultdict(float)
+    res = defaultdict(float)
+    for r in rows:
+        lab = str(r.get(xfield, ""))
+        u = r.get("used_core_hours", 0.0)
+        rs = r.get("reserved_core_hours", 0.0)
+        try:
+            u = float(u)
+        except Exception:
+            u = 0.0
+        try:
+            rs = float(rs)
+        except Exception:
+            rs = 0.0
+        if not math.isfinite(u):
+            u = 0.0
+        if not math.isfinite(rs):
+            rs = 0.0
+        used[lab] += u
+        res[lab] += rs
+    return used, res
+
+
+def _sort_labels(labels, score_map, ascending, limit):
+    scored = [(lab, score_map.get(lab, 0.0)) for lab in labels]
+    scored.sort(key=lambda x: x[1], reverse=not ascending)
+    if limit and limit > 0:
+        scored = scored[:limit]
+    return [lab for lab, _ in scored]
+
+
+def plot_bar_used_reserved(rows, xfield, limit, sort_by, ascending, save):
+    if plt is None:
+        print("matplotlib is not available", file=sys.stderr)
+        sys.exit(3)
+    used, res = _prepare_used_reserved(rows, xfield)
+    labels = list(set(list(used.keys()) + list(res.keys())))
+    if sort_by in ("used_core_hours", "used"):
+        sort_map = used
+    elif sort_by in ("reserved_core_hours", "reserved"):
+        sort_map = res
+    else:
+        sort_map = _aggregate_metric_by_label(rows, xfield, sort_by)
+    labels = _sort_labels(labels, sort_map, ascending, limit)
+    xu = [used.get(l, 0.0) for l in labels]
+    xr = [res.get(l, 0.0) for l in labels]
+    x = list(range(len(labels)))
+    w = 0.4
+    fig, ax = plt.subplots(figsize=(max(8, min(20, len(labels) * 0.6)), 6))
+    ax.bar([i - w / 2 for i in x], xr, width=w, label="reserved core-hours")
+    ax.bar([i + w / 2 for i in x], xu, width=w, label="used core-hours")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_ylabel("core-hours")
+    ax.set_title(f"Used vs Reserved core-hours by {xfield}")
+    ax.legend()
+    fig.tight_layout()
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+def _aggregate_mean_metric_by_label(rows, xfield, metric):
+    sums = defaultdict(float)
+    counts = defaultdict(int)
+    for r in rows:
+        lab = str(r.get(xfield, ""))
+        v = r.get(metric, None)
+        try:
+            v = float(v)
+        except Exception:
+            v = None
+        if v is None or (not math.isfinite(v)):
+            continue
+        sums[lab] += v
+        counts[lab] += 1
+    means = {}
+    for lab, s in sums.items():
+        c = counts.get(lab, 0)
+        if c > 0:
+            means[lab] = s / c
+    return means
+
+
+def _plot_bar_pair_means(rows, xfield, metric1, metric2, label1, label2, title, limit, sort_by, ascending, save):
+    if plt is None:
+        print("matplotlib is not available", file=sys.stderr)
+        sys.exit(3)
+    acc1 = _aggregate_mean_metric_by_label(rows, xfield, metric1)
+    acc2 = _aggregate_mean_metric_by_label(rows, xfield, metric2)
+    labels = list(set(list(acc1.keys()) + list(acc2.keys())))
+    if sort_by == metric2:
+        sort_map = acc2
+    else:
+        sort_map = acc1
+    labels = _sort_labels(labels, sort_map, ascending, limit)
+    y1 = [acc1.get(l, 0.0) for l in labels]
+    y2 = [acc2.get(l, 0.0) for l in labels]
+    x = list(range(len(labels)))
+    w = 0.4
+    fig, ax = plt.subplots(figsize=(max(8, min(20, len(labels) * 0.6)), 6))
+    ax.bar([i - w / 2 for i in x], y1, width=w, label=label1)
+    ax.bar([i + w / 2 for i in x], y2, width=w, label=label2)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_ylabel(metric1.split("_")[0])
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+def plot_bar_reserved_vs_avg_cpu(rows, xfield, limit, sort_by, ascending, save):
+    _plot_bar_pair_means(
+        rows,
+        xfield,
+        "cores_reserved_mean",
+        "avg_cpu_usage_mean",
+        "reserved cores (mean)",
+        "avg cores used (mean)",
+        f"Reserved cores vs avg core usage by {xfield}",
+        limit,
+        sort_by,
+        ascending,
+        save,
+    )
+
+
+def plot_bar_mem_reserved_vs_rss(rows, xfield, limit, sort_by, ascending, save):
+    _plot_bar_pair_means(
+        rows,
+        xfield,
+        "mem_reserved_mb_mean",
+        "rss_mb_mean",
+        "reserved MB (mean)",
+        "rss MB (mean)",
+        f"Reserved memory vs RSS by {xfield}",
+        limit,
+        sort_by,
+        ascending,
+        save,
+    )
+
+
+def plot_bar_metric(rows, xfield, metric, limit, sort_by, ascending, save):
+    if plt is None:
+        print("matplotlib is not available", file=sys.stderr)
+        sys.exit(3)
+    acc = _aggregate_metric_by_label(rows, xfield, metric)
+    labels = list(acc.keys())
+    if sort_by:
+        if sort_by == metric:
+            sort_map = acc
+        else:
+            sort_map = _aggregate_metric_by_label(rows, xfield, sort_by)
+        labels = _sort_labels(labels, sort_map, ascending, limit)
+    else:
+        labels = _sort_labels(labels, acc, ascending, limit)
+    vals = [acc.get(l, 0.0) for l in labels]
+    x = list(range(len(labels)))
+    fig, ax = plt.subplots(figsize=(max(8, min(20, len(labels) * 0.6)), 6))
+    ax.bar(x, vals)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_ylabel(metric)
+    ax.set_title(f"{metric} by {xfield}")
+    fig.tight_layout()
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="zsstats", description="Aggregate ZSlurm reports.tsv files.")
+    ap.add_argument("--files", nargs="*", default=["reports*.tsv"], help="Input glob(s). Default: reports*.tsv")
+    ap.add_argument("--group", default="jobname,cwd", help="Comma-separated group fields. Default: jobname,cwd")
+    ap.add_argument("--json", dest="as_json", action="store_true", help="Output JSON instead of TSV")
+    ap.add_argument("--out", default="-", help="Output file path or '-' for stdout. Default: -")
+    ap.add_argument("--plot-used-vs-reserved", dest="plot_uvr", action="store_true")
+    ap.add_argument("--plot-reserved-vs-avg-core", dest="plot_core", action="store_true")
+    ap.add_argument("--plot-mem-reserved-vs-rss", dest="plot_mem", action="store_true")
+    ap.add_argument("--plot-metric", dest="plot_metric", default=None)
+    ap.add_argument("--xfield", default=None)
+    ap.add_argument("--limit", type=int, default=20)
+    ap.add_argument("--sort-by", dest="sort_by", default="used_core_hours")
+    ap.add_argument("--asc", dest="ascending", action="store_true")
+    ap.add_argument("--save", dest="save", default=None)
+    ap.add_argument("--include-failed", dest="include_failed", action="store_true")
+
+    args = ap.parse_args()
+
+    globs = []
+    for g in args.files:
+        globs.extend(glob.glob(g))
+    files = sorted(set(globs))
+    if not files:
+        print("No input files matched.", file=sys.stderr)
+        sys.exit(2)
+
+    group_fields = [f.strip() for f in args.group.split(",") if f.strip()]
+    if not group_fields:
+        print("No group fields specified.", file=sys.stderr)
+        sys.exit(2)
+
+    groups = aggregate(files, group_fields, include_failed=args.include_failed)
+
+    rows = []
+    for gkey, agg in groups.items():
+        out = OrderedDict()
+        for i, gf in enumerate(group_fields):
+            out[gf] = gkey[i]
+        out.update(agg.finalize())
+        rows.append(out)
+
+    xfield = args.xfield if args.xfield else group_fields[0]
+    if args.plot_uvr:
+        plot_bar_used_reserved(rows, xfield, args.limit, args.sort_by, args.ascending, args.save)
+        return
+    if args.plot_core:
+        plot_bar_reserved_vs_avg_cpu(rows, xfield, args.limit, args.sort_by, args.ascending, args.save)
+        return
+    if args.plot_mem:
+        plot_bar_mem_reserved_vs_rss(rows, xfield, args.limit, args.sort_by, args.ascending, args.save)
+        return
+    if args.plot_metric:
+        plot_bar_metric(rows, xfield, args.plot_metric, args.limit, args.sort_by, args.ascending, args.save)
+        return
+
+    if args.as_json:
+        data = rows
+        s = json.dumps(data, indent=2)
+        if args.out == "-":
+            sys.stdout.write(s + "\n")
+        else:
+            with open(args.out, "w") as fh:
+                fh.write(s + "\n")
+        return
+
+    # TSV output
+    # Collect all columns encountered to build header
+    cols = []
+    seen = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                cols.append(k)
+
+    def _fmt(v):
+        if v is None:
+            return ""
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    out_lines = []
+    out_lines.append("\t".join(cols))
+    for r in rows:
+        out_lines.append("\t".join(_fmt(r.get(c)) for c in cols))
+    s = "\n".join(out_lines) + "\n"
+
+    if args.out == "-":
+        sys.stdout.write(s)
+    else:
+        with open(args.out, "w") as fh:
+            fh.write(s)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
