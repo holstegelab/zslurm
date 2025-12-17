@@ -37,7 +37,7 @@ from time import gmtime, strftime
 def xtime():
     return (strftime("%Y-%m-%d %H:%M:%S", gmtime()))
 
-STOP_THRESHOLD=20
+STOP_THRESHOLD=60
 
 PING_INTERVAL = 20
 PING_TIMEOUT = 600
@@ -458,9 +458,13 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     last_io_total = None
     iodeltas = []
     monitor_initial_delay = float(config.get('monitor_initial_delay_sec', 0.0))
+    monitor_interval = float(config.get('monitor_interval_sec', 600.0))
     stuck_cpu_thr = float(config.get('stuck_cpu_core_threshold', 0.05))
     stuck_io_thr = float(config.get('stuck_io_activity_bytes_threshold', 4096.0))
     stuck_enabled = bool(config.get('stuck_detection_enable', True))
+    stuck_stop_threshold = int(config.get('stuck_stop_threshold', STOP_THRESHOLD))
+    if stuck_stop_threshold < 1:
+        stuck_stop_threshold = 1
 
     pid = process.pid
     try:
@@ -486,7 +490,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
         
         cur_time = time.time()
         
-        if (cur_time - report_time) > float(config.get('monitor_interval_sec', 10.0)):
+        if (cur_time - report_time) > monitor_interval:
             report_time = cur_time
             prevspend_time = spend_time
             if retcode is None and not ps is None:
@@ -550,9 +554,18 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
                     status.lock.release()
 
                     if stuck_enabled and (report_time - start_time) >= monitor_initial_delay:
-                        if partition == 'compute' and len(cpucache) > STOP_THRESHOLD and len(iodeltas) > STOP_THRESHOLD:
-                            if all([e['cpu_perc'] < stuck_cpu_thr for e in cpucache[::-1][:STOP_THRESHOLD]]) and all([d <= stuck_io_thr for d in iodeltas[::-1][:STOP_THRESHOLD]]):
-                                print('%s - [%s] Job stuck, terminating job %s.' % (xtime(), myid, str(jobid)))
+                        if partition == 'compute' and len(cpucache) > stuck_stop_threshold and len(iodeltas) > stuck_stop_threshold:
+                            if all([e['cpu_perc'] < stuck_cpu_thr for e in cpucache[::-1][:stuck_stop_threshold]]) and all([d <= stuck_io_thr for d in iodeltas[::-1][:stuck_stop_threshold]]):
+                                window_sec = float(stuck_stop_threshold) * float(monitor_interval)
+                                recent_cpu = [e['cpu_perc'] for e in cpucache[::-1][:min(stuck_stop_threshold, 5)]]
+                                recent_io = iodeltas[::-1][:min(stuck_stop_threshold, 5)]
+                                sys.stderr.write(
+                                    f"{xtime()} - [{myid}] Job stuck, terminating job {jobid}; "
+                                    f"cpu_thr={stuck_cpu_thr}core io_thr={stuck_io_thr}B interval={monitor_interval}s "
+                                    f"n_intervals={stuck_stop_threshold} window~{window_sec:.1f}s "
+                                    f"recent_cpu={recent_cpu} recent_io={recent_io}\n"
+                                )
+                                sys.stderr.flush()
                                 procs = []
                                 try:
                                     for proc in ps.children(recursive=True):
