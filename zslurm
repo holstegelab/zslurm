@@ -356,7 +356,10 @@ class JobManager(object):
         return total_val >= (inuse_val + needed_val)
 
     def _is_job_eligible_locked(self, job):
-        if getattr(job, 'state', None) not in queue_states:
+        st = getattr(job, 'state', None)
+        if st == 'ASSIGNED':
+            return True
+        if st not in queue_states:
             return False
         if not self._resource_fits_locked(self.active_total, self.active_inuse, getattr(job, 'active_start_use_add', 0.0)):
             return False
@@ -758,6 +761,41 @@ class JobManager(object):
             allres = []
             average_mem_core = float(totmem) / float(cores)
 
+            def _to_float(value, default=0.0):
+                try:
+                    if value is None:
+                        return default
+                    return float(value)
+                except Exception:
+                    return default
+
+            def _ssd_free_gb(engine):
+                if engine is None:
+                    return 0.0
+                total = _to_float(getattr(engine, 'ssd_total_gb', 0.0), 0.0)
+                reserved = _to_float(getattr(engine, 'res_ssd_reserved_gb', 0.0), 0.0)
+                return max(0.0, total - reserved)
+
+            def _ssd_ok(job, engine):
+                su = str(getattr(job, 'ssd_use', 'no') or 'no')
+                need = max(0.0, _to_float(getattr(job, 'ssd_gb', 0.0), 0.0))
+                has_ssd = bool(engine is not None and getattr(engine, 'has_ssd', False))
+                if su == 'no':
+                    return True
+                if su == 'required':
+                    if not has_ssd:
+                        return False
+                    if need > 0.0 and _ssd_free_gb(engine) < need:
+                        return False
+                    return True
+                if su == 'possible':
+                    if not has_ssd:
+                        return True
+                    if need > 0.0 and _ssd_free_gb(engine) < need:
+                        return False
+                    return True
+                return True
+
             def eligible(job):
                 if job.partition != partition:
                     return False
@@ -767,8 +805,8 @@ class JobManager(object):
                     return False
                 if job.mem > totmem:
                     return False
-                if job.ssd_use == 'required' and not (e is not None and e.has_ssd):
-                    return False    
+                if not _ssd_ok(job, e):
+                    return False
                 if job.active_start_use_add > 0 and (self.active_inuse + job.active_start_use_add) > self.active_total:
                     return False
                 if job.dcache_start_use_add > 0 and (self.dcache_inuse + job.dcache_start_use_add) > self.dcache_total:
@@ -823,7 +861,7 @@ class JobManager(object):
                                 )
                                 or job_candidate.archive_start_use_add == 0
                             )
-                        ):
+                        ) and _ssd_ok(job_candidate, e):
                             remain_cores = (
                                 current_cpu - job_candidate.ncpu
                             )  # remain cores after scheduling this job
@@ -843,7 +881,7 @@ class JobManager(object):
                             ssd_bonus = 0.0
                             try:
                                 if job_candidate.ssd_use == 'possible' and e is not None and getattr(e, 'has_ssd', False):
-                                    cap = float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0))
+                                    cap = _ssd_free_gb(e)
                                     need = float(getattr(job_candidate, 'ssd_gb', 0.0))
                                     if need <= 0.0 or cap >= need:
                                         ssd_bonus = float(getattr(status, 'ssd_prefer_bonus', 0.25))
@@ -891,6 +929,7 @@ class JobManager(object):
                         )
                         or job.archive_start_use_add == 0
                     )
+                    and _ssd_ok(job, e)
                 ):
 
                     self.active_inuse += job.active_start_use_add
@@ -928,10 +967,9 @@ class JobManager(object):
                                     need = float(getattr(job, 'ssd_gb', 0.0))
                                     if need > 0.0:
                                         cap = max(0.0, float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0)))
-                                        alloc = min(need, cap)
-                                        if alloc > 0:
-                                            e.res_ssd_reserved_gb += alloc
-                                            job.ssd_alloc_gb = alloc
+                                        if cap >= need:
+                                            e.res_ssd_reserved_gb += need
+                                            job.ssd_alloc_gb = need
                             except Exception:
                                 import traceback
                                 traceback.print_exc()
@@ -959,6 +997,8 @@ class JobManager(object):
                             continue
                         if (job.archive_start_use_add > 0 and (self.archive_inuse + job.archive_start_use_add) > self.archive_total):
                             continue
+                        if not _ssd_ok(job, e):
+                            continue
                         new_queued.append(job)
                     queued = new_queued
 
@@ -983,13 +1023,7 @@ class JobManager(object):
                     if (                                                
                         job.ncpu <= current_cpu
                         and job.mem <= current_mem  
-                        and (
-                            (getattr(job, 'ssd_use', 'no') != 'required')
-                            or (
-                                e is not None and getattr(e, 'has_ssd', False)
-                                and (float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0))) >= float(getattr(job, 'ssd_gb', 0.0))
-                            )
-                        )
+                        and _ssd_ok(job, e)
                     ):
                         # Ask the previous engine to drop assignment and reassign to this engine.
                         try:
@@ -1056,8 +1090,47 @@ class JobManager(object):
                     # Do not allow starts on engines that are stopping
                     res = False
                 elif job.state == "ASSIGNED" and job.node_id == nodeid:
-                    self.job_start(nodeid, jobid)
-                    res = True
+                    su = str(getattr(job, 'ssd_use', 'no') or 'no')
+                    try:
+                        need = max(0.0, float(getattr(job, 'ssd_gb', 0.0) or 0.0))
+                    except Exception:
+                        need = 0.0
+                    has_ssd = bool(engine is not None and getattr(engine, 'has_ssd', False))
+                    free_ssd = 0.0
+                    if engine is not None:
+                        try:
+                            free_ssd = max(0.0, float(getattr(engine, 'ssd_total_gb', 0.0)) - float(getattr(engine, 'res_ssd_reserved_gb', 0.0)))
+                        except Exception:
+                            free_ssd = 0.0
+                    ssd_ok = True
+                    if su == 'required':
+                        if not has_ssd:
+                            ssd_ok = False
+                        elif need > 0.0 and free_ssd < need:
+                            ssd_ok = False
+                    elif su == 'possible':
+                        if has_ssd and need > 0.0 and free_ssd < need:
+                            ssd_ok = False
+
+                    if ssd_ok:
+                        self.job_start(nodeid, jobid)
+                        res = True
+                    else:
+                        try:
+                            # Release resource reservation from ASSIGNED state
+                            self.active_inuse -= float(getattr(job, 'active_start_use_add', 0.0) or 0.0)
+                            self.dcache_inuse -= float(getattr(job, 'dcache_start_use_add', 0.0) or 0.0)
+                            self.archive_inuse -= float(getattr(job, 'archive_start_use_add', 0.0) or 0.0)
+                            if self.active_inuse < 0:
+                                self.active_inuse = 0
+                            if self.dcache_inuse < 0:
+                                self.dcache_inuse = 0
+                            if self.archive_inuse < 0:
+                                self.archive_inuse = 0
+                        except Exception:
+                            pass
+                        job.node_id = None
+                        job.state = "PENDING"
         finally:
             self.lock.release()
         return res
@@ -1079,10 +1152,9 @@ class JobManager(object):
                         need = float(getattr(job, 'ssd_gb', 0.0))
                         if need > 0.0:
                             cap = max(0.0, float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0)))
-                            alloc = min(need, cap)
-                            if alloc > 0:
-                                e.res_ssd_reserved_gb += alloc
-                                job.ssd_alloc_gb = alloc
+                            if cap >= need:
+                                e.res_ssd_reserved_gb += need
+                                job.ssd_alloc_gb = need
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -2721,9 +2793,9 @@ def thread_check_commands():
                         to_start = plan.get('best_nodes', 0)
                         if to_start > 0:
                             try:
-                                max_compute_nodes = int(status.config.get('autogrow_max_compute_nodes', 45))
+                                max_compute_nodes = int(status.config.get('autogrow_max_compute_nodes', 40))
                             except Exception:
-                                max_compute_nodes = 45
+                                max_compute_nodes = 40
                             current_compute = int(getattr(engines, 'cluster_running_engines', 0)) + int(getattr(engines, 'cluster_queued_engines', 0))
                             cap_remaining = max(0, int(max_compute_nodes) - int(current_compute))
                             clamped = False
@@ -3719,10 +3791,13 @@ def main(scr, *args, **kwds):
 
     status.instance_name = instance_name
     status.config = config
+    if 'autogrow_max_compute_nodes' not in status.config:
+        status.config['autogrow_max_compute_nodes'] = 40
 
     def _remove_own_instance():
         try:
-            zslurm_shared.remove_instance(instance_name)
+            if status.instance_name:
+                zslurm_shared.remove_instance(status.instance_name)
         except Exception as ex:
             try:
                 sys.stderr.write(f"Failed to remove instance file for '{instance_name}' on exit: {ex}\n")
@@ -4013,11 +4088,30 @@ def main(scr, *args, **kwds):
                     pass
             elif c == ord("g"):  # autogrow toggle
                 status.autogrow_enable = not status.autogrow_enable
+                if status.autogrow_enable:
+                    current_cap = 40
+                    try:
+                        current_cap = int(status.config.get('autogrow_max_compute_nodes', 40))
+                    except Exception:
+                        current_cap = 40
+                    cap = get_number(
+                        gb,
+                        f"Enter max compute autogrow nodes (default={current_cap}): ",
+                        current_cap,
+                    )
+                    if cap is not None:
+                        status.config['autogrow_max_compute_nodes'] = max(0, int(cap))
                 add_log_line(
                     gb,
                     "Autogrow set to " + ("ON" if status.autogrow_enable else "OFF"),
                     GREEN,
                 )
+                if status.autogrow_enable:
+                    add_log_line(
+                        gb,
+                        "Autogrow compute node cap set to " + str(status.config.get('autogrow_max_compute_nodes', 40)),
+                        CYAN,
+                    )
                 try:
                     render_control_status(gb, status)
                 except Exception:
