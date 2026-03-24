@@ -461,8 +461,8 @@ def plot_bar_metric(rows, xfield, metric, limit, sort_by, ascending, save):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="zsstats", description="Aggregate ZSlurm reports.tsv files.")
-    ap.add_argument("--files", nargs="*", default=["reports*.tsv"], help="Input glob(s). Default: reports*.tsv")
+    ap = argparse.ArgumentParser(prog="zsstats", description="Aggregate ZSlurm report*.tsv files.")
+    ap.add_argument("--files", nargs="*", default=["report*.tsv"], help="Input glob(s). Default: report*.tsv")
     ap.add_argument("--group", default="jobname,cwd", help="Comma-separated group fields. Default: jobname,cwd")
     ap.add_argument("--json", dest="as_json", action="store_true", help="Output JSON instead of TSV")
     ap.add_argument("--out", default="-", help="Output file path or '-' for stdout. Default: -")

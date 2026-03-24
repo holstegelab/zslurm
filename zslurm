@@ -30,6 +30,22 @@ import ipyparallel
 mylocal_id = zslurm_shared.short_name(zslurm_shared.get_hostname())
 PHASING_OUT = "PHASING_OUT"
 
+DEFAULT_AUTOGROW_PREFER_PARTITIONS = [
+    ("genoa", True),
+    ("genoa", False),
+    ("rome", True),
+    ("rome", False),
+    ("fat_genoa", True),
+    ("fat_rome", True),
+]
+
+DEFAULT_NODE_PROFILES = {
+    "genoa": {"cores": 192, "mem_gb": 336},
+    "rome": {"cores": 128, "mem_gb": 224},
+    "fat_genoa": {"cores": 192, "mem_gb": 1440},
+    "fat_rome": {"cores": 128, "mem_gb": 960},
+}
+
 
 
 # return codes
@@ -117,22 +133,20 @@ class Status(object):
         self.autogrow_last_action_compute_ts = 0.0
         self.autogrow_last_action_staging_ts = 0.0
 
-        self.autogrow_prefer_partitions = [
-            ("genoa", True),
-            ("genoa", False),
-            ("rome", True),
-            ("rome", False),
-            ("fat_genoa", True),
-            ("fat_rome", True),
-        ]
+        self.autogrow_prefer_partitions = list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
         self.autogrow_debug = True
         
-        self.node_profiles = {
-            "genoa": {"cores": 192, "mem_gb": 336},
-            "rome": {"cores": 128, "mem_gb": 224},
-            "fat_genoa": {"cores": 192, "mem_gb": 1440},
-            "fat_rome": {"cores": 128, "mem_gb": 960},
-        }
+        self.node_profiles = dict(DEFAULT_NODE_PROFILES)
+        self.default_partition = "normal"
+        self.staging_partition = "staging"
+        self.enable_ssd_prompt = False
+        self.ssd_feature_name = "scratch-node"
+        self.archive_job_partitions = ["archive", "staging"]
+        self.autogrow_fallback_partition = "genoa"
+        self.autogrow_fat_partitions = ["fat_genoa", "fat_rome"]
+        self.staging_autogrow_burst_threshold = 50
+        self.staging_autogrow_base_nodes = 1
+        self.staging_autogrow_burst_nodes = 4
         self.node_reports_file = None
         self.reports_lock = threading.RLock()
         self.autogrow_plan = None        
@@ -144,6 +158,127 @@ class Status(object):
 
 
 status = Status()
+
+
+def _cfg_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off"):
+            return False
+    return bool(default)
+
+
+def _cfg_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return int(default)
+
+
+def _cfg_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _cfg_string_list(value, default=None):
+    if default is None:
+        default = []
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        items = [e.strip() for e in value.split(",") if e.strip()]
+        return items or list(default)
+    if isinstance(value, (list, tuple)):
+        items = [str(e).strip() for e in value if str(e).strip()]
+        return items or list(default)
+    return list(default)
+
+
+def _cfg_autogrow_prefer_partitions(value):
+    if value is None:
+        return list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
+    out = []
+    try:
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                if len(item) == 0:
+                    continue
+                part = str(item[0]).strip()
+                scratch = _cfg_bool(item[1], False) if len(item) > 1 else False
+            elif isinstance(item, dict):
+                part = str(item.get("partition", "")).strip()
+                scratch = _cfg_bool(item.get("scratch", False), False)
+            else:
+                part = str(item).strip()
+                scratch = False
+            if part:
+                out.append((part, scratch))
+    except Exception:
+        return list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
+    return out or list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
+
+
+def _cfg_node_profiles(value):
+    if not isinstance(value, dict):
+        return dict(DEFAULT_NODE_PROFILES)
+    out = {}
+    for name, prof in value.items():
+        if not isinstance(prof, dict):
+            continue
+        part = str(name).strip()
+        if not part:
+            continue
+        out[part] = {
+            "cores": _cfg_int(prof.get("cores"), 0),
+            "mem_gb": _cfg_float(prof.get("mem_gb"), 0.0),
+        }
+    return out or dict(DEFAULT_NODE_PROFILES)
+
+
+def _cluster_defaults():
+    on_snellius = "snellius" in zslurm_shared.get_full_hostname().lower()
+    default_partition = "genoa" if on_snellius else "normal"
+    enable_ssd_prompt = on_snellius
+    return {
+        "default_partition": default_partition,
+        "staging_partition": "staging",
+        "enable_ssd_prompt": enable_ssd_prompt,
+        "ssd_feature_name": "scratch-node",
+    }
+
+
+def _apply_cluster_config(config):
+    cfg = config if isinstance(config, dict) else {}
+    defaults = _cluster_defaults()
+
+    status.default_partition = str(cfg.get("default_partition", defaults["default_partition"]) or defaults["default_partition"])
+    status.staging_partition = str(cfg.get("staging_partition", defaults["staging_partition"]) or defaults["staging_partition"])
+    status.enable_ssd_prompt = _cfg_bool(cfg.get("enable_ssd_prompt"), defaults["enable_ssd_prompt"])
+    status.ssd_feature_name = str(cfg.get("ssd_feature_name", defaults["ssd_feature_name"]) or "")
+    status.autogrow_prefer_partitions = _cfg_autogrow_prefer_partitions(cfg.get("autogrow_prefer_partitions"))
+    status.node_profiles = _cfg_node_profiles(cfg.get("node_profiles"))
+    default_archive_jobs = ["archive", "staging"]
+    status.archive_job_partitions = _cfg_string_list(cfg.get("archive_job_partitions"), default_archive_jobs)
+    default_fallback_partition = status.autogrow_prefer_partitions[0][0] if status.autogrow_prefer_partitions else status.default_partition
+    status.autogrow_fallback_partition = str(cfg.get("autogrow_fallback_partition", default_fallback_partition) or default_fallback_partition)
+    default_fat_parts = [name for name in status.node_profiles.keys() if str(name).startswith("fat")]
+    status.autogrow_fat_partitions = _cfg_string_list(cfg.get("autogrow_fat_partitions"), default_fat_parts)
+    status.staging_autogrow_burst_threshold = _cfg_int(cfg.get("staging_autogrow_burst_threshold"), 50)
+    status.staging_autogrow_base_nodes = max(0, _cfg_int(cfg.get("staging_autogrow_base_nodes"), 1))
+    status.staging_autogrow_burst_nodes = max(status.staging_autogrow_base_nodes, _cfg_int(cfg.get("staging_autogrow_burst_nodes"), 4))
 
 
 def parse_timeleft(time):
@@ -1698,14 +1833,14 @@ class EngineManager(object):
                         features_str = ""
                     try:
                         ages_any[cpartition] = max(float(ages_any.get(cpartition, 0.0)), float(age_sec))
-                        if "scratch-node" in features_str:
+                        if getattr(status, 'ssd_feature_name', '') and getattr(status, 'ssd_feature_name', '') in features_str:
                             ages_scratch[cpartition] = max(float(ages_scratch.get(cpartition, 0.0)), float(age_sec))
                         else:
                             ages_noscratch[cpartition] = max(float(ages_noscratch.get(cpartition, 0.0)), float(age_sec))
                     except Exception:
                         pass
 
-                if cpartition == "staging":
+                if cpartition == getattr(status, 'staging_partition', 'staging'):
                     if cstate == "R":
                         # Count running engines even if not yet registered; they occupy cluster capacity
                         nrunning_archive += 1
@@ -1870,7 +2005,7 @@ class EngineManager(object):
                 args.extend(["-J", str(status.instance_name), "-t", str(stime)])
 
                 # Partition mapping for manager side
-                if partition == "staging":
+                if partition == getattr(status, 'staging_partition', 'staging'):
                     # check for existing and failed archive nodes to exclude
                     xlist = []
                     for eid, engine in self.engine_by_id.items():
@@ -2182,7 +2317,17 @@ class EngineManager(object):
             # Node usage report: write one line per poll
             try:
                 if getattr(status, 'node_reports_file', None):
-                    if e.partition  == 'compute':
+                    parts = None
+                    try:
+                        raw_parts = (getattr(status, 'config', {}) or {}).get('node_reports_include_partitions', None)
+                        if raw_parts is None:
+                            parts = None
+                        else:
+                            parts = _cfg_string_list(raw_parts, [])
+                    except Exception:
+                        parts = None
+                    should_report = (e.partition == 'compute') if parts is None else (e.partition in parts)
+                    if should_report:
                         ts_iso = datetime.datetime.now().isoformat()
                         # Queue stats for this partition
                         pending_jobs = 0
@@ -2382,6 +2527,11 @@ def compute_autogrow_plan(all_engines, partition):
             eligible.append(j)
 
     unique_part = list(set([part_name for part_name,_ in status.autogrow_prefer_partitions]))
+    fallback_part = str(getattr(status, 'autogrow_fallback_partition', '') or '')
+    fallback_prof = status.node_profiles.get(fallback_part) or {}
+    if not fallback_prof and status.node_profiles:
+        fallback_part = next(iter(status.node_profiles.keys()))
+        fallback_prof = status.node_profiles.get(fallback_part) or {}
 
     #Reserved resources
     res_cpu = sum(float(getattr(e, 'res_cpu_reserved', 0.0)) for e in all_engines if e.partition == partition)
@@ -2403,13 +2553,21 @@ def compute_autogrow_plan(all_engines, partition):
     for part_name in unique_part:
         nqueued_engines = engines.cluster_queued_by_partition.get(part_name, 0)      
         prof = status.node_profiles.get(part_name)
+        if prof is None:
+            continue
         
         queue_cpu_cap += nqueued_engines * float(prof.get('cores', 0.0))
         queue_mem_cap_mb += nqueued_engines * float(prof.get('mem_gb', 0.0)) * 1024.0
 
         
-    genoa_prof = status.node_profiles.get('genoa')
-    largest_cores = int(genoa_prof.get('cores', 0))
+    largest_cores = 0
+    try:
+        if status.node_profiles:
+            largest_cores = max(int((prof or {}).get('cores', 0) or 0) for prof in status.node_profiles.values())
+    except Exception:
+        largest_cores = 0
+    if largest_cores <= 0:
+        largest_cores = int(fallback_prof.get('cores', 0) or 0)
     
     # Free cluster capacity across currently running engines after pending jobs
     free_cpu_total = max(0.0, tot_cpu_cap - res_cpu)
@@ -2432,8 +2590,8 @@ def compute_autogrow_plan(all_engines, partition):
             'plan_part': None,
             'plan_nodes': 0.0,
             'plan_use_scratch': True,
-            'needed_cpu': required_cpu / (genoa_prof.get('cores', 0.0)),
-            'needed_mem': required_mem_mb / (genoa_prof.get('mem_gb', 0.0) * 1024.0),
+            'needed_cpu': required_cpu / max(1.0, float(fallback_prof.get('cores', 0.0) or 1.0)),
+            'needed_mem': required_mem_mb / (max(1.0, float(fallback_prof.get('mem_gb', 0.0) or 1.0)) * 1024.0),
             'avail_mpc': avail_mpc,
             'required_mpc': required_mpc,
             'raw_best_nodes': 0.0,
@@ -2452,7 +2610,7 @@ def compute_autogrow_plan(all_engines, partition):
         except Exception:
             return default
 
-    for part, scratch in status.autogrow_prefer_partitions:
+    for pref_rank, (part, scratch) in enumerate(status.autogrow_prefer_partitions):
         prof = status.node_profiles.get(part) or {}
         if not prof:
             continue
@@ -2474,13 +2632,10 @@ def compute_autogrow_plan(all_engines, partition):
         # Scoring
         sc = 0.0
 
-        # penalize fat by default
-        if str(part).startswith('fat'):
+        if str(part) in getattr(status, 'autogrow_fat_partitions', []):
             sc -= 4.0
 
-        # prefer genoa slightly, detract non-genoa
-        if 'genoa' not in str(part):
-            sc -= 4.0
+        sc -= float(pref_rank) * 0.5
 
         # prefer scratch, detract non-scratch
         if not scratch:
@@ -2500,7 +2655,7 @@ def compute_autogrow_plan(all_engines, partition):
             best_use_scratch = bool(scratch)
 
     if best_part is None:
-        best_part = 'genoa'
+        best_part = fallback_part or status.default_partition
         best_use_scratch = False
 
     prof = status.node_profiles.get(best_part) or {}
@@ -2516,11 +2671,11 @@ def compute_autogrow_plan(all_engines, partition):
     raw_best_nodes = int(math.ceil(max(nodes_cpu, nodes_mem))) if (required_cpu > 0.0 or required_mem_mb > 0.0) else 0
     best_nodes = raw_best_nodes
 
-    if best_nodes > 1 and not str(best_part).startswith('fat'):
+    if best_nodes > 1 and str(best_part) not in getattr(status, 'autogrow_fat_partitions', []):
         best_nodes = max(int(math.ceil(0.2 * best_nodes)), 1)
 
     fat_cap_applied = False
-    if str(best_part).startswith('fat') and best_nodes > 1:
+    if str(best_part) in getattr(status, 'autogrow_fat_partitions', []) and best_nodes > 1:
         best_nodes = 1
         fat_cap_applied = True
 
@@ -2811,7 +2966,8 @@ def thread_check_commands():
                                     msg,
                                     CYAN,
                                 )
-                                constraint = "scratch-node" if bool(plan.get('plan_use_scratch', True)) else None
+                                ssd_feature_name = getattr(status, 'ssd_feature_name', '')
+                                constraint = ssd_feature_name if (ssd_feature_name and bool(plan.get('plan_use_scratch', True))) else None
                                 engines.start_slurm(gb, to_start, status.autogrow_runtime_default, plan.get('best_part'), constraint, 0)
                                 status.autogrow_last_action_compute_ts = now
                                 plan_compute = f"growed: {to_start} @ {plan.get('best_part', 'compute')}"
@@ -2819,22 +2975,27 @@ def thread_check_commands():
                 
                 staging_pending = 0
                 try:
+                    archive_job_partitions = set(getattr(status, 'archive_job_partitions', ['archive', getattr(status, 'staging_partition', 'staging')]))
                     for job in list(jobs.jobs_by_id.values()):
                         part = str(getattr(job, 'partition', '') or '')
-                        if part in ('archive', 'staging') and getattr(job, 'state', '') in queue_states:
+                        if part in archive_job_partitions and getattr(job, 'state', '') in queue_states:
                             staging_pending += 1
                 except Exception:
                     staging_pending = 0
 
                 desired_staging = 0
-                if staging_pending >= 50:
-                    desired_staging = 4
+                staging_burst_threshold = max(1, int(getattr(status, 'staging_autogrow_burst_threshold', 50)))
+                staging_base_nodes = max(0, int(getattr(status, 'staging_autogrow_base_nodes', 1)))
+                staging_burst_nodes = max(staging_base_nodes, int(getattr(status, 'staging_autogrow_burst_nodes', 4)))
+                if staging_pending >= staging_burst_threshold:
+                    desired_staging = staging_burst_nodes
                 elif staging_pending > 0:
-                    desired_staging = 1
+                    desired_staging = staging_base_nodes
                 
                 queued_map = getattr(engines, 'cluster_queued_by_partition', {}) or {}
                 running_map = getattr(engines, 'cluster_running_by_partition', {}) or {}
-                current_staging = int(queued_map.get('staging', 0)) + int(running_map.get('staging', 0))
+                staging_partition = getattr(status, 'staging_partition', 'staging')
+                current_staging = int(queued_map.get(staging_partition, 0)) + int(running_map.get(staging_partition, 0))
 
                 cooldown_remaining_staging = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_staging_ts)))
 
@@ -2847,14 +3008,14 @@ def thread_check_commands():
                 if cooldown_remaining_staging <= 0:    
                     if desired_staging > 0:
                         if desired_staging > current_staging:
-                            to_start_staging = min(desired_staging - current_staging, 4 - current_staging)
+                            to_start_staging = min(desired_staging - current_staging, staging_burst_nodes - current_staging)
                             if to_start_staging > 0:
                                 add_log_line(
                                     gb,
                                     f"Staging autogrow: {staging_pending} archive jobs pending, starting 1 of {to_start_staging} nodes.",
                                     CYAN,
                                 )
-                                engines.start_slurm(gb, 1, status.autogrow_runtime_default, "staging", None, 1)                                
+                                engines.start_slurm(gb, 1, status.autogrow_runtime_default, staging_partition, None, 1)                                
                                 status.autogrow_last_action_staging_ts = now
                                 plan_staging = f"growed: 1"
 
@@ -3791,6 +3952,7 @@ def main(scr, *args, **kwds):
 
     status.instance_name = instance_name
     status.config = config
+    _apply_cluster_config(status.config)
     if 'autogrow_max_compute_nodes' not in status.config:
         status.config['autogrow_max_compute_nodes'] = 40
 
@@ -3962,25 +4124,26 @@ def main(scr, *args, **kwds):
                 engines.stop_local(gb)
 
             elif c == ord("d"):  # START SLURM engines
-                on_snellius = "snellius" in zslurm_shared.get_full_hostname()
-                if on_snellius:
-                    default_partition = "genoa"
-                else:
-                    default_partition = "normal"
+                default_partition = str(getattr(status, 'default_partition', 'normal') or 'normal')
+                staging_partition = str(getattr(status, 'staging_partition', 'staging') or 'staging')
+                enable_ssd_prompt = bool(getattr(status, 'enable_ssd_prompt', False))
+                ssd_feature_name = str(getattr(status, 'ssd_feature_name', '') or '')
 
                 partition = enter_command(
                     gb, f"Enter partition (default={default_partition}): "
                 )
-                if partition == "staging":
+                if partition == "":
+                    partition = default_partition
+                if partition == staging_partition:
                     cmd = 1
                     cores = 1
                     constraint = ""
                 else:
                     cmd = get_number(gb, "Number of engines (def=1): ", 1)
-                    if on_snellius:
+                    if enable_ssd_prompt and ssd_feature_name:
                         ans = enter_command(gb, "Reserve SSD scratch node? (Y/n): ")
                         if ans.lower() in ("", "y", "yes", "1"):
-                            constraint = "scratch-node"
+                            constraint = ssd_feature_name
                         else:
                             constraint = ""
                     else:
@@ -3993,8 +4156,6 @@ def main(scr, *args, **kwds):
 
                 if runtime == "":
                     runtime = "5-0:0:0"
-                if partition == "":
-                    partition = default_partition
 
                 if not cmd is None and not cores is None:
                     engines.start_slurm(gb, cmd, runtime, partition, constraint, cores)
