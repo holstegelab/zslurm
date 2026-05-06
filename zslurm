@@ -25,7 +25,10 @@ import traceback
 
 import zslurm_shared
 import atexit
-import ipyparallel
+try:
+    import ipyparallel
+except ImportError:
+    ipyparallel = None
 
 mylocal_id = zslurm_shared.short_name(zslurm_shared.get_hostname())
 PHASING_OUT = "PHASING_OUT"
@@ -3150,44 +3153,45 @@ def thread_display_status(gb, status):
 
         if counter >= 10:
             rc = None
-            try:
-                sys.stdout = open(os.devnull, "w")
-                rc = ipyparallel.Client(timeout=0.5)
-                queue = rc.queue_status()
-                unassigned = queue["unassigned"]
-                del queue["unassigned"]
+            if ipyparallel is not None:
+                try:
+                    sys.stdout = open(os.devnull, "w")
+                    rc = ipyparallel.Client(timeout=0.5)
+                    queue = rc.queue_status()
+                    unassigned = queue["unassigned"]
+                    del queue["unassigned"]
 
-                completed = sum(
-                    [
-                        value["completed"]
-                        for key, value in list(queue.items())
-                        if isinstance(key, int)
-                    ],
-                    0,
-                )
-                nqueue = sum(
-                    [
-                        value["queue"]
-                        for key, value in list(queue.items())
-                        if isinstance(key, int)
-                    ],
-                    0,
-                )
-                running = sum(
-                    [
-                        value["tasks"]
-                        for key, value in list(queue.items())
-                        if isinstance(key, int)
-                    ],
-                    0,
-                )
-                queue = nqueue + unassigned
-            except Exception as e:
-                pass
-            finally:
-                sys.stdout = sys.__stdout__
-                if not rc is None:
-                    rc.close()
+                    completed = sum(
+                        [
+                            value["completed"]
+                            for key, value in list(queue.items())
+                            if isinstance(key, int)
+                        ],
+                        0,
+                    )
+                    nqueue = sum(
+                        [
+                            value["queue"]
+                            for key, value in list(queue.items())
+                            if isinstance(key, int)
+                        ],
+                        0,
+                    )
+                    running = sum(
+                        [
+                            value["tasks"]
+                            for key, value in list(queue.items())
+                            if isinstance(key, int)
+                        ],
+                        0,
+                    )
+                    queue = nqueue + unassigned
+                except Exception:
+                    pass
+                finally:
+                    sys.stdout = sys.__stdout__
+                    if not rc is None:
+                        rc.close()
             counter = 0
 
         gb.lock.acquire()

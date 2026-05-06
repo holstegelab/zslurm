@@ -24,7 +24,13 @@ conda activate clustersnake
 python -m pip install .
 ```
 
-The environment file includes the required packaging/runtime dependencies, including `setuptools`, `pyyaml`, and `tabulate`.
+The environment file includes the base runtime dependencies for ZSlurm, including `pyyaml` and `tabulate`.
+
+`ipyparallel` is optional. If you want the manager UI to query and display IPython parallel queue statistics, install it separately:
+
+```bash
+python -m pip install .[ipyparallel]
+```
 
 
 ## Updating an existing installation
