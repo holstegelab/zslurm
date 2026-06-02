@@ -8,12 +8,26 @@ except:
 import argparse
 import sys
 import traceback
+import json
+
+SCHEMA_VERSION = 1
+# Stable, numeric field order for the 20-field list_nodes tuple
+# (see docs/agent-interface-plan.md). Units: *_mb MB, *_gb GB, *_s seconds.
+NODE_FIELDS = ["partition", "engine_id", "cluster_id", "cores", "totmem_mb",
+               "runtime_s", "timeleft_s", "njobs", "cpu_usage", "mem_usage_pct",
+               "load", "status", "sys_cpu_busy_pct", "sys_iowait_pct",
+               "res_cpu_reserved", "res_mem_reserved_mb", "has_ssd",
+               "ssd_total_gb", "ssd_used_gb", "res_ssd_reserved_gb"]
 
 parser = argparse.ArgumentParser(description='ZSlurm node listing')
 parser.add_argument('--all', action='store_true', help='Show also queued nodes.')
 parser.add_argument('--parseable', action='store_true', help='Output TSV table suitable for parsing.')
+parser.add_argument('--json', dest='as_json', action='store_true', help='Output machine-readable JSON (numeric, schema-versioned).')
 parser.add_argument('--instance', action='append', metavar='NAME', help='Filter to a specific instance (can be given multiple times).')
 args = parser.parse_args()
+
+# Exit-code contract: 0 ok, 2 transport/instance-resolution failure (retryable).
+_fail_count = [0]
 def _get_instances_from_args():
     if args.instance:
         return args.instance
@@ -34,17 +48,45 @@ def _fetch_nodes(instance):
     except (socket.error, httplib.HTTPException) as ex:
         if url is None:
             url = "<unresolved>"
+        _fail_count[0] += 1
         sys.stderr.write(f"{instance}: failed to connect to ZSlurm manager at {url}: {ex}\n")
-        traceback.print_exc()
+        if not args.as_json:
+            traceback.print_exc()
     except KeyError:
+        _fail_count[0] += 1
         sys.stderr.write(f"Instance '{instance}' not defined in configuration.\n")
     except Exception as ex:
+        _fail_count[0] += 1
         sys.stderr.write(f"{instance}: unexpected error while fetching nodes: {ex}\n")
-        traceback.print_exc()
+        if not args.as_json:
+            traceback.print_exc()
     return []
 
 
 instances = _get_instances_from_args()
+
+if args.as_json:
+    out = {"schema_version": SCHEMA_VERSION, "fields": NODE_FIELDS, "instances": {}}
+    for instance in instances:
+        rows = []
+        for node in _fetch_nodes(instance):
+            n = list(node) + [0.0] * (20 - len(node))  # pad for older managers
+            rows.append({
+                "partition": n[0], "engine_id": n[1], "cluster_id": n[2],
+                "cores": float(n[3]), "totmem_mb": float(n[4]),
+                "runtime_s": float(n[5]), "timeleft_s": float(n[6]),
+                "njobs": int(n[7]), "cpu_usage": float(n[8]),
+                "mem_usage_pct": float(n[9]), "load": float(n[10]),
+                "status": n[11], "sys_cpu_busy_pct": float(n[12]),
+                "sys_iowait_pct": float(n[13]), "res_cpu_reserved": float(n[14]),
+                "res_mem_reserved_mb": float(n[15]), "has_ssd": bool(n[16]),
+                "ssd_total_gb": float(n[17]), "ssd_used_gb": float(n[18]),
+                "res_ssd_reserved_gb": float(n[19]),
+            })
+        out["instances"][instance] = rows
+    print(json.dumps(out, indent=2, sort_keys=True))
+    sys.exit(2 if (instances and _fail_count[0] >= len(instances)) else 0)
+
 use_pretty = not args.parseable
 tabulate_module = None
 if use_pretty:
@@ -58,7 +100,7 @@ if use_pretty:
 if args.parseable:
     header = [
         "INSTANCE","ID","SLURM","PARTITION","CORES","MEM","TIME","REMAINING","NJOBS",
-        "CPU","MEM","LOAD","SYSCPU","IOWAIT","RESCPU","RESMEM","SSD","SSD_TOTAL","SSD_USED","SSD_RSVD","STATUS"
+        "CPU","MEM","HOSTLOAD","HOSTCPU","HOSTIO","RESCPU","RESMEM","SSD","SSD_TOTAL","SSD_USED","SSD_RSVD","STATUS"
     ]
     print("\t".join(header))
 
@@ -131,14 +173,14 @@ for instance in instances:
         if len(instances) > 1:
             print(f"Instance: {instance}")
         
-        print(tabulate_module.tabulate(table, headers=['ID','SLURM','PARTITION','CORES','MEM','TIME','REMAINING','NJOBS','CPU','MEM','LOAD','SYSCPU','IOWAIT','RESCPU','RESMEM','SSD','SSD_TOTAL','SSD_USED','SSD_RSVD','STATUS']))
+        print(tabulate_module.tabulate(table, headers=['ID','SLURM','PARTITION','CORES','MEM','TIME','REMAINING','NJOBS','CPU','MEM','HOSTLOAD','HOSTCPU','HOSTIO','RESCPU','RESMEM','SSD','SSD_TOTAL','SSD_USED','SSD_RSVD','STATUS']))
         
         if len(instances) > 1:
             print()
     else:
         if len(instances) > 1:
             print(f"Instance: {instance}")
-        print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tLOAD\tSYSCPU\tIOWAIT\tRESCPU\tRESMEM\tSSD\tSSD_TOTAL\tSSD_USED\tSSD_RSVD\tSTATUS")
+        print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tHOSTLOAD\tHOSTCPU\tHOSTIO\tRESCPU\tRESMEM\tSSD\tSSD_TOTAL\tSSD_USED\tSSD_RSVD\tSTATUS")
         for node in nodes:
             partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load, status = node[:12]
             sys_cpu_busy = node[12] if len(node) > 12 else 0.0
@@ -157,3 +199,5 @@ for instance in instances:
                 ('Y' if has_ssd else 'N'), ssd_total_gb, ssd_used_gb, res_ssd_reserved_gb, status))
         if len(instances) > 1:
             print()
+
+sys.exit(2 if (instances and _fail_count[0] >= len(instances)) else 0)

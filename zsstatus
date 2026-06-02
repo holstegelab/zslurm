@@ -1,0 +1,215 @@
+#!/usr/bin/env python
+"""zsstatus -- one machine-readable snapshot of a zslurm instance for an agent.
+
+Fans out the read RPCs (ping, get_status_json, queue_stats, list_nodes, list_jobs)
+into a single schema-versioned JSON object, plus an engine summary and a set of
+DERIVED ALARMS that distinguish "done vs hung":
+
+  budget_stall      a storage budget is full: inuse + smallest pending *_use_add
+                    would exceed total, and budgeted jobs are pending. Looks just
+                    like "no engines" from the queue, so it is flagged explicitly.
+  no_engines        pending jobs but zero running engines and autogrow off/at cap.
+  oversized_pending a pending job needs more cores/mem than the largest engine
+                    (a deadlock risk if autogrow is off or can't grow bigger).
+
+Exit codes (see docs/agent-interface-plan.md):
+  0  ok
+  2  transport / instance-resolution failure (retryable)
+  3  ambiguous instance (multiple instances, none selected)  (NOT retryable)
+
+Usage:
+  zsstatus [--instance NAME] [--json]   (--json is the default and only output)
+"""
+import sys
+import json
+import socket
+import argparse
+import traceback
+
+try:
+    import http.client as httplib
+except Exception:  # pragma: no cover
+    import httplib
+
+import zslurm_shared
+
+SCHEMA_VERSION = 1
+
+# Match the server's queue_states (zslurm). ASSIGNED jobs are already placed on an
+# engine (storage reserved into inuse), so they are NOT "waiting for resources" and
+# must not feed the no_engines / oversized_pending alarms.
+QUEUE_STATES = {"PENDING", "REQUEUED"}
+
+
+def _resolve_instance(requested):
+    """Return a single instance name or exit. If --instance was given, trust it;
+    else use the single discovered instance; else exit 3 (ambiguous)."""
+    if requested:
+        return requested
+    try:
+        names = zslurm_shared.get_instance_names()
+    except Exception:
+        names = []
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        sys.stderr.write("zsstatus: no zslurm instance found (is the manager running?)\n")
+        _emit({"ok": False, "code": 2, "error": "no instance found"})
+        sys.exit(2)
+    sys.stderr.write(f"zsstatus: multiple instances {names}; select one with --instance\n")
+    _emit({"ok": False, "code": 3, "error": "ambiguous instance", "instances": names})
+    sys.exit(3)
+
+
+def _emit(obj):
+    print(json.dumps(obj, indent=2, sort_keys=True))
+
+
+def _engine_summary(nodes):
+    """Aggregate the 20-field list_nodes tuples into a per-partition + total view
+    (supports the memory pillar: free vs reserved cores/mem per partition)."""
+    per_part = {}
+    totals = {"engines": 0, "cores": 0.0, "res_cpu": 0.0, "totmem_mb": 0.0,
+              "res_mem_mb": 0.0, "max_cores": 0.0, "max_totmem_mb": 0.0,
+              "ssd_engines": 0}
+    for node in nodes:
+        n = list(node) + [0.0] * (20 - len(node))
+        part = str(n[0] or "?")
+        cores = float(n[3]); totmem = float(n[4])
+        res_cpu = float(n[14]); res_mem = float(n[15])
+        has_ssd = bool(n[16])
+        p = per_part.setdefault(part, {"engines": 0, "cores": 0.0, "res_cpu": 0.0,
+                                       "totmem_mb": 0.0, "res_mem_mb": 0.0,
+                                       "max_cores": 0.0, "max_totmem_mb": 0.0,
+                                       "ssd_engines": 0})
+        for tgt in (p, totals):
+            tgt["engines"] += 1
+            tgt["cores"] += cores
+            tgt["res_cpu"] += res_cpu
+            tgt["totmem_mb"] += totmem
+            tgt["res_mem_mb"] += res_mem
+            tgt["max_cores"] = max(tgt["max_cores"], cores)
+            tgt["max_totmem_mb"] = max(tgt["max_totmem_mb"], totmem)
+            if has_ssd:
+                tgt["ssd_engines"] += 1
+    for d in list(per_part.values()) + [totals]:
+        d["free_cores"] = max(0.0, d["cores"] - d["res_cpu"])
+        d["free_mem_mb"] = max(0.0, d["totmem_mb"] - d["res_mem_mb"])
+    return {"by_partition": per_part, "totals": totals}
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="zsstatus", description="One JSON snapshot of a zslurm instance (for agents).")
+    parser.add_argument("--instance", default=None, help="instance name (default: the single running instance)")
+    parser.add_argument("--json", dest="as_json", action="store_true", help="JSON output (default and only format)")
+    args = parser.parse_args()
+
+    instance = _resolve_instance(args.instance)
+
+    try:
+        url = zslurm_shared.get_job_url(instance=instance)
+        proxy = zslurm_shared.TimeoutServerProxy(url, allow_none=True)
+        health = proxy.ping()
+        status = proxy.get_status_json()
+        qstats = proxy.queue_stats()
+        nodes = proxy.list_nodes()
+        jobs = proxy.list_jobs()
+        try:
+            running_detail = proxy.list_jobs_detailed(None, ["RUNNING"])
+        except Exception:
+            running_detail = []  # older manager without the Phase-3 RPC
+    except (socket.error, httplib.HTTPException, KeyError) as ex:
+        sys.stderr.write(f"zsstatus: cannot reach manager for instance '{instance}': {ex}\n")
+        _emit({"ok": False, "code": 2, "instance": instance, "error": str(ex)})
+        sys.exit(2)
+    except Exception as ex:
+        sys.stderr.write(f"zsstatus: unexpected error: {ex}\n")
+        traceback.print_exc()
+        _emit({"ok": False, "code": 2, "instance": instance, "error": str(ex)})
+        sys.exit(2)
+
+    engines = _engine_summary(nodes)
+    running_engines = int(((qstats or {}).get("engines") or {}).get("running_total", 0) or 0)
+
+    # Pending jobs + max requirement (deadlock / oversized detection)
+    pending = [j for j in jobs if str(j[2]) in QUEUE_STATES]
+    max_req_cores = max([float(j[4]) for j in pending], default=0.0)
+    # list_jobs has no mem column; mem requirement comes from queue_stats pending totals
+    # only (aggregate), so deadlock-by-mem is heuristic via the largest engine.
+    sched = (status or {}).get("scheduler", {}) or {}
+    budgets = (status or {}).get("budgets", {}) or {}
+    autogrow_on = bool(sched.get("autogrow_enable"))
+    autogrow_cap = int(sched.get("autogrow_max_compute_nodes", 0) or 0)
+
+    # ---- derived alarms ----
+    alarms = []
+
+    # budget_stall: a tier's headroom can't admit even the smallest pending add
+    for tier, b in budgets.items():
+        mpa = b.get("min_pending_add")
+        if mpa is None:
+            continue
+        total = float(b.get("total", 0) or 0)
+        inuse = float(b.get("inuse", 0) or 0)
+        if inuse + float(mpa) > total:
+            alarms.append({
+                "alarm": "budget_stall", "tier": tier,
+                "detail": f"{tier} budget full: inuse {inuse:g} + min pending add {float(mpa):g} > total {total:g} GB",
+                "remedy": f"raise the {tier} budget (zscontrol budget --{tier} <GB>) if real quota allows, "
+                          f"or let in-flight jobs release *_use_remove (keep LIFO on)",
+            })
+
+    if pending and running_engines == 0 and (not autogrow_on or autogrow_cap == 0):
+        alarms.append({
+            "alarm": "no_engines",
+            "detail": f"{len(pending)} pending jobs but 0 running engines and autogrow is "
+                      f"{'off' if not autogrow_on else 'capped at 0'}",
+            "remedy": "start engines (TUI 'd' / headless agent-managed scaling) or enable autogrow",
+        })
+
+    max_engine_cores = engines["totals"]["max_cores"]
+    if max_engine_cores > 0 and max_req_cores > max_engine_cores and not autogrow_on:
+        alarms.append({
+            "alarm": "oversized_pending",
+            "detail": f"a pending job needs {max_req_cores:g} cores but the largest engine has "
+                      f"{max_engine_cores:g}; autogrow is off so a bigger node won't appear",
+            "remedy": "enable autogrow onto a larger partition, or split the job",
+        })
+
+    # near_oom: a RUNNING job whose live PSS is close to its reserved mem. On
+    # compute jobs a hard failure requeues with DOUBLED mem (footprint amplifier).
+    near_oom = sorted([j for j in (running_detail or []) if j.get("mem_pressure", 0) >= 0.9],
+                      key=lambda j: -j.get("mem_pressure", 0))
+    for j in near_oom[:5]:
+        alarms.append({
+            "alarm": "near_oom", "jobid": j.get("jobid"), "name": j.get("name"),
+            "detail": f"job {j.get('jobid')} ({j.get('name')}) using "
+                      f"{j.get('current_mem_mb'):.0f}/{j.get('mem_reserved_mb'):.0f} MB "
+                      f"({j.get('mem_pressure'):.0%}); requeue_remaining={j.get('requeue_remaining')}",
+            "remedy": "raise this rule's mem_mb (failed compute jobs requeue at 2x mem); "
+                      "consider a fatter partition rather than letting it OOM-loop",
+        })
+
+    out = {
+        "ok": True,
+        "schema_version": SCHEMA_VERSION,
+        "instance": instance,
+        "health": health,
+        "scheduler": sched,
+        "budgets": budgets,
+        "pending_jobs": (status or {}).get("pending_jobs", len(pending)),
+        "budgeted_pending_jobs": (status or {}).get("budgeted_pending_jobs", 0),
+        "queue": qstats,
+        "engines": engines,
+        "running_engines": running_engines,
+        "running_jobs": len(running_detail or []),
+        "running_top_mem_pressure": sorted(
+            (running_detail or []), key=lambda j: -j.get("mem_pressure", 0))[:3],
+        "alarms": alarms,
+    }
+    _emit(out)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

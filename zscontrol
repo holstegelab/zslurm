@@ -1,0 +1,251 @@
+#!/usr/bin/env python
+"""zscontrol -- programmatic control plane for a zslurm instance (for agents).
+
+Wraps the gated control RPCs that mirror the curses TUI keys, so an agent can
+provision storage budgets, steer depth-first/LIFO scheduling, cap autogrow, and
+(de)prioritise by pattern -- without a terminal. All mutating subcommands require
+the manager to have control enabled (config 'enable_control_rpc: true' or
+--enable-control on a headless manager) and, if configured, a matching token.
+
+The token is read from --token or $ZSLURM_CONTROL_TOKEN and is never printed.
+
+Exit codes (see docs/agent-interface-plan.md):
+  0  ok
+  2  transport / instance-resolution failure   (retryable)
+  3  logical rejection: control disabled, bad token, empty/oversized pattern  (NOT retryable)
+
+Subcommands:
+  budget   --active GB --dcache GB --archive GB [--active-inuse GB ...]   set storage budgets
+  lifo     on|off                                                        depth-first/LIFO toggle
+  context  N                                                             greedy memory window (>=1)
+  autogrow on|off [--max-nodes N]                                        autoscale + node cap
+  prioritize   PATTERN [--yes]                                           move matching jobs first
+  deprioritize PATTERN [--yes]                                           move matching jobs last
+  match    PATTERN                                                       dry-run: list matching jobs (read)
+  whatif   [--active GB --dcache GB --archive GB]                        budget what-if (read)
+  status                                                                 get_status_json (read)
+"""
+import os
+import sys
+import json
+import socket
+import argparse
+import traceback
+
+try:
+    import http.client as httplib
+except Exception:  # pragma: no cover
+    import httplib
+
+import zslurm_shared
+
+# Refuse a pattern (de)prioritise that would touch more than this many jobs
+# unless --yes is given (blast-radius rail).
+PATTERN_CONFIRM_THRESHOLD = 50
+
+
+def _resolve_instance(requested):
+    if requested:
+        return requested
+    try:
+        names = zslurm_shared.get_instance_names()
+    except Exception:
+        names = []
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        sys.stderr.write("zscontrol: no zslurm instance found (is the manager running?)\n")
+        sys.exit(2)
+    sys.stderr.write(f"zscontrol: multiple instances {names}; select one with --instance\n")
+    sys.exit(3)
+
+
+def _proxy(instance):
+    url = zslurm_shared.get_job_url(instance=instance)
+    return zslurm_shared.TimeoutServerProxy(url, allow_none=True)
+
+
+def _finish(result):
+    """Print a control-RPC result and exit per the code contract."""
+    if isinstance(result, dict) and result.get("ok") is False:
+        code = int(result.get("code", 3) or 3)
+        sys.stderr.write(f"zscontrol: rejected: {result.get('error', 'unknown error')}\n")
+        print(json.dumps(result, indent=2, sort_keys=True))
+        sys.exit(code if code in (2, 3) else 3)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    sys.exit(0)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="zscontrol", description="Programmatic control plane for zslurm.")
+    p.add_argument("--instance", default=None, help="instance name (default: the single running instance)")
+    p.add_argument("--token", default=None, help="control token (default: $ZSLURM_CONTROL_TOKEN)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("budget", help="set storage budget totals/inuse (GB)")
+    sp.add_argument("--active", type=float, default=None)
+    sp.add_argument("--dcache", type=float, default=None)
+    sp.add_argument("--archive", type=float, default=None)
+    sp.add_argument("--active-inuse", dest="active_inuse", type=float, default=None)
+    sp.add_argument("--dcache-inuse", dest="dcache_inuse", type=float, default=None)
+    sp.add_argument("--archive-inuse", dest="archive_inuse", type=float, default=None)
+
+    sp = sub.add_parser("lifo", help="toggle depth-first/last-in-first-out scheduling")
+    sp.add_argument("state", choices=["on", "off"])
+
+    sp = sub.add_parser("context", help="set the greedy memory-fill search window (>=1)")
+    sp.add_argument("n", type=int)
+
+    sp = sub.add_parser("autogrow", help="enable/disable autogrow and set the compute-node cap")
+    sp.add_argument("state", choices=["on", "off"], nargs="?", default=None)
+    sp.add_argument("--max-nodes", dest="max_nodes", type=int, default=None)
+
+    sp = sub.add_parser("prioritize", help="move jobs whose name contains PATTERN to run first")
+    sp.add_argument("pattern")
+    sp.add_argument("--yes", action="store_true", help="confirm even if many jobs match")
+
+    sp = sub.add_parser("deprioritize", help="move jobs whose name contains PATTERN to run last")
+    sp.add_argument("pattern")
+    sp.add_argument("--yes", action="store_true", help="confirm even if many jobs match")
+
+    sp = sub.add_parser("match", help="dry-run: list jobs whose name contains PATTERN (read)")
+    sp.add_argument("pattern")
+
+    sp = sub.add_parser("whatif", help="what-if: budget-eligible pending jobs at proposed totals (read)")
+    sp.add_argument("--active", type=float, default=None)
+    sp.add_argument("--dcache", type=float, default=None)
+    sp.add_argument("--archive", type=float, default=None)
+
+    sub.add_parser("status", help="get_status_json (read)")
+
+    sp = sub.add_parser("forecast", help="will a planned job set fit the storage budgets? (read)")
+    sp.add_argument("plan", help="path to a JSON plan (list of job dicts), or '-' for stdin, or '@path'")
+
+    sp = sub.add_parser("jobs", help="detailed per-job view incl. requeue/mem-pressure (read)")
+    sp.add_argument("--states", default=None, help="comma-separated state filter, e.g. RUNNING,PENDING")
+
+    sub.add_parser("autogrow-plan", help="controller's last autogrow plan + cap (read)")
+
+    sub.add_parser("recompute-inuse", help="repair budget drift: recompute inuse from running jobs")
+
+    sp = sub.add_parser("grow", help="start N Slurm engines (DANGEROUS: sbatches real allocations, burns SBUs)")
+    sp.add_argument("n", type=int)
+    sp.add_argument("--partition", default=None)
+    sp.add_argument("--cores", type=int, default=0, help="cpus-per-task; 0 = whole node (--exclusive)")
+    sp.add_argument("--constraint", default="", help="Slurm feature, e.g. scratch-node")
+    sp.add_argument("--time", dest="stime", default=None, help="walltime, e.g. 5-0:0:0")
+    sp.add_argument("--yes", action="store_true", help="required to actually start engines")
+
+    sp = sub.add_parser("shrink", help="stop N Slurm engines (prefers queued > idle > oldest)")
+    sp.add_argument("n", type=int)
+
+    args = p.parse_args()
+    token = args.token if args.token is not None else os.environ.get("ZSLURM_CONTROL_TOKEN")
+    instance = _resolve_instance(args.instance)
+
+    try:
+        proxy = _proxy(instance)
+
+        if args.cmd == "status":
+            _finish(proxy.get_status_json())
+
+        if args.cmd == "match":
+            rows = proxy.match_jobs(args.pattern)
+            print(json.dumps({"ok": True, "pattern": args.pattern, "matched": len(rows),
+                              "jobs": rows}, indent=2, sort_keys=True))
+            sys.exit(0)
+
+        if args.cmd == "whatif":
+            _finish(proxy.whatif_budget(args.active, args.dcache, args.archive))
+
+        if args.cmd == "forecast":
+            # read the plan (list of job dicts) from file/stdin
+            src = args.plan
+            if src == "-":
+                text = sys.stdin.read()
+            else:
+                if src.startswith("@"):
+                    src = src[1:]
+                with open(src) as fh:
+                    text = fh.read()
+            try:
+                plan = json.loads(text)
+            except Exception as ex:
+                sys.stderr.write(f"zscontrol: plan is not valid JSON: {ex}\n")
+                sys.exit(3)
+            if not isinstance(plan, list):
+                sys.stderr.write("zscontrol: plan must be a JSON list of job objects\n")
+                sys.exit(3)
+            result = proxy.forecast_budget(plan)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            sys.exit(0)  # read: verdict is in the JSON ('SAFE'/'ORDER_SENSITIVE'/'INFEASIBLE')
+
+        if args.cmd == "jobs":
+            states = args.states.split(",") if args.states else None
+            rows = proxy.list_jobs_detailed(None, states)
+            print(json.dumps({"ok": True, "jobs": rows}, indent=2, sort_keys=True))
+            sys.exit(0)
+
+        if args.cmd == "autogrow-plan":
+            print(json.dumps(proxy.get_autogrow_plan(), indent=2, sort_keys=True))
+            sys.exit(0)
+
+        if args.cmd == "recompute-inuse":
+            _finish(proxy.recompute_inuse_from_running(token))
+
+        if args.cmd == "shrink":
+            _finish(proxy.shrink(token, int(args.n)))
+
+        if args.cmd == "grow":
+            if not args.yes:
+                sys.stderr.write(f"zscontrol: grow starts {args.n} real Slurm engine(s) and burns SBUs; "
+                                 f"re-run with --yes to confirm (and check budget-overview first)\n")
+                print(json.dumps({"ok": False, "code": 3, "error": "grow needs --yes"}, indent=2))
+                sys.exit(3)
+            _finish(proxy.grow(token, int(args.n), args.partition, args.stime, args.constraint, int(args.cores)))
+
+        if args.cmd == "budget":
+            _finish(proxy.set_budgets(token, args.active, args.dcache, args.archive,
+                                      args.active_inuse, args.dcache_inuse, args.archive_inuse))
+
+        if args.cmd == "lifo":
+            _finish(proxy.set_scheduler_mode(token, args.state == "on", None))
+
+        if args.cmd == "context":
+            _finish(proxy.set_scheduler_mode(token, None, int(args.n)))
+
+        if args.cmd == "autogrow":
+            enable = None if args.state is None else (args.state == "on")
+            _finish(proxy.set_autogrow(token, enable, args.max_nodes))
+
+        if args.cmd in ("prioritize", "deprioritize"):
+            # Blast-radius rail: dry-run the match first, refuse huge matches.
+            matched = proxy.match_jobs(args.pattern)
+            n = len(matched)
+            if n == 0:
+                sys.stderr.write(f"zscontrol: pattern '{args.pattern}' matched 0 jobs\n")
+                print(json.dumps({"ok": False, "code": 3, "error": "pattern matched 0 jobs",
+                                  "pattern": args.pattern}, indent=2))
+                sys.exit(3)
+            if n > PATTERN_CONFIRM_THRESHOLD and not args.yes:
+                sys.stderr.write(f"zscontrol: pattern '{args.pattern}' matches {n} jobs "
+                                 f"(> {PATTERN_CONFIRM_THRESHOLD}); re-run with --yes to confirm\n")
+                print(json.dumps({"ok": False, "code": 3, "error": "too many matches; pass --yes",
+                                  "pattern": args.pattern, "matched": n}, indent=2))
+                sys.exit(3)
+            fn = proxy.prioritize if args.cmd == "prioritize" else proxy.deprioritize
+            _finish(fn(token, args.pattern))
+
+    except (socket.error, httplib.HTTPException, KeyError) as ex:
+        sys.stderr.write(f"zscontrol: cannot reach manager for instance '{instance}': {ex}\n")
+        sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception as ex:
+        sys.stderr.write(f"zscontrol: unexpected error: {ex}\n")
+        traceback.print_exc()
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

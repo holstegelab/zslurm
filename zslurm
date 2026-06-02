@@ -29,6 +29,9 @@ try:
     import ipyparallel
 except ImportError:
     ipyparallel = None
+import argparse
+import json
+import signal
 
 mylocal_id = zslurm_shared.short_name(zslurm_shared.get_hostname())
 PHASING_OUT = "PHASING_OUT"
@@ -100,7 +103,7 @@ class Status(object):
         self.address = ""
         self.port = 0
         self.instance_name = None
-        self.lastin_first = False
+        self.lastin_first = True
         self.prio_fillmem_context = 500
         self.used_load = numpy.array([], dtype=float)
         self.used_cpus = numpy.array([], dtype=float)
@@ -152,8 +155,16 @@ class Status(object):
         self.staging_autogrow_burst_nodes = 4
         self.node_reports_file = None
         self.reports_lock = threading.RLock()
-        self.autogrow_plan = None        
-        
+        self.autogrow_plan = None
+
+        # Agent / programmatic-control interface (see docs/agent-interface-plan.md).
+        # Mutating control RPCs (set_budgets/set_scheduler_mode/set_autogrow/
+        # prioritize/deprioritize) are refused unless enable_control_rpc is True.
+        # control_token, when set, must be supplied by the caller for those RPCs.
+        self.config = {}
+        self.enable_control_rpc = False
+        self.control_token = None
+
 
     def set_address(self, address, port):
         self.address = address
@@ -282,6 +293,11 @@ def _apply_cluster_config(config):
     status.staging_autogrow_burst_threshold = _cfg_int(cfg.get("staging_autogrow_burst_threshold"), 50)
     status.staging_autogrow_base_nodes = max(0, _cfg_int(cfg.get("staging_autogrow_base_nodes"), 1))
     status.staging_autogrow_burst_nodes = max(status.staging_autogrow_base_nodes, _cfg_int(cfg.get("staging_autogrow_burst_nodes"), 4))
+
+    # Agent control interface (mutating RPCs gated, see docs/agent-interface-plan.md)
+    status.enable_control_rpc = _cfg_bool(cfg.get("enable_control_rpc"), False)
+    token = cfg.get("control_token")
+    status.control_token = str(token) if token else None
 
 
 def parse_timeleft(time):
@@ -476,6 +492,11 @@ class JobManager(object):
         self.dcache_total = 0
         self.dcache_inuse = 0
 
+        # idempotent submission: maps a client-supplied idempotency_key -> jobid,
+        # so a retried submit_job (e.g. after a socket timeout that actually
+        # succeeded) returns the existing jobid instead of double-submitting.
+        self.seen_tokens = {}
+
     def _resource_fits_locked(self, total, inuse, needed):
         try:
             needed_val = float(needed)
@@ -520,6 +541,357 @@ class JobManager(object):
 
         self.eligible_jobs = counts
         self._eligible_cache_ts = now
+
+    # ---- Agent / programmatic interface (read) -----------------------------
+    def get_status_json(self):
+        """Machine-readable budget + scheduler snapshot for an autonomous agent.
+
+        The three storage budgets are not exposed by queue_stats(); this is the
+        only place they are readable over RPC. pending_add is the sum of the
+        *_start_use_add of currently PENDING/REQUEUED jobs (i.e. demand that has
+        not yet been reserved), and min_pending_add is the smallest positive add
+        per tier (used by the budget_stall alarm in zsstatus)."""
+        self.lock.acquire()
+        try:
+            pend_add = {'active': 0.0, 'dcache': 0.0, 'archive': 0.0}
+            min_add = {'active': None, 'dcache': None, 'archive': None}
+            n_pending = 0
+            n_budget_pending = 0
+            for job in self.jobs_by_id.values():
+                if getattr(job, 'state', None) not in queue_states:
+                    continue
+                n_pending += 1
+                vals = {
+                    'active': float(getattr(job, 'active_start_use_add', 0.0) or 0.0),
+                    'dcache': float(getattr(job, 'dcache_start_use_add', 0.0) or 0.0),
+                    'archive': float(getattr(job, 'archive_start_use_add', 0.0) or 0.0),
+                }
+                if any(v > 0 for v in vals.values()):
+                    n_budget_pending += 1
+                for k, v in vals.items():
+                    pend_add[k] += v
+                    if v > 0 and (min_add[k] is None or v < min_add[k]):
+                        min_add[k] = v
+            budgets = {
+                'active':  {'total': float(self.active_total),  'inuse': float(self.active_inuse),  'pending_add': pend_add['active'],  'min_pending_add': min_add['active']},
+                'dcache':  {'total': float(self.dcache_total),  'inuse': float(self.dcache_inuse),  'pending_add': pend_add['dcache'],  'min_pending_add': min_add['dcache']},
+                'archive': {'total': float(self.archive_total), 'inuse': float(self.archive_inuse), 'pending_add': pend_add['archive'], 'min_pending_add': min_add['archive']},
+            }
+            cfg = getattr(status, 'config', {}) or {}
+            return {
+                'budgets': budgets,
+                'scheduler': {
+                    'lastin_first': bool(status.lastin_first),
+                    'prio_fillmem_context': int(status.prio_fillmem_context),
+                    'autogrow_enable': bool(status.autogrow_enable),
+                    'autoconsolidate_enable': bool(status.autoconsolidate_enable),
+                    'autogrow_max_compute_nodes': int(cfg.get('autogrow_max_compute_nodes', 0) or 0),
+                },
+                'pending_jobs': n_pending,
+                'budgeted_pending_jobs': n_budget_pending,
+            }
+        finally:
+            self.lock.release()
+
+    def match_jobs(self, pattern):
+        """Return [[jobid, name, state, partition], ...] for jobs whose name
+        contains pattern. Dry-run helper before any prioritize/cancel-by-pattern."""
+        pat = str(pattern)
+        out = []
+        self.lock.acquire()
+        try:
+            for jobid, job in self.jobs_by_id.items():
+                if pat in str(getattr(job, 'job_name', '')):
+                    out.append([jobid, job.job_name, job.state, job.partition])
+            return out
+        finally:
+            self.lock.release()
+
+    def whatif_budget(self, active_total=None, dcache_total=None, archive_total=None):
+        """Read-only: how many PENDING jobs would be budget-eligible per partition
+        at the proposed totals vs now. Reuses the same total>=inuse+add invariant
+        the scheduler enforces; does NOT mutate state."""
+        def fits(total, inuse, need):
+            try:
+                need = float(need)
+            except Exception:
+                need = 0.0
+            return need <= 0.0 or float(total) >= float(inuse) + need
+        self.lock.acquire()
+        try:
+            at = self.active_total if active_total is None else float(active_total)
+            dt = self.dcache_total if dcache_total is None else float(dcache_total)
+            rt = self.archive_total if archive_total is None else float(archive_total)
+            cur = {}
+            new = {}
+            for job in self.jobs_by_id.values():
+                if getattr(job, 'state', None) not in queue_states:
+                    continue
+                part = str(getattr(job, 'partition', 'compute') or 'compute')
+                a = getattr(job, 'active_start_use_add', 0.0)
+                d = getattr(job, 'dcache_start_use_add', 0.0)
+                r = getattr(job, 'archive_start_use_add', 0.0)
+                cur_ok = (fits(self.active_total, self.active_inuse, a)
+                          and fits(self.dcache_total, self.dcache_inuse, d)
+                          and fits(self.archive_total, self.archive_inuse, r))
+                new_ok = (fits(at, self.active_inuse, a)
+                          and fits(dt, self.dcache_inuse, d)
+                          and fits(rt, self.archive_inuse, r))
+                cur[part] = cur.get(part, 0) + (1 if cur_ok else 0)
+                new[part] = new.get(part, 0) + (1 if new_ok else 0)
+            delta = {p: new.get(p, 0) - cur.get(p, 0) for p in set(list(cur) + list(new))}
+            return {
+                'proposed_totals': {'active': at, 'dcache': dt, 'archive': rt},
+                'current_eligible_by_partition': cur,
+                'whatif_eligible_by_partition': new,
+                'delta_by_partition': delta,
+            }
+        finally:
+            self.lock.release()
+
+    # ---- Agent / programmatic interface (write) ----------------------------
+    def set_budgets(self, active_total=None, dcache_total=None, archive_total=None,
+                    active_inuse=None, dcache_inuse=None, archive_inuse=None):
+        """Set the three storage-budget totals/inuse the TUI keys 1-6 set. Takes
+        jobs.lock (the TUI path does not; this is intentional hardening) and forces
+        the eligible-count cache to recompute so a stall clears immediately.
+
+        total < inuse is allowed (matches the TUI): it does not corrupt anything, it
+        simply means "over budget" and blocks further budgeted dispatch until inuse
+        drains -- the intended back-pressure. Use recompute_inuse_from_running() to
+        re-derive inuse from running jobs if it has drifted."""
+        self.lock.acquire()
+        try:
+            if active_total is not None:
+                self.active_total = float(active_total)
+            if dcache_total is not None:
+                self.dcache_total = float(dcache_total)
+            if archive_total is not None:
+                self.archive_total = float(archive_total)
+            if active_inuse is not None:
+                self.active_inuse = float(active_inuse)
+            if dcache_inuse is not None:
+                self.dcache_inuse = float(dcache_inuse)
+            if archive_inuse is not None:
+                self.archive_inuse = float(archive_inuse)
+            self._eligible_cache_ts = 0.0
+            return {
+                'active':  {'total': float(self.active_total),  'inuse': float(self.active_inuse)},
+                'dcache':  {'total': float(self.dcache_total),  'inuse': float(self.dcache_inuse)},
+                'archive': {'total': float(self.archive_total), 'inuse': float(self.archive_inuse)},
+            }
+        finally:
+            self.lock.release()
+
+    def list_jobs_detailed(self, owner=None, states=None):
+        """Like list_jobs but named-key dicts with the extra signals an agent needs
+        to spot stuck / OOM-looping jobs: requeue_remaining, current vs reserved mem
+        (mem_pressure), runtime. Separate from list_jobs so the 14-field positional
+        tuple (consumed by zsqueue and the Snakemake plugin) stays stable."""
+        want_states = set(states) if states else None
+        out = []
+        self.lock.acquire()
+        try:
+            now = time.time()
+            for job in self.jobs_by_id.values():
+                if owner is not None and str(getattr(job, 'owner', None)) != str(owner):
+                    continue
+                st = getattr(job, 'state', None)
+                if want_states is not None and st not in want_states:
+                    continue
+                mem_res = float(getattr(job, 'mem', 0.0) or 0.0)
+                cur_mem = float(getattr(job, 'current_mem_usage', 0.0) or 0.0)
+                runtime = (now - job.starttime) if getattr(job, 'starttime', None) else 0.0
+                out.append({
+                    'jobid': str(job.jobid),
+                    'name': job.job_name,
+                    'state': st,
+                    'partition': job.partition,
+                    'node': job.node_id if job.node_id is not None else "(Resources)",
+                    'cores': float(getattr(job, 'ncpu', 0.0) or 0.0),
+                    'mem_reserved_mb': mem_res,
+                    'current_mem_mb': cur_mem,
+                    'mem_pressure': (cur_mem / mem_res) if mem_res > 0 else 0.0,
+                    'current_cpu': float(getattr(job, 'current_cpu_usage', 0.0) or 0.0),
+                    'runtime_s': float(runtime),
+                    'requeue_remaining': int(getattr(job, 'requeue', 0) or 0),
+                    'reqtime_s': float(getattr(job, 'reqtime', 0.0) or 0.0),
+                    'active_use_gb': float(getattr(job, 'active_start_use_add', 0.0) - getattr(job, 'active_end_use_remove', 0.0)),
+                    'dcache_use_gb': float(getattr(job, 'dcache_start_use_add', 0.0) - getattr(job, 'dcache_end_use_remove', 0.0)),
+                    'arch_use_gb': float(getattr(job, 'archive_start_use_add', 0.0) - getattr(job, 'archive_end_use_remove', 0.0)),
+                    'ssd_use': getattr(job, 'ssd_use', 'no'),
+                    'ssd_gb': float(getattr(job, 'ssd_gb', 0.0) or 0.0),
+                    'comment': getattr(job, 'comment', ''),
+                })
+            return out
+        finally:
+            self.lock.release()
+
+    def recompute_inuse_from_running(self):
+        """Repair storage-budget drift: recompute each *_inuse as the sum of
+        *_start_use_add over jobs currently RUNNING or ASSIGNED. Useful after a
+        crash/restart or a missed reconcile (poll re-reservation can double-count).
+        Returns the before/after inuse values."""
+        self.lock.acquire()
+        try:
+            before = {'active': float(self.active_inuse), 'dcache': float(self.dcache_inuse),
+                      'archive': float(self.archive_inuse)}
+            sums = {'active': 0.0, 'dcache': 0.0, 'archive': 0.0}
+            for job in self.jobs_by_id.values():
+                if getattr(job, 'state', None) in ('RUNNING', 'ASSIGNED'):
+                    sums['active'] += float(getattr(job, 'active_start_use_add', 0.0) or 0.0)
+                    sums['dcache'] += float(getattr(job, 'dcache_start_use_add', 0.0) or 0.0)
+                    sums['archive'] += float(getattr(job, 'archive_start_use_add', 0.0) or 0.0)
+            self.active_inuse = sums['active']
+            self.dcache_inuse = sums['dcache']
+            self.archive_inuse = sums['archive']
+            self._eligible_cache_ts = 0.0
+            return {'before': before, 'after': sums}
+        finally:
+            self.lock.release()
+
+    def forecast_budget(self, plan):
+        """Read-only: will a planned set of jobs fit the three storage budgets?
+
+        plan = [ {name, partition, ncpu, mem, reqtime,
+                  active_use_add, active_use_remove, dcache_use_add, dcache_use_remove,
+                  arch_use_add|archive_use_add, arch_use_remove|archive_use_remove,
+                  depends_on:[names]}, ... ]
+
+        Two bounds per tier, starting from live inuse:
+          worst_case_peak = inuse + sum(all *_use_add)   (every job reserved, none released)
+          optimistic_peak = peak of a perfectly-serialized run in dependency order
+                            (each job adds at start, releases its remove before the next)
+        Verdict per tier:  worst<=total -> SAFE (any order);
+          optimistic<=total<worst -> ORDER_SENSITIVE (feasible if depth-first/LIFO drains);
+          optimistic>total -> INFEASIBLE.
+        Overall verdict is the worst tier. Also reports the first job at which the
+        optimistic peak crosses the total (first_blocking_job) and a light compute fit."""
+        def g(d, *keys):
+            for k in keys:
+                if k in d and d[k] is not None:
+                    try:
+                        return float(d[k])
+                    except Exception:
+                        return 0.0
+            return 0.0
+
+        # normalize plan items
+        items = []
+        for i, j in enumerate(plan or []):
+            j = j or {}
+            items.append({
+                'name': str(j.get('name', f'job{i}')),
+                'partition': str(j.get('partition', 'compute') or 'compute'),
+                'ncpu': g(j, 'ncpu', 'n', 'cores'),
+                'mem': g(j, 'mem', 'mem_mb'),
+                'add': {'active': g(j, 'active_use_add'), 'dcache': g(j, 'dcache_use_add'),
+                        'archive': g(j, 'arch_use_add', 'archive_use_add')},
+                'rem': {'active': g(j, 'active_use_remove'), 'dcache': g(j, 'dcache_use_remove'),
+                        'archive': g(j, 'arch_use_remove', 'archive_use_remove')},
+                'depends_on': list(j.get('depends_on', []) or []),
+            })
+
+        # topological order by depends_on (fall back to given order on cycle/missing)
+        had_deps = any(it['depends_on'] for it in items)
+        order = items
+        try:
+            byname = {it['name']: it for it in items}
+            indeg = {it['name']: 0 for it in items}
+            adj = {it['name']: [] for it in items}
+            for it in items:
+                for dep in it['depends_on']:
+                    if dep in byname:
+                        adj[dep].append(it['name'])
+                        indeg[it['name']] += 1
+            ready = [n for n in indeg if indeg[n] == 0]
+            topo = []
+            while ready:
+                n = ready.pop(0)
+                topo.append(byname[n])
+                for m in adj[n]:
+                    indeg[m] -= 1
+                    if indeg[m] == 0:
+                        ready.append(m)
+            if len(topo) == len(items):
+                order = topo
+        except Exception:
+            order = items
+
+        # Snapshot engine maxima under engines.lock FIRST, then take jobs.lock for
+        # budgets. Acquiring the two locks sequentially (never nested) avoids both a
+        # lock-ordering deadlock and a concurrent-modification race on engine_by_id.
+        try:
+            engines.lock.acquire()
+            try:
+                eng = list(engines.engine_by_id.values())
+            finally:
+                engines.lock.release()
+            max_eng_cores = max([float(getattr(e, 'cores', 0.0) or 0.0) for e in eng], default=0.0)
+            max_eng_mem = max([float(getattr(e, 'totmem', 0.0) or 0.0) for e in eng], default=0.0)
+        except Exception:
+            max_eng_cores = max_eng_mem = 0.0
+
+        self.lock.acquire()
+        try:
+            live = {'active': float(self.active_inuse), 'dcache': float(self.dcache_inuse),
+                    'archive': float(self.archive_inuse)}
+            totals = {'active': float(self.active_total), 'dcache': float(self.dcache_total),
+                      'archive': float(self.archive_total)}
+        finally:
+            self.lock.release()
+
+        tiers = ('active', 'dcache', 'archive')
+        worst = {t: live[t] + sum(it['add'][t] for it in items) for t in tiers}
+        opt_peak = {t: live[t] for t in tiers}
+        running = {t: live[t] for t in tiers}
+        first_block = {t: None for t in tiers}
+        for it in order:
+            for t in tiers:
+                during = running[t] + it['add'][t]
+                if during > opt_peak[t]:
+                    opt_peak[t] = during
+                if first_block[t] is None and it['add'][t] > 0 and during > totals[t]:
+                    first_block[t] = it['name']
+                running[t] = running[t] + it['add'][t] - it['rem'][t]
+
+        def verdict_for(t):
+            if worst[t] <= totals[t]:
+                return 'SAFE'
+            if opt_peak[t] <= totals[t]:
+                return 'ORDER_SENSITIVE'
+            return 'INFEASIBLE'
+
+        rank = {'SAFE': 0, 'ORDER_SENSITIVE': 1, 'INFEASIBLE': 2}
+        per_tier = {}
+        overall = 'SAFE'
+        for t in tiers:
+            v = verdict_for(t)
+            per_tier[t] = {
+                'total': totals[t], 'current_inuse': live[t],
+                'plan_add_total': sum(it['add'][t] for it in items),
+                'worst_case_peak': worst[t], 'optimistic_peak': opt_peak[t],
+                'headroom': totals[t] - live[t], 'verdict': v,
+                'first_blocking_job': first_block[t],
+            }
+            if rank[v] > rank[overall]:
+                overall = v
+
+        sum_cores = sum(it['ncpu'] for it in items)
+        max_job_cores = max([it['ncpu'] for it in items], default=0.0)
+        max_job_mem = max([it['mem'] for it in items], default=0.0)
+        compute = {
+            'jobs': len(items),
+            'sum_cores': sum_cores,
+            'max_single_job_cores': max_job_cores,
+            'max_single_job_mem_mb': max_job_mem,
+            'max_engine_cores': max_eng_cores,
+            'max_engine_totmem_mb': max_eng_mem,
+            'oversized_job': bool(max_eng_cores > 0 and max_job_cores > max_eng_cores)
+                             or bool(max_eng_mem > 0 and max_job_mem > max_eng_mem),
+        }
+        return {'verdict': overall, 'budgets': per_tier, 'compute': compute,
+                'ordered_by_dependencies': bool(had_deps and order is not items)}
 
     def get_job_stats(self):
         self.lock.acquire()
@@ -594,13 +966,28 @@ class JobManager(object):
         comment="",
         ssd_use='no',
         ssd_gb=0,
-        owner=None
+        owner=None,
+        idempotency_key=None
     ):
+        # Idempotent submission: a retried submit with the same key returns the
+        # already-created jobid instead of double-submitting (see seen_tokens).
+        # The check and the jobid-reservation MUST be atomic (one lock hold), else
+        # two concurrent retries both miss the token and both create a job.
         self.lock.acquire()
-        jobid = str(self.jobid_counter)
-        self.jobid_counter += 1
-        self.total_jobs[partition] = self.total_jobs.get(partition, 0) + 1
-        self.lock.release()
+        try:
+            existing = self.seen_tokens.get(str(idempotency_key)) if idempotency_key else None
+            if existing is None:
+                jobid = str(self.jobid_counter)
+                self.jobid_counter += 1
+                self.total_jobs[partition] = self.total_jobs.get(partition, 0) + 1
+                if idempotency_key:
+                    self.seen_tokens[str(idempotency_key)] = jobid
+        finally:
+            self.lock.release()
+
+        if existing is not None:
+            add_log_line(gb, f"Job {job_name} idempotency_key={idempotency_key} replayed -> jobid {existing}", YELLOW)
+            return existing
 
         # weird xml-rpc problem?
         if len(env) == 1 and "data" in env:
@@ -1513,6 +1900,206 @@ job_finished = lambda *args: jobs.job_finished(*args)
 can_run_assigned_job = lambda *args: jobs.can_run_assigned_job(*args)
 
 
+# ===========================================================================
+# Agent / programmatic control interface (registered on the job server below).
+# See docs/agent-interface-plan.md. Read RPCs are open; mutating RPCs are
+# refused with {"ok": False, "code": 3, ...} unless enable_control_rpc is set,
+# and require control_token when one is configured. Returning a structured
+# {"ok": ...} dict (instead of raising) keeps the contract jsonable and lets
+# clients map code 3 -> non-retryable exit without parsing XML-RPC Faults.
+# ===========================================================================
+SCHEMA_VERSION = 1
+_MANAGER_START_TS = None
+_CONTROLLER_THREAD = None
+
+
+def _control_denied(token):
+    if not getattr(status, 'enable_control_rpc', False):
+        return {"ok": False, "code": 3,
+                "error": "control RPC disabled; set 'enable_control_rpc: true' in "
+                         "~/.zslurm/config.yaml (or start the manager with --enable-control)"}
+    ct = getattr(status, 'control_token', None)
+    if ct and str(token) != str(ct):
+        return {"ok": False, "code": 3, "error": "invalid control token"}
+    return None
+
+
+def ping():
+    up = None if _MANAGER_START_TS is None else (time.time() - _MANAGER_START_TS)
+    return {
+        "ok": True,
+        "schema_version": SCHEMA_VERSION,
+        "instance": getattr(status, 'instance_name', None),
+        "uptime_s": up,
+        "job_server_alive": Servers.job_server is not None,
+        "manager_server_alive": Servers.manager_server is not None,
+        "controller_alive": bool(_CONTROLLER_THREAD is not None and _CONTROLLER_THREAD.is_alive()),
+        "lastin_first": bool(status.lastin_first),
+        "prio_fillmem_context": int(status.prio_fillmem_context),
+        "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
+    }
+
+
+health = ping  # alias
+
+
+def get_status_json():
+    return jobs.get_status_json()
+
+
+def match_jobs(pattern):
+    return jobs.match_jobs(pattern)
+
+
+def whatif_budget(active_total=None, dcache_total=None, archive_total=None):
+    return jobs.whatif_budget(active_total, dcache_total, archive_total)
+
+
+def set_budgets(token=None, active_total=None, dcache_total=None, archive_total=None,
+                active_inuse=None, dcache_inuse=None, archive_inuse=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    res = jobs.set_budgets(active_total, dcache_total, archive_total,
+                           active_inuse, dcache_inuse, archive_inuse)
+    add_log_line(gb, f"[agent] budgets set -> {res}", CYAN)
+    return {"ok": True, "budgets": res}
+
+
+def set_scheduler_mode(token=None, lastin_first=None, prio_fillmem_context=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if lastin_first is not None:
+        status.lastin_first = bool(lastin_first)
+    if prio_fillmem_context is not None:
+        try:
+            status.prio_fillmem_context = max(1, int(prio_fillmem_context))
+        except Exception:
+            pass
+    add_log_line(gb, f"[agent] scheduler mode: lastin_first={status.lastin_first} "
+                     f"prio_fillmem_context={status.prio_fillmem_context}", CYAN)
+    return {"ok": True, "lastin_first": bool(status.lastin_first),
+            "prio_fillmem_context": int(status.prio_fillmem_context)}
+
+
+def set_autogrow(token=None, enable=None, max_compute_nodes=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if enable is not None:
+        status.autogrow_enable = bool(enable)
+    if max_compute_nodes is not None:
+        try:
+            if not isinstance(getattr(status, 'config', None), dict):
+                status.config = {}
+            status.config['autogrow_max_compute_nodes'] = max(0, int(max_compute_nodes))
+        except Exception:
+            pass
+    cfg = getattr(status, 'config', {}) or {}
+    add_log_line(gb, f"[agent] autogrow: enable={status.autogrow_enable} "
+                     f"max_nodes={cfg.get('autogrow_max_compute_nodes')}", CYAN)
+    return {"ok": True, "autogrow_enable": bool(status.autogrow_enable),
+            "autogrow_max_compute_nodes": int(cfg.get('autogrow_max_compute_nodes', 0) or 0)}
+
+
+def rpc_prioritize(token=None, pattern=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if not pattern:
+        return {"ok": False, "code": 3, "error": "empty pattern"}
+    matched = jobs.match_jobs(pattern)
+    jobs.prioritize(pattern)
+    add_log_line(gb, f"[agent] prioritize '{pattern}' ({len(matched)} jobs, lastin_first={status.lastin_first})", CYAN)
+    return {"ok": True, "matched": len(matched), "lastin_first": bool(status.lastin_first)}
+
+
+def rpc_deprioritize(token=None, pattern=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if not pattern:
+        return {"ok": False, "code": 3, "error": "empty pattern"}
+    matched = jobs.match_jobs(pattern)
+    jobs.deprioritize(pattern)
+    add_log_line(gb, f"[agent] deprioritize '{pattern}' ({len(matched)} jobs, lastin_first={status.lastin_first})", CYAN)
+    return {"ok": True, "matched": len(matched), "lastin_first": bool(status.lastin_first)}
+
+
+# ---- Phase 3: planning / observability (read) -----------------------------
+def forecast_budget(plan):
+    return jobs.forecast_budget(plan)
+
+
+def list_jobs_detailed(owner=None, states=None):
+    return jobs.list_jobs_detailed(owner, states)
+
+
+def get_autogrow_plan():
+    """Expose the controller's last autogrow plan (rendered only to curses today)."""
+    return {"ok": True, "autogrow_plan": getattr(status, 'autogrow_plan', None),
+            "autogrow_enable": bool(status.autogrow_enable),
+            "autogrow_max_compute_nodes": int((getattr(status, 'config', {}) or {}).get('autogrow_max_compute_nodes', 0) or 0)}
+
+
+# ---- Phase 3/4: repair + fleet (write, gated) ------------------------------
+def recompute_inuse_from_running(token=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    res = jobs.recompute_inuse_from_running()
+    add_log_line(gb, f"[agent] recompute inuse from running -> {res}", CYAN)
+    return {"ok": True, **res}
+
+
+def grow(token=None, n=1, partition=None, stime=None, constraint="", cores=0):
+    """Start n Slurm-backed engines (wraps EngineManager.start_slurm). DANGEROUS:
+    this sbatches real Slurm allocations and burns SBUs -- gate it and cap autogrow."""
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    try:
+        n = int(n)
+    except Exception:
+        return {"ok": False, "code": 3, "error": "n must be an integer"}
+    if n < 1:
+        return {"ok": False, "code": 3, "error": "n must be >= 1"}
+    part = partition or status.default_partition
+    walltime = stime or getattr(status, 'autogrow_runtime_default', "5-0:0:0")
+    try:
+        cores = int(cores)
+    except Exception:
+        cores = 0
+    add_log_line(gb, f"[agent] grow: {n} engine(s) on {part} (cores={cores or 'exclusive'}, "
+                     f"constraint={constraint or '-'}, t={walltime})", YELLOW)
+    # start_slurm returns Engine objects (not XML-RPC serializable) or None on error;
+    # surface only the serializable cluster ids + count.
+    started = engines.start_slurm(gb, n, walltime, part, constraint or "", cores)
+    cluster_ids = [str(getattr(e, 'cluster_id', '')) for e in (started or [])]
+    return {"ok": bool(started), "requested": n, "partition": part, "cores": cores,
+            "constraint": constraint or None, "stime": walltime,
+            "started": len(cluster_ids), "cluster_ids": cluster_ids,
+            "error": None if started else "sbatch submission failed (see cluster.log)"}
+
+
+def shrink(token=None, n=1):
+    """Stop n Slurm-backed engines (wraps EngineManager.stop_slurm; prefers queued
+    > idle > oldest)."""
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    try:
+        n = int(n)
+    except Exception:
+        return {"ok": False, "code": 3, "error": "n must be an integer"}
+    if n < 1:
+        return {"ok": False, "code": 3, "error": "n must be >= 1"}
+    add_log_line(gb, f"[agent] shrink: stop {n} engine(s)", YELLOW)
+    engines.stop_slurm(gb, n)
+    return {"ok": True, "requested": n}
+
+
 class RequestHandler(SimpleXMLRPCRequestHandler):
     def __init__(self, rpc_path):
         rpc_paths = (f"/{rpc_path}",)
@@ -1533,6 +2120,24 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(list_done_jobs, "list_done_jobs")
         server.register_function(queue_stats, "queue_stats")
         server.register_function(list_nodes, "list_nodes")
+        # Agent / programmatic interface (see docs/agent-interface-plan.md)
+        server.register_function(ping, "ping")
+        server.register_function(health, "health")
+        server.register_function(get_status_json, "get_status_json")
+        server.register_function(match_jobs, "match_jobs")
+        server.register_function(whatif_budget, "whatif_budget")
+        server.register_function(set_budgets, "set_budgets")
+        server.register_function(set_scheduler_mode, "set_scheduler_mode")
+        server.register_function(set_autogrow, "set_autogrow")
+        server.register_function(rpc_prioritize, "prioritize")
+        server.register_function(rpc_deprioritize, "deprioritize")
+        # Phase 3/4: planning, observability, repair, fleet
+        server.register_function(forecast_budget, "forecast_budget")
+        server.register_function(list_jobs_detailed, "list_jobs_detailed")
+        server.register_function(get_autogrow_plan, "get_autogrow_plan")
+        server.register_function(recompute_inuse_from_running, "recompute_inuse_from_running")
+        server.register_function(grow, "grow")
+        server.register_function(shrink, "shrink")
         add_log_line(gb, f"[job] started on port {port} with rpc path {rpc_path}", GREEN)
         Servers.job_server = server
         server.serve_forever()
@@ -3056,6 +3661,9 @@ def thread_start_manager_server(port, rpc_path):
 
 
 def start_server(port, rpcpath):
+    global _MANAGER_START_TS, _CONTROLLER_THREAD
+    _MANAGER_START_TS = time.time()
+
     t = threading.Thread(target=thread_start_manager_server, args=(port, rpcpath))
     t.daemon = True
     t.start()
@@ -3064,9 +3672,10 @@ def start_server(port, rpcpath):
     t.daemon = True
     t.start()
 
-    t = threading.Thread(target=thread_check_commands)
-    t.daemon = True
-    t.start()
+    tc = threading.Thread(target=thread_check_commands)
+    tc.daemon = True
+    tc.start()
+    _CONTROLLER_THREAD = tc
 
 
 # create a bordered window
@@ -3387,7 +3996,7 @@ def thread_display_status(gb, status):
                     curses.color_pair(cpu_c),
                 )
 
-                gb.wcom_status.addstr(8, 1, "Load: ")
+                gb.wcom_status.addstr(8, 1, "Host load: ")
                 gb.wcom_status.addstr(
                     8,
                     18,
@@ -3418,7 +4027,7 @@ def thread_display_status(gb, status):
                     xav = 0.0
                     yav = 0.0
                 
-                gb.wcom_status.addstr(11, 1, "Sys CPU/IO (%): ")
+                gb.wcom_status.addstr(11, 1, "Host CPU/IO (%): ")
                 gb.wcom_status.addstr(
                     11,
                     18,
@@ -4300,4 +4909,156 @@ def main(scr, *args, **kwds):
     time.sleep(2)  # wait for all paint ops to finish and engines to terminate
 
 
-curses.wrapper(main)
+def _open_report_files(config):
+    """Open the per-job report TSV (job_finished writes to it) and, if enabled,
+    the per-poll node-usage TSV. Shared by the curses and headless paths."""
+    current_date = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+    status.reports_file = open(config.get("reports_file_prefix", "report") + f'-{current_date}.tsv', "w")
+    fieldnames = [
+        "jobname", "comment", "retcode", "machine", "jobid",
+        "starttime", "endtime", "cores_reserved", "mem_reserved_mb",
+        "input_mb", "output_file",
+    ]
+    for lab in ["uss", "rss", "vms", "cpu_percentage"]:
+        for j in [0, 5, 25, 50, 75, 95, 100]:
+            fieldnames.append(lab + "_" + str(j))
+    fieldnames.extend([
+        "runtime", "montime", "avg_cpu_percentage", "nthreads_avg", "nthreads_max",
+        "user", "system", "maxrss", "mon_user", "mon_system", "iowait",
+        "read_count", "write_count", "read_bytes", "write_bytes", "memory_over_time",
+    ])
+    status.reports_file.write("\t".join(fieldnames) + "\n")
+    status.reports_file.flush()
+
+    if bool(config.get("node_reports_enable", True)):
+        status.node_reports_file = open(config.get("node_reports_file_prefix", 'node_usage') + f'-{current_date}.tsv', "w")
+        node_fields = [
+            "ts_iso", "engine_id", "cluster_id", "partition", "status", "managed",
+            "stopping", "cores", "totmem_mb", "cpu_pct", "mem_pct", "load",
+            "sys_cpu_busy_pct", "sys_iowait_pct", "res_cores_reserved",
+            "res_mem_reserved_mb", "jobs_running", "has_ssd", "ssd_total_gb",
+            "ssd_used_gb", "res_ssd_reserved_gb", "timeleft_sec", "uptime_sec",
+            "pending_jobs", "pending_cores", "pending_mem_mb",
+        ]
+        status.node_reports_file.write("\t".join(node_fields) + "\n")
+        status.node_reports_file.flush()
+
+
+def main_headless(args):
+    """Run the manager without the curses UI: just the RPC servers + controller
+    thread. Required for autonomous/agent operation and for testing the agent
+    interface (see docs/agent-interface-plan.md). add_log_line() already no-ops
+    its window writes when gb.wlog is None, so logging goes to cluster.log only."""
+    _cleanup_unreachable_instances()
+    address = zslurm_shared.get_hostname()
+    instance_name = _ensure_unique_instance(address)
+    config = zslurm_shared.get_config(instance=instance_name)
+
+    status.instance_name = instance_name
+    status.config = config
+    _apply_cluster_config(status.config)
+    if 'autogrow_max_compute_nodes' not in status.config:
+        status.config['autogrow_max_compute_nodes'] = 40
+
+    # CLI overrides: let an agent own scaling / control, and make testing safe
+    # (autogrow defaults ON and would sbatch real Slurm engines).
+    if getattr(args, 'no_autogrow', False):
+        status.autogrow_enable = False
+    if getattr(args, 'no_autoconsolidate', False):
+        status.autoconsolidate_enable = False
+    if getattr(args, 'enable_control', False):
+        status.enable_control_rpc = True
+    if getattr(args, 'control_token', None):
+        status.control_token = args.control_token
+        status.enable_control_rpc = True
+
+    def _remove_own_instance():
+        try:
+            if status.instance_name:
+                zslurm_shared.remove_instance(status.instance_name)
+        except Exception:
+            pass
+    atexit.register(_remove_own_instance)
+
+    status.set_address(address, int(config["port"]))
+
+    gb.lock = threading.RLock()
+    gb.log_file = open("cluster.log", "a")
+    gb.wlog = None  # explicit: no curses window -> add_log_line writes file only
+
+    _open_report_files(config)
+
+    add_log_line(gb, f"[manager] HEADLESS start instance={instance_name} "
+                     f"manager_port={config['port']} job_port={int(config['port'])+1} "
+                     f"rpcpath={config['rpcpath']}", GREEN)
+    add_log_line(gb, f"[manager] control_enabled={status.enable_control_rpc} "
+                     f"autogrow={status.autogrow_enable} "
+                     f"autoconsolidate={status.autoconsolidate_enable}", CYAN)
+
+    start_server(int(config["port"]), config["rpcpath"])
+
+    # One machine-readable banner on stdout so a launcher can capture the endpoint.
+    try:
+        banner = {
+            "ok": True,
+            "instance": instance_name,
+            "bind_host": address,
+            "base_port": int(config["port"]),
+            "job_port": int(config["port"]) + 1,
+            "rpcpath": config["rpcpath"],
+            "manager_url": zslurm_shared.get_manager_url(instance=instance_name),
+            "job_url": zslurm_shared.get_job_url(instance=instance_name),
+            "control_enabled": bool(status.enable_control_rpc),
+        }
+        sys.stdout.write(json.dumps(banner) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+    stop_event = threading.Event()
+
+    def _sig(signum, frame):
+        add_log_line(gb, f"[manager] signal {signum} received, shutting down", YELLOW)
+        stop_event.set()
+
+    try:
+        signal.signal(signal.SIGINT, _sig)
+        signal.signal(signal.SIGTERM, _sig)
+    except Exception:
+        pass
+
+    try:
+        while not stop_event.wait(1.0):
+            pass
+    finally:
+        try:
+            engines.stop_all()
+        except Exception:
+            pass
+        add_log_line(gb, "[manager] headless shutdown complete", YELLOW)
+
+
+def _cli_main():
+    parser = argparse.ArgumentParser(
+        prog="zslurm",
+        description="zslurm pilot-job meta-scheduler manager")
+    parser.add_argument("--headless", action="store_true",
+                        help="run without the curses UI (RPC servers + controller only); "
+                             "for autonomous/agent operation")
+    parser.add_argument("--no-autogrow", action="store_true",
+                        help="(headless) start with autogrow disabled")
+    parser.add_argument("--no-autoconsolidate", action="store_true",
+                        help="(headless) start with autoconsolidation disabled")
+    parser.add_argument("--enable-control", action="store_true",
+                        help="(headless) enable mutating control RPCs "
+                             "(set_budgets / set_scheduler_mode / set_autogrow / prioritize)")
+    parser.add_argument("--control-token", default=None,
+                        help="(headless) require this token for control RPCs (implies --enable-control)")
+    args, _unknown = parser.parse_known_args()
+    if args.headless:
+        main_headless(args)
+    else:
+        curses.wrapper(main)
+
+
+_cli_main()

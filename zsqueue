@@ -9,13 +9,32 @@ except:
 import argparse
 import sys
 import traceback
+import json
+
+SCHEMA_VERSION = 1
+# Stable, numeric field order for the 14-field list_jobs/list_done_jobs row
+# (see docs/agent-interface-plan.md). Units: runtime_s seconds, cores float,
+# cpu_usage core-equivalent fraction, mem_usage_mb MB, *_use_gb GB.
+JOB_FIELDS = ["jobid", "name", "state", "runtime_s", "cores", "partition", "node",
+              "cpu_usage", "mem_usage_mb", "arch_use_gb", "active_use_gb",
+              "dcache_use_gb", "cwd", "comment"]
 
 parser = argparse.ArgumentParser(description='ZSlurm Job queue listing')
 parser.add_argument('--all', action='store_true', help='Show also completed jobs.')
 parser.add_argument('--done', action='store_true', help='Show only completed jobs.')
 parser.add_argument('--parseable', action='store_true', help='Output TSV table suitable for parsing.')
+parser.add_argument('--json', dest='as_json', action='store_true', help='Output machine-readable JSON (numeric, schema-versioned).')
 parser.add_argument('--instance', action='append', metavar='NAME', help='Filter to a specific instance (can be given multiple times).')
 args = parser.parse_args()
+
+# Exit-code contract: 0 ok, 2 transport/instance-resolution failure (retryable).
+# Exit 2 only when EVERY targeted instance failed (consistent across all output modes).
+_fail_count = [0]
+
+def _pad(row, n=14):
+    # tolerate managers that return shorter rows (older field set)
+    row = list(row)
+    return row + [None] * (n - len(row)) if len(row) < n else row
 
 def _get_instances_from_args():
     if args.instance:
@@ -40,17 +59,50 @@ def _fetch_jobs(instance):
     except (socket.error, httplib.HTTPException) as ex:
         if url is None:
             url = "<unresolved>"
+        _fail_count[0] += 1
         sys.stderr.write(f"{instance}: failed to connect to ZSlurm manager at {url}: {ex}\n")
-        traceback.print_exc()
+        if not args.as_json:
+            traceback.print_exc()
     except KeyError:
+        _fail_count[0] += 1
         sys.stderr.write(f"Instance '{instance}' not defined in configuration.\n")
     except Exception as ex:
+        _fail_count[0] += 1
         sys.stderr.write(f"{instance}: unexpected error while fetching jobs: {ex}\n")
-        traceback.print_exc()
+        if not args.as_json:
+            traceback.print_exc()
     return []
 
 instances = _get_instances_from_args()
 user = getpass.getuser()
+
+if args.as_json:
+    out = {"schema_version": SCHEMA_VERSION, "fields": JOB_FIELDS, "instances": {}}
+    for instance in instances:
+        rows = []
+        for row in _fetch_jobs(instance):
+            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage,
+             mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(row)
+            rows.append({
+                "jobid": str(jobid),
+                "name": job_name,
+                "state": state,
+                "runtime_s": float(runtime),
+                "cores": float(cpus),
+                "partition": partition,
+                "node": node,
+                "cpu_usage": float(cpu_usage),
+                "mem_usage_mb": float(mem_usage),
+                "arch_use_gb": float(arch_use),
+                "active_use_gb": float(active_use),
+                "dcache_use_gb": float(dcache_use),
+                "cwd": cwd,
+                "comment": job_comment,
+            })
+        out["instances"][instance] = rows
+    print(json.dumps(out, indent=2, sort_keys=True))
+    sys.exit(2 if (instances and _fail_count[0] >= len(instances)) else 0)
+
 use_pretty = not args.parseable
 tabulate_module = None
 if use_pretty:
@@ -70,7 +122,8 @@ if args.parseable:
 for instance in instances:
     jobs = _fetch_jobs(instance)
     if args.parseable:
-        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment in jobs:
+        for _row in jobs:
+            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(_row)
             runtime_fmt = zslurm_shared.format_time(runtime)
             row = [
                 instance,
@@ -94,7 +147,8 @@ for instance in instances:
 
     if use_pretty and tabulate_module is not None:
         table = []
-        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment in jobs:
+        for _row in jobs:
+            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(_row)
             runtime_fmt = zslurm_shared.format_time(runtime)
             table.append([
                 jobid, partition, job_name, user, state, runtime_fmt, cpus, node,
@@ -112,8 +166,11 @@ for instance in instances:
         if len(instances) > 1:
             print(f"Instance: {instance}")
         print("JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODE\tCPU\tMEM\tACTIVE\tARCH\tDCACHE\tCWD")
-        for jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment in jobs:
+        for _row in jobs:
+            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(_row)
             runtime_fmt = zslurm_shared.format_time(runtime)
             print(f'{jobid}\t{partition}\t{job_name}\t{user}\t{state}\t{runtime_fmt}\t{cpus}\t{node}\t{cpu_usage * 100.0:.1f}\t{mem_usage / 1024.0:.1f} Gb\t{active_use:.1f} Gb\t{arch_use:.1f} Gb\t{dcache_use:.1f} Gb\t{cwd}')
         if len(instances) > 1:
             print()
+
+sys.exit(2 if (instances and _fail_count[0] >= len(instances)) else 0)
