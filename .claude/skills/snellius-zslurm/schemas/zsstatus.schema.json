@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "zsstatus output (the agent poll blob)",
+  "type": "object",
+  "required": ["ok", "schema_version", "instance"],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "code": { "type": "integer", "description": "present when ok=false: 2 transport, 3 ambiguous-instance" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "instance": { "type": "string" },
+    "health": {
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "schema_version": { "type": "integer" },
+        "uptime_s": { "type": ["number", "null"] },
+        "job_server_alive": { "type": "boolean" },
+        "manager_server_alive": { "type": "boolean" },
+        "controller_alive": { "type": "boolean" },
+        "lastin_first": { "type": "boolean" },
+        "prio_fillmem_context": { "type": "integer" },
+        "control_enabled": { "type": "boolean" }
+      }
+    },
+    "scheduler": {
+      "type": "object",
+      "properties": {
+        "lastin_first": { "type": "boolean" },
+        "prio_fillmem_context": { "type": "integer" },
+        "autogrow_enable": { "type": "boolean" },
+        "autoconsolidate_enable": { "type": "boolean" },
+        "autogrow_max_compute_nodes": { "type": "integer" }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "description": "keys: active, dcache, archive",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "total": { "type": "number" },
+          "inuse": { "type": "number" },
+          "pending_add": { "type": "number", "description": "sum of *_start_use_add over PENDING/REQUEUED jobs" },
+          "min_pending_add": { "type": ["number", "null"], "description": "smallest positive pending add (drives budget_stall)" }
+        }
+      }
+    },
+    "pending_jobs": { "type": "integer" },
+    "budgeted_pending_jobs": { "type": "integer" },
+    "queue": { "type": "object", "description": "verbatim queue_stats(): total, by_partition, states, engines" },
+    "engines": {
+      "type": "object",
+      "properties": {
+        "by_partition": { "type": "object" },
+        "totals": {
+          "type": "object",
+          "properties": {
+            "engines": { "type": "integer" },
+            "cores": { "type": "number" },
+            "res_cpu": { "type": "number" },
+            "free_cores": { "type": "number" },
+            "totmem_mb": { "type": "number" },
+            "res_mem_mb": { "type": "number" },
+            "free_mem_mb": { "type": "number" },
+            "max_cores": { "type": "number" },
+            "max_totmem_mb": { "type": "number" },
+            "ssd_engines": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "running_engines": { "type": "integer" },
+    "alarms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["alarm"],
+        "properties": {
+          "alarm": { "type": "string", "enum": ["budget_stall", "no_engines", "oversized_pending"] },
+          "tier": { "type": "string" },
+          "detail": { "type": "string" },
+          "remedy": { "type": "string" }
+        }
+      }
+    }
+  }
+}

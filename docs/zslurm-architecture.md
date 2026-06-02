@@ -348,7 +348,10 @@ The current surface is built for a **human operator at a terminal**. Concretely:
    10-field unpack) — do not use it as a programmatic entry point.
 
 These are catalogued per-component in the analysis appendix; the plan to close them is in
-[`agent-interface-plan.md`](agent-interface-plan.md).
+[`agent-interface-plan.md`](agent-interface-plan.md), and the resulting machine-readable
+interface (headless mode, `zsstatus`/`zscontrol`, `--json`, agent RPCs) is summarised in the
+repo `README.md` ("Agent / programmatic interface"). A ready-to-use Claude Code skill that
+drives it is bundled at [`.claude/skills/snellius-zslurm/`](../.claude/skills/snellius-zslurm/).
 
 ---
 

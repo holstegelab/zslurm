@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "zsnodes --json output",
+  "type": "object",
+  "required": ["schema_version", "fields", "instances"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "fields": { "type": "array", "items": { "type": "string" } },
+    "instances": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["partition", "engine_id", "cores", "totmem_mb"],
+          "properties": {
+            "partition": { "type": "string" },
+            "engine_id": { "type": "string" },
+            "cluster_id": {},
+            "cores": { "type": "number" },
+            "totmem_mb": { "type": "number" },
+            "runtime_s": { "type": "number" },
+            "timeleft_s": { "type": "number" },
+            "njobs": { "type": "integer" },
+            "cpu_usage": { "type": "number" },
+            "mem_usage_pct": { "type": "number" },
+            "load": { "type": "number" },
+            "status": { "type": "string" },
+            "sys_cpu_busy_pct": { "type": "number" },
+            "sys_iowait_pct": { "type": "number" },
+            "res_cpu_reserved": { "type": "number", "description": "reserved cores; cores - this = free" },
+            "res_mem_reserved_mb": { "type": "number" },
+            "has_ssd": { "type": "boolean" },
+            "ssd_total_gb": { "type": "number" },
+            "ssd_used_gb": { "type": "number" },
+            "res_ssd_reserved_gb": { "type": "number" }
+          }
+        }
+      }
+    }
+  }
+}

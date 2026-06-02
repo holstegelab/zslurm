@@ -771,3 +771,50 @@ The newer `zslurm.yaml` example includes additional fields such as:
 - **`--info-output-file {output[0]}`**
 
 To use a profile with Snakemake, copy one of these files to your Snakemake profile location and adapt paths such as `conda-prefix` to your own environment.
+
+## Agent / programmatic interface
+
+The commands above are built for a human at a terminal (interactive curses UI, pretty
+tables). ZSlurm also ships a **machine-readable interface** so an autonomous agent — or any
+script — can drive it without the TUI. See [`docs/zslurm-architecture.md`](docs/zslurm-architecture.md)
+for how ZSlurm works and [`docs/agent-interface-plan.md`](docs/agent-interface-plan.md) for
+the interface design and phasing.
+
+- **Headless manager**: `zslurm --headless` runs the RPC servers + controller without the
+  curses UI (for unattended/agent operation and testing). Flags: `--no-autogrow`,
+  `--no-autoconsolidate`, `--enable-control`, `--control-token TOKEN`. It prints a one-line
+  JSON banner with the instance endpoint, then runs until SIGTERM.
+- **`zsstatus`**: one JSON snapshot an agent polls — health, the three storage budgets,
+  scheduler mode, queue, an engine summary, and derived **alarms** (`budget_stall`,
+  `no_engines`, `oversized_pending`, `near_oom`).
+- **`zscontrol`**: a control plane mirroring the TUI keys. Reads (no token): `status`,
+  `whatif`, `match`, `forecast` (will a planned DAG fit the budgets?), `jobs`,
+  `autogrow-plan`. Gated writes (require `enable_control_rpc` + `control_token`): `budget`,
+  `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`, `recompute-inuse`,
+  `grow`/`shrink`.
+- **`--json`** on `zsqueue` and `zsnodes` emits numeric, schema-versioned rows;
+  `zsqueue_stats`/`zsoccupancy`/`zsstats` already have `--json`. Exit-code contract across
+  the agent clients: `0` ok, `2` transport/instance failure (retryable), `3` logical
+  rejection (e.g. control disabled, bad token) — not retryable.
+- New RPCs on the job server (gated writes behind `enable_control_rpc` + `control_token`,
+  set in `~/.zslurm/config.yaml` or via the `--enable-control`/`--control-token` flags):
+  `ping`/`health`, `get_status_json`, `match_jobs`, `whatif_budget`, `forecast_budget`,
+  `list_jobs_detailed`, `get_autogrow_plan`, `set_budgets`, `set_scheduler_mode`,
+  `set_autogrow`, `prioritize`/`deprioritize`, `recompute_inuse_from_running`,
+  `grow`/`shrink`. `submit_job` accepts an optional `idempotency_key` for retry-safe
+  submission.
+
+### Claude Code skill
+
+A ready-to-use **Claude Code skill** that teaches an agent to drive ZSlurm + Snellius is
+bundled at [`.claude/skills/snellius-zslurm/`](.claude/skills/snellius-zslurm/) — it
+auto-loads for anyone using Claude Code in this repository. To make it available globally
+(across all your projects), copy it into your user skills directory:
+
+```bash
+cp -r .claude/skills/snellius-zslurm ~/.claude/skills/
+```
+
+The skill covers the three scheduling pillars (depth-first/LIFO, memory packing across
+heterogeneous nodes, storage budgets), a Snellius node/SBU/quota reference, JSON schemas,
+worked transcripts, and the safety rails (SBU/core-hour limits, idempotency, poll cadence).

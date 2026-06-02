@@ -161,8 +161,9 @@ totals survive a manager restart without re-provisioning.
 - **Edit** `zslurm`: new RPC bodies + `register_function` lines near `zslurm:1527-1532`;
   budget/scheduler setters extracted so TUI and RPC share one path; `idempotency_key` in
   `submit_job`; headless entrypoint alongside `curses.wrapper(main)`.
-- **Edit** `zsqueue`, `zsnodes`: add `--json`.
-- **New** `zsstatus`, `zscontrol`; `docs/` schemas.
-- **New** skill in `~/.claude/skills/snellius-zslurm/` (SKILL.md + `snellius_nodes.md` +
-  `schemas/` + `examples/`).
+- **Edit** `zsqueue`, `zsnodes`: add `--json` (with row-padding + uniform exit codes).
+- **New** `zsstatus`, `zscontrol`.
+- **New** Claude Code skill bundled in the repo at `.claude/skills/snellius-zslurm/`
+  (SKILL.md + `snellius_nodes.md` + `schemas/` + `examples.md`) — auto-loads for anyone
+  using Claude Code in this repo, and can be copied to `~/.claude/skills/` for global use.
 - **Untouched**: the scheduler hot path (`request_jobs`, the greedy fit, autogrow logic).

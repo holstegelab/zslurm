@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "zsqueue --json output",
+  "type": "object",
+  "required": ["schema_version", "fields", "instances"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "fields": { "type": "array", "items": { "type": "string" } },
+    "instances": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["jobid", "name", "state", "cores", "partition"],
+          "properties": {
+            "jobid": { "type": "string" },
+            "name": { "type": "string" },
+            "state": { "type": "string", "description": "PENDING|REQUEUED|ASSIGNED|RUNNING|COMPLETED|FAILED|CANCELLED" },
+            "runtime_s": { "type": "number" },
+            "cores": { "type": "number", "description": "reserved cores (fractional allowed)" },
+            "partition": { "type": "string" },
+            "node": { "type": "string", "description": "engine id, or \"(Resources)\" if unplaced" },
+            "cpu_usage": { "type": "number", "description": "live core-equivalent usage" },
+            "mem_usage_mb": { "type": "number" },
+            "arch_use_gb": { "type": "number", "description": "net archive use = start_add - end_remove" },
+            "active_use_gb": { "type": "number" },
+            "dcache_use_gb": { "type": "number" },
+            "cwd": { "type": "string" },
+            "comment": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
