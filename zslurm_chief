@@ -52,7 +52,8 @@ config = zslurm_shared.get_config()
 port = None
 
 
-cpu = psutil.cpu_count()
+host_cpu_count = float(psutil.cpu_count() or 1.0)
+cpu = host_cpu_count
 partition = 'compute'
 cluster_managed = True
 keep_logfiles = False
@@ -105,50 +106,73 @@ myid = myip #for now
 
 
 
-e_ncpu = float(min(psutil.cpu_count(), cpu))
+e_ncpu = float(min(host_cpu_count, float(cpu)))
 
 
 
 def get_memory_avl():
     memory_mb = (psutil.virtual_memory().total / (1024.0 ** 2))
     if config.get('mem_scale_with_cpu', False):
-        return memory_mb * (e_ncpu / float(psutil.cpu_count()))
+        return memory_mb * (e_ncpu / host_cpu_count)
     return memory_mb
 
 
 CGROUP_MEM_LIMIT_FILE = None
 CGROUP_MEM_CURRENT_FILE = None
+CGROUP_CPU_STAT_FILE = None
+CGROUP_CPU_USAGE_FILE = None
+CGROUP_CPUSET_FILE = None
 CGROUP_V2 = False
 
-def detect_cgroup_memory_files():
-    global CGROUP_MEM_LIMIT_FILE, CGROUP_MEM_CURRENT_FILE, CGROUP_V2
+def detect_cgroup_files():
+    global CGROUP_MEM_LIMIT_FILE, CGROUP_MEM_CURRENT_FILE, CGROUP_CPU_STAT_FILE, CGROUP_CPU_USAGE_FILE, CGROUP_CPUSET_FILE, CGROUP_V2
     CGROUP_MEM_LIMIT_FILE = None
     CGROUP_MEM_CURRENT_FILE = None
+    CGROUP_CPU_STAT_FILE = None
+    CGROUP_CPU_USAGE_FILE = None
+    CGROUP_CPUSET_FILE = None
     CGROUP_V2 = False
     try:
         with open('/proc/self/cgroup','r') as f:
             lines = [l.strip() for l in f.readlines() if l.strip()]
     except Exception:
         return False
-    v2_path = None
-    v1_mem_path = None
+    controller_paths = {}
     for line in lines:
         parts = line.split(':')
-        if len(parts) == 3 and parts[0] == '0' and parts[1] == '':
-            v2_path = parts[2]
-            break
-        if len(parts) == 3 and 'memory' in parts[1].split(','):
-            v1_mem_path = parts[2]
+        if len(parts) != 3:
+            continue
+        _, subsystems, path = parts
+        if subsystems == '':
+            controller_paths['v2'] = path
+            continue
+        for subsystem in subsystems.split(','):
+            controller_paths[subsystem] = path
+    v2_path = controller_paths.get('v2')
     if v2_path is not None:
         base = '/sys/fs/cgroup' + (v2_path if v2_path != '/' else '')
         limit = os.path.join(base, 'memory.max')
         current = os.path.join(base, 'memory.current')
+        cpu_stat = os.path.join(base, 'cpu.stat')
+        cpuset_candidates = [
+            os.path.join(base, 'cpuset.cpus.effective'),
+            os.path.join(base, 'cpuset.cpus'),
+        ]
         if os.path.exists(limit) and os.path.exists(current):
             CGROUP_MEM_LIMIT_FILE = limit
             CGROUP_MEM_CURRENT_FILE = current
+        if os.path.exists(cpu_stat):
+            CGROUP_CPU_STAT_FILE = cpu_stat
+        for candidate in cpuset_candidates:
+            if os.path.exists(candidate):
+                CGROUP_CPUSET_FILE = candidate
+                break
+        if not (CGROUP_MEM_CURRENT_FILE is None and CGROUP_CPU_STAT_FILE is None):
             CGROUP_V2 = True
             return True
         return False
+    found = False
+    v1_mem_path = controller_paths.get('memory')
     if v1_mem_path is not None:
         base = '/sys/fs/cgroup/memory' + (v1_mem_path if v1_mem_path != '/' else '')
         limit = os.path.join(base, 'memory.limit_in_bytes')
@@ -156,34 +180,115 @@ def detect_cgroup_memory_files():
         if os.path.exists(limit) and os.path.exists(current):
             CGROUP_MEM_LIMIT_FILE = limit
             CGROUP_MEM_CURRENT_FILE = current
-            CGROUP_V2 = False
-            return True
-        return False
-    return False
+            found = True
+    v1_cpuacct_path = controller_paths.get('cpuacct')
+    if v1_cpuacct_path is not None:
+        base = '/sys/fs/cgroup/cpuacct' + (v1_cpuacct_path if v1_cpuacct_path != '/' else '')
+        usage = os.path.join(base, 'cpuacct.usage')
+        if os.path.exists(usage):
+            CGROUP_CPU_USAGE_FILE = usage
+            found = True
+    v1_cpuset_path = controller_paths.get('cpuset')
+    if v1_cpuset_path is not None:
+        base = '/sys/fs/cgroup/cpuset' + (v1_cpuset_path if v1_cpuset_path != '/' else '')
+        candidate = os.path.join(base, 'cpuset.cpus')
+        if os.path.exists(candidate):
+            CGROUP_CPUSET_FILE = candidate
+    return found
 
-def get_cgroup_remaining_mb():
+
+def get_cgroup_memory_current_mb():
     try:
-        if CGROUP_MEM_LIMIT_FILE is None or CGROUP_MEM_CURRENT_FILE is None:
+        if CGROUP_MEM_CURRENT_FILE is None:
+            return None
+        with open(CGROUP_MEM_CURRENT_FILE,'r') as f:
+            current_s = f.read().strip()
+        return max(0.0, float(current_s) / (1024.0 ** 2))
+    except Exception:
+        return None
+
+
+def get_cgroup_memory_limit_mb():
+    try:
+        if CGROUP_MEM_LIMIT_FILE is None:
             return None
         with open(CGROUP_MEM_LIMIT_FILE,'r') as f:
             limit_s = f.read().strip()
         if CGROUP_V2 and limit_s == 'max':
             return None
-        try:
-            limit = float(limit_s)
-        except ValueError:
-            return None
+        limit = float(limit_s)
         if limit > 1e15:
             return None
-        with open(CGROUP_MEM_CURRENT_FILE,'r') as f:
-            current = float(f.read().strip())
-        rem = max(0.0, (limit - current) / (1024.0**2))
-        return rem
+        return max(0.0, limit / (1024.0 ** 2))
+    except Exception:
+        return None
+
+
+def get_cgroup_cpu_time_sec():
+    try:
+        if not CGROUP_CPU_STAT_FILE is None:
+            with open(CGROUP_CPU_STAT_FILE,'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 2 and parts[0] == 'usage_usec':
+                        return max(0.0, float(parts[1]) / 1_000_000.0)
+            return None
+        if not CGROUP_CPU_USAGE_FILE is None:
+            with open(CGROUP_CPU_USAGE_FILE,'r') as f:
+                return max(0.0, float(f.read().strip()) / 1_000_000_000.0)
+        return None
+    except Exception:
+        return None
+
+
+def get_cgroup_cpu_capacity():
+    if CGROUP_CPUSET_FILE is None:
+        return float(e_ncpu)
+    try:
+        with open(CGROUP_CPUSET_FILE,'r') as f:
+            cpuset_spec = f.read().strip()
+        if not cpuset_spec:
+            return float(e_ncpu)
+        count = 0
+        for chunk in cpuset_spec.split(','):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if '-' in chunk:
+                start_s, end_s = chunk.split('-', 1)
+                start = int(start_s)
+                end = int(end_s)
+                if end >= start:
+                    count += (end - start + 1)
+            else:
+                count += 1
+        if count > 0:
+            return float(min(float(count), e_ncpu))
+    except Exception:
+        pass
+    return float(e_ncpu)
+
+def get_cgroup_remaining_mb():
+    try:
+        limit_mb = get_cgroup_memory_limit_mb()
+        current_mb = get_cgroup_memory_current_mb()
+        if limit_mb is None or current_mb is None:
+            return None
+        return max(0.0, limit_mb - current_mb)
     except Exception as ex:
         sys.stderr.write('cgroup memory read failed: ' + str(ex) + '\n')
         sys.stderr.write(traceback.format_exc())
         sys.stderr.flush()
         return None
+
+
+def get_effective_available_mb():
+    available_mb = psutil.virtual_memory().available / (1024.0 ** 2)
+    if bool(config.get('mem_use_cgroup_available', True)) and not (CGROUP_MEM_LIMIT_FILE is None or CGROUP_MEM_CURRENT_FILE is None):
+        cgroup_rem_mb = get_cgroup_remaining_mb()
+        if not cgroup_rem_mb is None:
+            available_mb = min(available_mb, cgroup_rem_mb)
+    return max(0.0, float(available_mb))
 
 
 
@@ -263,13 +368,12 @@ headroom_fraction = float(config.get('mem_headroom_fraction', 0.08))
 cap_fraction = float(config.get('mem_cap_fraction_of_total', 0.99))
 e_memtot_buffer = min(cap_fraction * memory_mb_available, (1.0 - headroom_fraction) * e_memtot)
 print(f'Buffer space {e_memtot} - {e_memtot_buffer}')
-if bool(config.get('mem_use_cgroup_available', True)):
-    try:
-        detect_cgroup_memory_files()
-    except Exception as ex:
-        sys.stderr.write('cgroup detection failed: ' + str(ex) + '\n')
-        sys.stderr.write(traceback.format_exc())
-        sys.stderr.flush()
+try:
+    detect_cgroup_files()
+except Exception as ex:
+    sys.stderr.write('cgroup detection failed: ' + str(ex) + '\n')
+    sys.stderr.write(traceback.format_exc())
+    sys.stderr.flush()
 
 
 if 'SLURM_ARRAY_JOB_ID' in os.environ:
@@ -455,16 +559,19 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     resources = None
     lastcpureport = None
     spend_time = 0
-    last_io_total = None
+    last_summary_io_total = None
     iodeltas = []
     monitor_initial_delay = float(config.get('monitor_initial_delay_sec', 0.0))
     monitor_interval = float(config.get('monitor_interval_sec', 600.0))
+    live_monitor_interval = float(config.get('monitor_live_interval_sec', min(5.0, monitor_interval)))
     stuck_cpu_thr = float(config.get('stuck_cpu_core_threshold', 0.05))
     stuck_io_thr = float(config.get('stuck_io_activity_bytes_threshold', 4096.0))
     stuck_enabled = bool(config.get('stuck_detection_enable', True))
     stuck_stop_threshold = int(config.get('stuck_stop_threshold', STOP_THRESHOLD))
     if stuck_stop_threshold < 1:
         stuck_stop_threshold = 1
+    if live_monitor_interval <= 0.0:
+        live_monitor_interval = 5.0
 
     pid = process.pid
     try:
@@ -473,8 +580,10 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
         ps = None
 
     start_time = time.time()
-    report_time = 0
-    last_report_time = start_time
+    live_report_time = 0.0
+    summary_report_time = 0.0
+    last_live_sample_time = start_time
+    last_live_spend_time = 0.0
     status.current_cpu_usage[jobid] = 0.0
     status.current_mem_usage[jobid] = 0.0
     
@@ -490,9 +599,8 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
         
         cur_time = time.time()
         
-        if (cur_time - report_time) > monitor_interval:
-            report_time = cur_time
-            prevspend_time = spend_time
+        if (cur_time - live_report_time) > live_monitor_interval:
+            live_report_time = cur_time
             if retcode is None and not ps is None:
                 try:
                     with ps.oneshot():
@@ -527,33 +635,39 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
                             except psutil.NoSuchProcess:
                                 continue
                     io_total = float(sum([float(v.get('read_bytes',0.0)) + float(v.get('write_bytes',0.0)) for v in iocache.values()]))
-                    if last_io_total is None:
-                        io_delta = 0.0
-                    else:
-                        io_delta = max(0.0, io_total - last_io_total)
-                    last_io_total = io_total
-                    iodeltas.append(io_delta)
-                    memcache.append(r)
 
                     # Total CPU time across the tree without double counting
                     spend_time = (lastcpureport['user'] + lastcpureport['system'] + lastcpureport['children_user'] + lastcpureport['children_system']) 
-                    if prevspend_time <= 0:
-                        cpu_percentage = spend_time / max(report_time - start_time, 1e-3)
+                    if last_live_spend_time <= 0:
+                        cpu_percentage = spend_time / max(cur_time - start_time, 1e-3)
                     else:
-                        cpu_percentage = ((spend_time - prevspend_time) / (report_time - last_report_time))
+                        cpu_percentage = ((spend_time - last_live_spend_time) / max(cur_time - last_live_sample_time, 1e-3))
                     # Uncapped core-equivalent usage (non-negative)
 
                     cpu_percentage = max(0.0, float(cpu_percentage))                
-                    lastcpureport['cpu_perc'] = cpu_percentage
-                    cpucache.append(lastcpureport)
-
-                    last_report_time = report_time
                     status.lock.acquire()
                     status.current_cpu_usage[jobid] = cpu_percentage
                     status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
                     status.lock.release()
 
-                    if stuck_enabled and (report_time - start_time) >= monitor_initial_delay:
+                    last_live_sample_time = cur_time
+                    last_live_spend_time = spend_time
+
+                    if (cur_time - summary_report_time) > monitor_interval:
+                        summary_report_time = cur_time
+                        if last_summary_io_total is None:
+                            io_delta = 0.0
+                        else:
+                            io_delta = max(0.0, io_total - last_summary_io_total)
+                        last_summary_io_total = io_total
+                        iodeltas.append(io_delta)
+                        memcache.append(r)
+
+                        snapshot = dict(lastcpureport)
+                        snapshot['cpu_perc'] = cpu_percentage
+                        cpucache.append(snapshot)
+
+                    if stuck_enabled and (summary_report_time - start_time) >= monitor_initial_delay:
                         if partition == 'compute' and len(cpucache) > stuck_stop_threshold and len(iodeltas) > stuck_stop_threshold:
                             if all([e['cpu_perc'] < stuck_cpu_thr for e in cpucache[::-1][:stuck_stop_threshold]]) and all([d <= stuck_io_thr for d in iodeltas[::-1][:stuck_stop_threshold]]):
                                 window_sec = float(stuck_stop_threshold) * float(monitor_interval)
@@ -601,7 +715,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     report['endtime'] = time.strftime('%b %d %Y %H:%M:%S', time.localtime(time.time()))
 
     report['runtime'] = time.time() - start_time
-    report['montime'] = report_time - start_time
+    report['montime'] = summary_report_time - start_time
     report['retcode'] = retcode
 
     if not resources is None:
@@ -681,6 +795,8 @@ idle_start = 0
 event_timer = threading.Event()
 last_cpu_times = psutil.cpu_times()
 last_cpu_total = sum(last_cpu_times)
+last_cgroup_cpu_time = get_cgroup_cpu_time_sec()
+last_cgroup_sample_time = time.time()
 
 try :
     #lengine_monitor = psutil.Process(lengine.pid)
@@ -709,12 +825,7 @@ try :
        
        
         #check memory available (reserved, actual use)
-        ps_avail_mb = (psutil.virtual_memory().available / (1024.0 ** 2))
-        dyn_available_mb = cap_fraction * ps_avail_mb
-        if bool(config.get('mem_use_cgroup_available', True)) and not (CGROUP_MEM_LIMIT_FILE is None or CGROUP_MEM_CURRENT_FILE is None):
-            cgroup_rem_mb = get_cgroup_remaining_mb()
-            if not cgroup_rem_mb is None:
-                dyn_available_mb = cap_fraction * min(ps_avail_mb, cgroup_rem_mb)
+        dyn_available_mb = cap_fraction * get_effective_available_mb()
         mb_memory_available = min(e_memtot_buffer - sum(status.current_mem_usage.values(),0.0), dyn_available_mb)
 
         
@@ -801,7 +912,7 @@ try :
         #POLL
         cpu_usage = (sum(status.current_cpu_usage.values(),0.0) / e_ncpu) * 100.0
         mem_usage = (sum(status.current_mem_usage.values(), 0.0) / e_memtot_buffer) * 100.0
-        load = psutil.getloadavg()[0] / float(psutil.cpu_count())
+        load = psutil.getloadavg()[0] / host_cpu_count
         # System CPU busy and iowait (percent over this poll interval)
         cur_cpu_times = psutil.cpu_times()
         cur_cpu_total = sum(cur_cpu_times)
@@ -812,6 +923,22 @@ try :
         sys_iowait = max(0.0, 100.0 * (diowait / dtotal))
         last_cpu_times = cur_cpu_times
         last_cpu_total = cur_cpu_total
+        now = time.time()
+        cgroup_cpu_time = get_cgroup_cpu_time_sec()
+        if not cgroup_cpu_time is None and not last_cgroup_cpu_time is None:
+            cpu_delta = max(0.0, cgroup_cpu_time - last_cgroup_cpu_time)
+            wall_delta = max(1e-9, now - last_cgroup_sample_time)
+            cpu_capacity = max(1e-9, get_cgroup_cpu_capacity())
+            cpu_usage = min(100.0, max(0.0, 100.0 * ((cpu_delta / wall_delta) / cpu_capacity)))
+        if not cgroup_cpu_time is None:
+            last_cgroup_cpu_time = cgroup_cpu_time
+            last_cgroup_sample_time = now
+
+        cgroup_memory_mb = get_cgroup_memory_current_mb()
+        if not cgroup_memory_mb is None:
+            cgroup_limit_mb = get_cgroup_memory_limit_mb()
+            mem_capacity = e_memtot_buffer if cgroup_limit_mb is None else min(e_memtot_buffer, cgroup_limit_mb)
+            mem_usage = min(100.0, max(0.0, 100.0 * (cgroup_memory_mb / max(mem_capacity, 1e-9))))
         idle = len(status.running_processes) == 0
         if idle and idle_start == 0:
             idle_start = time.time()
@@ -821,7 +948,6 @@ try :
             sys.stderr.write(f"{xtime()} - POLL; INFO: {myid} {cpu_usage:.2f} {e_memtot:.2f} {e_memtot_buffer:.2f} {get_memory_avl():.2f} {mem_usage:.2f} {load:.2f} {sys_cpu_busy:.2f} {sys_iowait:.2f} {mode} {status.current_cpu_usage} {status.current_mem_usage}\n")
             sys.stderr.flush()
 
-            now = time.time()
             if now - ssd_last_refresh >= ssd_refresh_interval:
                 if not scratch_path or not os.path.isdir(scratch_path):
                     scratch_path = detect_scratch_path(clusterid)
