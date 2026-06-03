@@ -14,6 +14,13 @@ except:
     from SimpleXMLRPCServer import SimpleXMLRPCServer,SimpleXMLRPCRequestHandler
 import socket
 import threading
+
+
+class ReuseAddrXMLRPCServer(SimpleXMLRPCServer):
+    # Set SO_REUSEADDR so the manager can rebind its port immediately after a
+    # restart instead of failing with "Address already in use" for ~60s while
+    # the previous manager's engine connections sit in TIME_WAIT.
+    allow_reuse_address = True
 from collections import defaultdict, OrderedDict, deque
 
 import random
@@ -2107,7 +2114,7 @@ class RequestHandler(SimpleXMLRPCRequestHandler):
 def thread_start_job_server(port, rpc_path):
     request_handeler=SimpleXMLRPCRequestHandler
     request_handeler.rpc_paths=(f"/{rpc_path}",)
-    with SimpleXMLRPCServer(
+    with ReuseAddrXMLRPCServer(
         ("", int(port)),
         logRequests=False,
         allow_none=True,
@@ -3640,11 +3647,11 @@ def thread_check_commands():
 def thread_start_manager_server(port, rpc_path):
     request_handeler=SimpleXMLRPCRequestHandler
     request_handeler.rpc_paths=(f"/{rpc_path}",)
-    server=SimpleXMLRPCServer(
+    server=ReuseAddrXMLRPCServer(
         ("", int(port)),
         logRequests=False,
         allow_none=True,
-        requestHandler=request_handeler) 
+        requestHandler=request_handeler)
     server.register_introspection_functions()
 
     server.register_function(register, "register")
@@ -4482,19 +4489,29 @@ def get_number(gb, argument, default=0):
 
 
 def _is_port_available(host, port):
+    # Test by actually BINDING both the manager port and its +1 job port, exactly
+    # as the servers do (wildcard address + SO_REUSEADDR). A connect()-based probe
+    # is wrong here: base_port 38864 lies inside the Linux ephemeral port range, so
+    # it is sometimes already in use as another process's *client* port (an
+    # ESTABLISHED connection with no listener). connect() to it is refused -> the
+    # old probe reported "available" -> the server's bind() then failed with
+    # EADDRINUSE. A bind() probe detects that case (and TIME_WAIT, and real listeners).
     try:
         base_port = int(port)
     except Exception:
         base_port = int(zslurm_shared.port)
 
     for candidate in (base_port, base_port + 1):
+        s = None
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1.0)
-                if s.connect_ex((host, candidate)) == 0:
-                    return False
-        except Exception:
-            return True
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", candidate))   # match the servers' bind("", port)
+        except OSError:
+            return False              # cannot bind this port -> not usable
+        finally:
+            if s is not None:
+                s.close()
     return True
 
 
