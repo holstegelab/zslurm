@@ -1,0 +1,189 @@
+#!/home/hulsmanm/miniconda3/envs/clustersnake/bin/python
+"""zsoffload -- offload compute off the login node onto a *shared* zslurm manager,
+with multi-agent coordination (lock + lease registry + adopt-never-stop-foreign).
+
+Cost boundary (important):
+  * `submit` / `status` / `release` / `leases` / `whoami`  -> NEVER spend SBU.
+        They only use a manager that is already running (the human's, or one an
+        agent already provisioned) and add/drop a coordination lease.
+  * `up`    -> the ONE command that may create capacity. `--provision node`
+        claims a (partial) compute node running the manager + a local engine
+        (the human's usual pattern, automated); `--provision login` starts a
+        free-but-fragile headless manager on the login node.
+  * `down`  -> stops ONLY a manager THIS tooling provisioned, and only when no
+        lease holds it and it is idle. Never touches an adopted/foreign manager.
+
+Typical agent use:
+  export ZSLURM_OFFLOAD_AGENT=my-task-slug          # stable id across calls
+  zsoffload submit -J align -c 8 --mem 16000 -t 2:0:0 -- bwa mem ref.fa r1 r2
+  zsoffload status                                  # poll (>=15s apart)
+  zsoffload release                                 # when my jobs are done
+
+See `.claude/skills/snellius-zslurm/` for the full protocol + offload policy.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import zslurm_coord as zc
+
+
+def resolve_agent_id(args):
+    return (getattr(args, "agent", None)
+            or os.environ.get("ZSLURM_OFFLOAD_AGENT")
+            or "offload-%s-%d" % (zc.hostname(), os.getppid()))
+
+
+def out(obj, code=0):
+    print(json.dumps(obj, indent=2, sort_keys=True))
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+def cmd_up(args):
+    res = zc.up(provision=args.provision, partition=args.partition,
+                cores=args.cores, walltime=args.time, max_nodes=args.max_nodes)
+    out(res, 0 if res.get("instance") or res.get("provisioned") else 3)
+
+
+def cmd_submit(args):
+    agent_id = resolve_agent_id(args)
+    if not args.cmd:
+        out({"ok": False, "error": "no command given after --"}, 2)
+    res = zc.submit(agent_id, args.cmd, cores=args.cpus, mem_mb=args.mem,
+                    walltime=args.time, partition=args.partition, name=args.name,
+                    idempotency_key=args.key, note=args.note or "", shell=args.shell)
+    out(res, 0 if res.get("ok") else (res.get("code", 3) or 3))
+
+
+def cmd_status(args):
+    name, st = zc.pick_instance(prefer_foreign=True)
+    owner = zc.read_owner() or {}
+    leases = zc.live_leases()
+    blob = {
+        "instance": name,
+        "reachable": bool(name),
+        "owner": {"autostarted": owner.get("autostarted"),
+                  "backend": owner.get("backend"),
+                  "instance": owner.get("instance"),
+                  "slurm_jobid": owner.get("slurm_jobid"),
+                  "host": owner.get("host")},
+        "live_leases": [{"agent_id": l.get("agent_id"), "jobids": l.get("jobids"),
+                         "expires_in_s": round(float(l.get("expires", 0)) - zc.now()),
+                         "note": l.get("note")} for l in leases],
+    }
+    if st:
+        blob["health"] = st.get("health")
+        blob["pending_jobs"] = st.get("pending_jobs")
+        blob["running_engines"] = st.get("running_engines")
+        blob["alarms"] = st.get("alarms")
+        blob["scheduler"] = st.get("scheduler")
+    out(blob, 0 if name else 2)
+
+
+def cmd_release(args):
+    agent_id = resolve_agent_id(args)
+    dropped = zc.release_lease(agent_id)
+    res = {"released": dropped, "agent_id": agent_id}
+    if args.reap:
+        # last-one-out: if we own an idle, leaseless manager, take it down
+        res["reap"] = zc.down(force=False)
+    out(res, 0)
+
+
+def cmd_leases(args):
+    leases = zc.live_leases()
+    out({"count": len(leases), "leases": leases}, 0)
+
+
+def cmd_down(args):
+    out(zc.down(force=args.force), 0)
+
+
+def cmd_whoami(args):
+    out({"agent_id": resolve_agent_id(args), "host": zc.hostname(),
+         "state_dir": zc.STATE_DIR}, 0)
+
+
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(prog="zsoffload", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--agent", default=None,
+                   help="stable agent id (else $ZSLURM_OFFLOAD_AGENT, else derived)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("up", help="ensure a shared manager exists (adopt first; "
+                                   "provision only if asked) -- may SPEND SBU")
+    sp.add_argument("--provision", choices=["adopt", "login", "node"], default="adopt",
+                    help="adopt: refuse to spend (default); login: free/fragile "
+                         "login-node manager; node: claim a partial compute node "
+                         "running manager+engine (SPENDS)")
+    sp.add_argument("--partition", default="auto", help="node backend partition; "
+                    "'auto' (default) = cheapest thin (genoa/rome) with room, fat as "
+                    "fallback; 'auto_fat' = fat_genoa/fat_rome (~7.5 GB/core) for "
+                    "memory-heavy jobs; or an explicit name -- never himem/gpu")
+    sp.add_argument("--cores", type=int, default=24, help="base local-engine cores "
+                    "(>= 1/8 node; genoa min 24, rome min 16)")
+    sp.add_argument("--time", default="5-00:00:00", help="base node walltime "
+                    "(default = the 5-day max; the reaper releases it early when idle)")
+    sp.add_argument("--max-nodes", dest="max_nodes", type=int, default=2,
+                    help="capped-autogrow whole-node overflow cap")
+    sp.set_defaults(func=cmd_up)
+
+    sp = sub.add_parser("submit", help="offload one command (adopt-only; never spends)")
+    sp.add_argument("-J", "--name", default=None)
+    sp.add_argument("-c", "--cpus", type=float, default=1.0, help="cores (fractional ok)")
+    sp.add_argument("--mem", type=float, default=1024, help="MB")
+    sp.add_argument("-t", "--time", default="1:00:00", help="walltime (sets lease TTL)")
+    sp.add_argument("-p", "--partition", default="compute", help="job class: compute|archive")
+    sp.add_argument("--key", default=None, help="idempotency key (retry-safe)")
+    sp.add_argument("--note", default=None, help="lease note")
+    sp.add_argument("--shell", action="store_true",
+                    help="treat the command as a shell line (pipes/redirects/globs); "
+                         "it is written to a script file so quoting survives")
+    sp.add_argument("cmd", nargs=argparse.REMAINDER,
+                    help="-- COMMAND ARGS (everything after -- is the job). For "
+                         "complex shell, pass a script file or use --shell.")
+    sp.set_defaults(func=cmd_submit)
+
+    sp = sub.add_parser("status", help="poll the shared manager + leases (read)")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("release", help="drop this agent's lease when its jobs are done")
+    sp.add_argument("--reap", action="store_true",
+                    help="also take down a self-provisioned manager if now idle+leaseless")
+    sp.set_defaults(func=cmd_release)
+
+    sp = sub.add_parser("leases", help="list live leases (read)")
+    sp.set_defaults(func=cmd_leases)
+
+    sp = sub.add_parser("down", help="stop a SELF-provisioned manager if safe "
+                                     "(never an adopted/foreign one)")
+    sp.add_argument("--force", action="store_true",
+                    help="stop even if idle-check fails (still requires no live leases "
+                         "unless combined carefully) -- use sparingly")
+    sp.set_defaults(func=cmd_down)
+
+    sp = sub.add_parser("whoami", help="print resolved agent id + state dir")
+    sp.set_defaults(func=cmd_whoami)
+    return p
+
+
+def main():
+    # allow `submit ... -- cmd` where cmd starts with REMAINDER; strip a leading '--'
+    args = build_parser().parse_args()
+    if getattr(args, "cmd", None) and isinstance(args.cmd, list) and args.cmd and args.cmd[0] == "--":
+        args.cmd = args.cmd[1:]
+    try:
+        args.func(args)
+    except zc.LockTimeout as ex:
+        # another agent holds the manager lock (e.g. a slow provision); retryable
+        out({"ok": False, "code": 2, "error": "manager busy: %s" % ex}, 2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,128 @@
+#!/home/hulsmanm/miniconda3/envs/clustersnake/bin/python
+"""zsreap -- background janitor for the shared-manager offloader.
+
+Safe to run repeatedly from cron / `loop`. On each pass it:
+  1. prunes expired leases (handles agents that crashed without releasing);
+  2. if WE provisioned the manager and it is now idle (no live leases, no
+     pending/running work) for at least --grace seconds, tears it down
+     (login: SIGTERM our pid; node: scancel our job) so engines/SBU stop.
+
+It NEVER touches a manager it did not provision -- the human's own manager, or
+one started by another tool, is left running. Idle time is tracked across passes
+in ~/.zslurm/reap_state.json so a single long grace works with short intervals.
+
+Exit code: 0 always (it is a janitor; nothing to fail a pipeline on).
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import zslurm_coord as zc
+
+REAP_STATE = os.path.join(zc.STATE_DIR, "reap_state.json")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="zsreap", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--grace", type=int, default=1800,
+                    help="seconds a self-provisioned manager must stay idle+leaseless "
+                         "before teardown (default 1800 = 30 min)")
+    ap.add_argument("--down-idle", action="store_true",
+                    help="actually tear down a self-provisioned idle manager "
+                         "(default: only prune leases + report)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    report = {"pruned": [], "action": "none"}
+
+    # 1) prune expired leases (always safe)
+    report["pruned"] = [l.get("agent_id", l.get("file")) for l in zc.prune_expired_leases()]
+
+    owner = zc.read_owner() or {}
+    leases = zc.live_leases()
+    report["live_leases"] = len(leases)
+
+    # only consider teardown for a manager WE provisioned
+    self_alive = zc._self_manager_alive(owner)
+    report["self_provisioned"] = bool(owner.get("autostarted"))
+    report["self_alive"] = bool(self_alive)
+
+    state = zc.read_json(REAP_STATE, {}) or {}
+
+    if not (owner.get("autostarted") and self_alive):
+        # nothing of ours to reap; clear any idle clock
+        state.pop("idle_since", None)
+        state.pop("idle_key", None)
+        zc.write_json_atomic(REAP_STATE, state)
+        report["action"] = "no_self_manager"
+        return _finish(report, args)
+
+    inst = owner.get("instance")
+    rc, st = zc.zsstatus(instance=inst) if inst else (2, None)
+    idle = bool(st and zc.is_idle(st)) and not leases
+    report["idle"] = idle
+
+    if not idle:
+        state.pop("idle_since", None)
+        state.pop("idle_key", None)
+        zc.write_json_atomic(REAP_STATE, state)
+        report["action"] = "busy_or_leased"
+        return _finish(report, args)
+
+    # idle + leaseless: start / continue the grace clock, but TIE the clock to the
+    # identity of the manager being timed. If a different self-manager was provisioned
+    # (new jobid/pid/instance) since the clock started, reset it -- otherwise a brand
+    # new manager could inherit the old one's nearly-elapsed grace and be torn down
+    # almost immediately.
+    idle_key = str(owner.get("slurm_jobid") or owner.get("manager_pid")
+                   or owner.get("instance"))
+    if state.get("idle_key") != idle_key:
+        state["idle_key"] = idle_key
+        state["idle_since"] = zc.now()
+    idle_since = state.get("idle_since") or zc.now()
+    state["idle_since"] = idle_since
+    zc.write_json_atomic(REAP_STATE, state)
+    idle_for = zc.now() - idle_since
+    report["idle_for_s"] = round(idle_for)
+    report["grace_s"] = args.grace
+
+    if idle_for >= args.grace:
+        if args.down_idle:
+            res = zc.down(force=False)
+            report["action"] = "down"
+            report["down"] = res
+            if res.get("stopped"):
+                state.pop("idle_since", None)
+                zc.write_json_atomic(REAP_STATE, state)
+        else:
+            report["action"] = "would_down_idle (pass --down-idle to enact)"
+    else:
+        report["action"] = "grace_pending"
+
+    return _finish(report, args)
+
+
+def _finish(report, args):
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print("zsreap: pruned=%d live_leases=%d self=%s action=%s%s"
+              % (len(report.get("pruned", [])), report.get("live_leases", 0),
+                 report.get("self_alive"), report.get("action"),
+                 (" idle_for=%ss/%ss" % (report.get("idle_for_s"), report.get("grace_s")))
+                 if "idle_for_s" in report else ""))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except zc.LockTimeout:
+        # someone else holds the manager lock (a provision/teardown in progress);
+        # the janitor simply skips this pass and tries again next time.
+        print("zsreap: manager busy (lock held); skipping this pass")
+        sys.exit(0)
