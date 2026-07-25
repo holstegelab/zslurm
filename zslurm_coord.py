@@ -689,6 +689,31 @@ def provision_node(partition="genoa", cores=24, walltime="1-00:00:00",
     cores = min(cores, int(f["cores"]))                   # ceil at one whole node
     if _walltime_seconds(walltime) > 5 * 86400:           # Snellius hard max 5 days
         return None, "walltime %s exceeds the 5-day maximum" % walltime
+    # Ask for `walltime` but let backfill shorten it to whatever fits before the
+    # next (invisible) maintenance reservation -- see the note in zslurm_shared.
+    # Below the floor we would rather stay queued than run a manager node that
+    # dies before it has paid for its own startup.
+    time_min = None
+    # Keep this module importable with only the stdlib; the full clustersnake
+    # environment has zslurm_shared and therefore enables the --time-min floor.
+    try:
+        import zslurm_shared
+        cfg = zslurm_shared.get_config() or {}
+        enabled = str(cfg.get("maintenance_window_enable", "true")).strip().lower() \
+                  not in ("0", "false", "no", "off")
+        if enabled:
+            time_min = zslurm_shared.submission_time_min(
+                walltime,
+                cfg.get("maintenance_time_min_sec",
+                        zslurm_shared.DEFAULT_TIME_MIN_SECONDS))
+            if time_min:
+                log("provision_node: requesting %s with --time-min %s (backfill "
+                    "truncates to what fits before the next reservation)"
+                    % (walltime, time_min))
+    except Exception as ex:
+        # A missing optional helper must not break the coordinator's stdlib-only
+        # import mode. On a real submission, sbatch/Slurm remains authoritative.
+        log("provision_node: --time-min floor unavailable: %s" % ex)
     if mem_mb is None:
         mem_mb = mem_mb_for(partition, cores)
     mem_mb = min(int(mem_mb), int(f["cores"] * f["gb_per_core"] * 1024))
@@ -708,13 +733,14 @@ def provision_node(partition="genoa", cores=24, walltime="1-00:00:00",
     conda_sh = os.path.join(conda_base, "etc/profile.d/conda.sh")
     env_name = os.path.basename(os.path.dirname(BIN_DIR))  # e.g. clustersnake
 
+    time_min_directive = ("#SBATCH --time-min=%s\n" % time_min) if time_min else ""
     body = """#!/bin/bash
 #SBATCH -J zslurm_mgr
 #SBATCH -p {partition}
 #SBATCH --cpus-per-task={cores}
 #SBATCH --mem={mem_mb}
 #SBATCH -t {walltime}
-#SBATCH -o {logdir}/manager_node-%j.out
+{time_min_directive}#SBATCH -o {logdir}/manager_node-%j.out
 set -uo pipefail
 # Normalize env so the manager writes its instance YAML to ~/.zslurm/instances
 # (zslurm_shared hardcodes that and the coordinator reads it there).
@@ -759,6 +785,7 @@ trap term TERM INT
 wait $MGR
 kill $ENG 2>/dev/null
 """.format(partition=partition, cores=cores, mem_mb=mem_mb, walltime=walltime,
+           time_min_directive=time_min_directive,
            logdir=logdir, conda_sh=conda_sh, env_name=env_name, tok=tok, bindir=BIN_DIR)
 
     with open(script, "w") as fh:

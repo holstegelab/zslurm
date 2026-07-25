@@ -1,6 +1,15 @@
 #!/bin/bash
-source "${HOME}/miniconda3/etc/profile.d/conda.sh"
-conda activate clustersnake
+# Engine launcher for zslurm. Self-sufficient activation of the clustersnake env:
+# the relocated base's conda.sh still hardcodes the DEAD old base
+# (/home/hulsmanm/miniconda3/bin/conda), so we do NOT source it. Instead put the
+# clustersnake env on PATH directly and export the conda vars.
+CONDA_BASE="/home/hulsmanm/all_data/research/conda/marc/miniconda3"
+CONDA_PREFIX_ENV="${CONDA_BASE}/envs/clustersnake"
+export CONDA_EXE="${CONDA_BASE}/bin/conda"
+export CONDA_PYTHON_EXE="${CONDA_BASE}/bin/python3.9"
+export CONDA_PREFIX="${CONDA_PREFIX_ENV}"
+export CONDA_DEFAULT_ENV="clustersnake"
+export PATH="${CONDA_PREFIX_ENV}/bin:${CONDA_BASE}/condabin:${PATH}"
 python -V
-zslurm_chief "$@" 
+zslurm_chief "$@"
 

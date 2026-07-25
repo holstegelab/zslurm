@@ -146,14 +146,62 @@ Operationally, it:
 
 - periodically evaluates each partition
 - estimates how much CPU and memory should be kept, with a safety margin
-- chooses which engines are best to keep based on load, reserved resources, number of jobs, and remaining runtime
+- ranks the engines by a keep-score and phases out the lowest (see below)
 - marks the extra engines as **phasing out** instead of killing them immediately
+
+#### Which engine gets phased out
+
+The keep-score leads with **residual work**: for each engine, the longest remaining
+`reqtime` over the jobs running on it, i.e. how long until it would run empty if it
+were given nothing more. That is what phasing an engine out actually costs, because
+a phased-out engine holds its node — and keeps billing for it — until its last job
+ends, while accepting no new work. An engine that drains in a minute is nearly free
+to drop; one holding a six-hour job is not, and its capacity cannot be reclaimed by
+phasing it out anyway, since that job runs to completion either way.
+
+The remaining terms are reserved CPU/memory, occupancy (jobs per core) and remaining
+node walltime. All four are normalised to 0..1, so `consolidation_keep_weights`
+(`drain` 0.45, `reserves` 0.25, `jobs` 0.15, `time` 0.15) genuinely decides the
+balance. `consolidation_drain_horizon_sec` (default 6 h) is the residual work at
+which an engine counts as fully loaded.
+
+This depends on jobs carrying a realistic `reqtime`. The short-read pipeline supplies
+one per rule from measured runtimes; jobs submitted without one fall back to the
+profile default and will all look equally busy.
 
 Phasing out means:
 
-- the engine does **not** accept new jobs
+- the engine accepts new jobs only inside the backfill window described below
 - existing jobs are allowed to finish
 - once idle, the engine is stopped
+
+#### Backfilling a phasing-out engine
+
+A phased-out engine holds its node until its **last** job ends. When that job still
+has hours to run, the rest of the node would otherwise sit idle for those hours, so
+the engine may still accept work that is certain to finish first -- it then stops at
+about the moment it would have stopped anyway.
+
+This is deliberately conservative and falls back to refusing everything, exactly as
+before, unless all of these hold:
+
+- `phaseout_backfill_enable` is on
+- the engine is **not** draining because its node walltime is nearly up -- that one is
+  already racing a hard kill
+- the engine still has running work, since letting an empty one die is the point
+- at least `phaseout_backfill_min_window_sec` (default 1 h) remains after subtracting
+  `phaseout_backfill_margin_sec` (default 30 min)
+
+The window is also capped by the node's own remaining walltime minus the same margin,
+and every job still has to satisfy `job_walltime_buffer_sec` on top, so a backfilled
+job needs roughly 45 minutes of slack before it is allowed to start.
+
+#### Fitting jobs to remaining walltime
+
+A job is only handed to an engine when `reqtime + job_walltime_buffer_sec` (default
+15 min) fits in that engine's remaining walltime. `reqtime` is an estimate, so a job
+that fits exactly is a job that gets killed at the wall after burning its whole
+runtime for nothing.
 
 This helps reduce fragmentation and cluster footprint without abruptly interrupting running work.
 
@@ -179,6 +227,8 @@ The autogrow controller:
 - picks a preferred partition/node profile based on the configured partition preferences
 - honors a cooldown to avoid overshooting
 - respects the configured maximum number of compute nodes
+- caps every new engine at the next applicable Slurm `MAINT` reservation and
+  gives the job a matching Slurm deadline
 
 This means autogrow is not triggered by every pending job. It is triggered when there is meaningful unmet demand after considering:
 
@@ -187,6 +237,33 @@ This means autogrow is not triggered by every pending job. It is triggered when 
 - global archive/active/dcache constraints
 
 So if jobs are pending only because a global storage quota is full, autogrow will not solve that problem by launching more nodes.
+
+#### Maintenance windows
+
+ZSlurm does **not** try to work out when the next maintenance window starts. On
+Snellius it cannot: `PrivateData=reservations` hides the records from normal
+users, and `sbatch --test-only` is not a usable substitute, because it reports the
+*priority-ordered* start time rather than the backfill one. Measured on
+2026-07-21, with 451 idle nodes in `genoa`, `--test-only` answered
+`2026-07-25T15:10` for 5 minutes, 12 hours, 1 day and 5 days alike, while a real
+1-hour job started immediately — so there is no duration-dependent jump to search
+for, and an inference built on it concludes "no maintenance" precisely when a
+window is imminent.
+
+Instead every allocation is submitted with both a maximum and a minimum walltime:
+
+```text
+sbatch -t 5-00:00:00 --time-min 12:00:00 ...
+```
+
+Slurm then starts the job in the first slot that fits and truncates `TimeLimit`
+to exactly the time available before the next reservation, so allocations are
+self-sizing and the boundary is simply `StartTime + TimeLimit` of the resulting
+job. Below `maintenance_time_min_sec` (default **12 hours**) the job stays queued
+instead: a shorter engine spends more on startup and drain than it gives back,
+and the capacity comes back by itself once the window has passed. Autogrow
+workers, manually requested engines and the coordinator's manager node all go
+through the same path.
 
 There is also separate staging/archive-oriented autogrow behavior for `staging` engines when archive jobs are waiting.
 
@@ -256,6 +333,26 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - pending archive-job threshold for switching to burst staging behavior
 - **`staging_autogrow_burst_nodes`**
   - maximum target staging-node count under burst conditions
+- **`maintenance_window_enable`**
+  - submit every manual or automatic allocation with a `--time-min` floor, so Slurm
+    shortens it to fit before the next maintenance window (see *Maintenance windows*)
+- **`maintenance_time_min_sec`**
+  - that floor: the shortest allocation still worth having. Below it the job stays
+    queued until the window has passed, instead of starting and dying immediately
+    (default `43200`, i.e. 12 hours)
+- **`job_walltime_buffer_sec`**
+  - slack a job's `reqtime` must leave inside an engine's remaining walltime before
+    it may start there (default `900`)
+- **`phaseout_backfill_enable`**
+  - let a phasing-out engine still accept work that finishes before its last job does
+- **`phaseout_backfill_margin_sec`**
+  - safety margin subtracted from both the drain estimate and the node walltime when
+    sizing that backfill window (default `1800`)
+- **`phaseout_backfill_min_window_sec`**
+  - do not backfill at all unless at least this much is reclaimable (default `3600`)
+- **`consolidation_drain_horizon_sec`**
+  - residual work at which an engine counts as fully loaded in the keep-score
+    (default `21600`, i.e. 6 hours)
 
 ### What is now config-driven
 
@@ -282,6 +379,8 @@ ssd_feature_name: scratch-node
 
 autogrow_max_compute_nodes: 40
 autogrow_fallback_partition: genoa
+maintenance_window_enable: true
+maintenance_time_min_sec: 43200
 autogrow_fat_partitions:
   - fat_genoa
   - fat_rome
@@ -397,6 +496,29 @@ zsbatch -p compute --dcache-use-remove 300 -- python cleanup_dcache.py
 ```
 
 In practice, this means ZSlurm can act as a lightweight global resource monitor for shared storage bottlenecks, not just a CPU/memory scheduler.
+
+### Limiting concurrent dCache transfers
+
+The durable dCache counter above measures storage in GB. Transfer concurrency is
+a separate, transient resource. Configure its instance-wide capacity in
+`~/.zslurm/config.yaml`:
+
+```yaml
+dcache_transfer_slots: 4
+```
+
+A Snakemake job that uploads or downloads data requests one slot with:
+
+```python
+resources:
+    dcache_transfer_slots=1
+```
+
+The executor passes this request as job metadata. ZSlurm reserves it while the
+job is `ASSIGNED` or `RUNNING` and releases it on completion, failure, requeue,
+cancellation, or loss of the assigned worker. Leave this resource out of
+Snakemake's global `resources:` capacity list: that lets Snakemake submit the
+whole runnable DAG while ZSlurm enforces the cross-node limit.
 
 ## Configuration and instances
 

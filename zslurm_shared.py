@@ -327,6 +327,13 @@ _scratch_parts_cache = None
 
 
 def _canon_state(s):
+    # Slurm's JSON node "state" is a list (base state first, then flags), e.g.
+    # ["IDLE"] or ["ALLOCATED", "RESERVED"] or ["DOWN", "DRAIN"]; the text form is
+    # "IDLE+DRAIN". Both must reduce to the base state token -- without this the
+    # JSON path produced the literal string "['IDLE']", so IDLE lookups always
+    # returned 0 and the autogrow planner was blind to real node availability.
+    if isinstance(s, (list, tuple)):
+        s = s[0] if s else ""
     if not s:
         return "UNKNOWN"
     v = str(s).strip()
@@ -486,3 +493,103 @@ def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60):
     _scratch_parts_cache = parts
     _scratch_parts_cache_ts = now
     return parts
+
+
+# Maintenance-aware Slurm submission helpers
+def parse_slurm_duration(value):
+    """Return seconds for Slurm [days-]hours:minutes:seconds durations."""
+    try:
+        text = str(value).strip()
+        if not text or text.upper() in ("INVALID", "N/A", "UNLIMITED", "INFINITE"):
+            return None
+        days = 0
+        has_days = False
+        if "-" in text:
+            day_text, text = text.split("-", 1)
+            days = int(day_text)
+            has_days = True
+        fields = [int(x) for x in text.split(":")]
+        if len(fields) == 3:
+            hours, minutes, seconds = fields
+        elif len(fields) == 2:
+            if has_days:
+                hours, minutes, seconds = fields[0], fields[1], 0
+            else:
+                hours, minutes, seconds = 0, fields[0], fields[1]
+        elif len(fields) == 1:
+            if has_days:
+                hours, minutes, seconds = fields[0], 0, 0
+            else:
+                hours, minutes, seconds = 0, fields[0], 0
+        else:
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+    except Exception:
+        return None
+
+
+def format_slurm_duration(seconds):
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return "%d-%02d:%02d:%02d" % (days, hours, minutes, seconds)
+    return "%02d:%02d:%02d" % (hours, minutes, seconds)
+
+
+def _slurm_time_epoch(value):
+    try:
+        return int(time.mktime(time.strptime(str(value), "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return None
+
+
+# --- maintenance windows ---------------------------------------------------
+# We deliberately do NOT try to work out when the next maintenance window starts.
+# Snellius runs with PrivateData=reservations, so `scontrol show reservation`
+# returns nothing to a normal user, and `sbatch --test-only` is not a usable
+# substitute: it reports the PRIORITY-ordered start time, not the backfill one.
+# Measured 2026-07-21 on genoa with 451 idle nodes, --test-only answered
+# 2026-07-25T15:10 for 5 minutes, 12 hours, 1 day and 5 days alike -- no
+# duration-dependent discontinuity left to binary-search -- while a real 1-hour
+# job started instantly. Any inference resting on that oracle concludes "no
+# maintenance" exactly when a window is imminent, which is the worst possible
+# direction to fail in: it submits the full walltime, the job cannot start, and a
+# still-usable allocation gets traded for one that will not run until the window
+# has passed.
+#
+# Instead we hand Slurm both a maximum and a minimum walltime and let the
+# backfill scheduler size the allocation for us:
+#
+#     sbatch -t <requested>  --time-min <floor>
+#
+# Slurm starts the job in the first slot that fits and truncates TimeLimit to
+# exactly the time available before the next reservation. Nothing is inferred,
+# and the boundary -- for anyone who wants the number -- is simply
+# StartTime + TimeLimit of the resulting job.
+
+DEFAULT_TIME_MIN_SECONDS = 12 * 3600
+
+
+def submission_time_min(requested, floor_seconds=DEFAULT_TIME_MIN_SECONDS):
+    """Return the ``--time-min`` value to submit alongside ``-t requested``.
+
+    ``floor_seconds`` is the shortest allocation still worth having. Below it a
+    compute node costs more to start up and drain than it gives back, so we would
+    rather stay queued until after the maintenance window than take the scraps.
+
+    Returns None when no meaningful floor applies (floor disabled, or not shorter
+    than the request itself, which Slurm would reject); the caller then omits
+    ``--time-min`` and the request behaves exactly as before.
+    """
+    try:
+        floor_seconds = int(floor_seconds)
+    except (TypeError, ValueError):
+        return None
+    if floor_seconds <= 0:
+        return None
+    requested_seconds = parse_slurm_duration(requested)
+    if requested_seconds is not None and floor_seconds >= requested_seconds:
+        return None
+    return format_slurm_duration(floor_seconds)

@@ -880,6 +880,17 @@ try :
                 try:
                     sys.stderr.write(f"{xtime()}:{jobid} - START; INFO: {ncpu} {mem} {' '.join(command)} {logfile_path}\n")
                     sys.stderr.flush()
+                    # This job runs inside THIS engine's Slurm allocation, but `env` was
+                    # captured on the manager node and still carries the MANAGER's SLURM_*
+                    # identity (SLURM_JOB_ID, node vars, ...). Rules that locate node-local
+                    # scratch via /scratch-node/$USER.$SLURM_JOB_ID would otherwise miss and
+                    # fall back to a foreign engine's scratch dir, which gets reaped when
+                    # engines cycle -> samtools "bgzf_read ... error" / lost temp files.
+                    # Replace the whole SLURM_* namespace in the job env with this engine's
+                    # real values so the job sees the node it actually runs on.
+                    if isinstance(env, dict):
+                        env = {k: v for k, v in env.items() if not k.startswith("SLURM")}
+                        env.update({k: v for k, v in os.environ.items() if k.startswith("SLURM")})
                     process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
 
                     status.current_cpu -= ncpu
