@@ -427,6 +427,13 @@ class Job(object):
         self.env = env
         self.ncpu = ncpu
         self.mem = mem
+        # Immutable submission limits and mutable running allocations are kept
+        # separately. Jobs that never use the lease API remain at their maxima.
+        self.max_ncpu = float(ncpu)
+        self.max_mem = float(mem)
+        self.held_ncpu = float(ncpu)
+        self.held_mem = float(mem)
+        self.lease_epoch = 0
         self.reqtime = reqtime
         self.requeue = requeue
         self.dependency = dependency
@@ -480,6 +487,12 @@ class Job(object):
         self.node_id = nodeid
         self.starttime = time.time()
         self.state = "RUNNING"
+        # A requeued job starts with its complete (possibly enlarged) request.
+        self.max_ncpu = float(self.ncpu)
+        self.max_mem = float(self.mem)
+        self.held_ncpu = float(self.ncpu)
+        self.held_mem = float(self.mem)
+        self.lease_epoch = 0
         engines.job_running(nodeid, self)
 
     def assigned(self, nodeid):
@@ -856,7 +869,16 @@ class JobManager(object):
                 st = getattr(job, 'state', None)
                 if want_states is not None and st not in want_states:
                     continue
-                mem_res = float(getattr(job, 'mem', 0.0) or 0.0)
+                max_cores = float(getattr(job, 'max_ncpu', job.ncpu) or 0.0)
+                max_mem = float(getattr(job, 'max_mem', job.mem) or 0.0)
+                if st == "RUNNING":
+                    held_cores = float(
+                        getattr(job, 'held_ncpu', max_cores) or 0.0
+                    )
+                    mem_res = float(getattr(job, 'held_mem', max_mem) or 0.0)
+                else:
+                    held_cores = max_cores
+                    mem_res = max_mem
                 cur_mem = float(getattr(job, 'current_mem_usage', 0.0) or 0.0)
                 runtime = (now - job.starttime) if getattr(job, 'starttime', None) else 0.0
                 out.append({
@@ -865,8 +887,11 @@ class JobManager(object):
                     'state': st,
                     'partition': job.partition,
                     'node': job.node_id if job.node_id is not None else "(Resources)",
-                    'cores': float(getattr(job, 'ncpu', 0.0) or 0.0),
+                    'cores': held_cores,
                     'mem_reserved_mb': mem_res,
+                    'max_cores': max_cores,
+                    'max_mem_mb': max_mem,
+                    'lease_epoch': int(getattr(job, 'lease_epoch', 0) or 0),
                     'current_mem_mb': cur_mem,
                     'mem_pressure': (cur_mem / mem_res) if mem_res > 0 else 0.0,
                     'current_cpu': float(getattr(job, 'current_cpu_usage', 0.0) or 0.0),
@@ -1349,6 +1374,8 @@ class JobManager(object):
                 }
             is_pending = (st in queue_states) or (st == 'ASSIGNED')
             if st == 'RUNNING':
+                cores = float(getattr(j, 'held_ncpu', cores) or 0.0)
+                mem_mb = float(getattr(j, 'held_mem', mem_mb) or 0.0)
                 buckets = (totals['running'], by_part[part]['running'])
             elif is_pending:
                 buckets = (totals['pending'], by_part[part]['pending'])
@@ -1711,8 +1738,8 @@ class JobManager(object):
                     if job.state == "RUNNING": #set by job.started
                         e = engines.engine_by_id.get(myid, None)
                         if e is not None:
-                            e.res_cpu_reserved += float(job.ncpu)
-                            e.res_mem_reserved_mb += float(job.mem)
+                            e.res_cpu_reserved += float(job.held_ncpu)
+                            e.res_mem_reserved_mb += float(job.held_mem)
                             try:
                                 if getattr(job, 'ssd_use', 'no') != 'no' and getattr(e, 'has_ssd', False):
                                     need = float(getattr(job, 'ssd_gb', 0.0))
@@ -1903,6 +1930,117 @@ class JobManager(object):
             self.lock.release()
         return res
 
+    def resize_running_job(self, nodeid, jobid, target_cpu, target_mem_mb):
+        """Atomically set a running job's mutable CPU and memory reservation.
+
+        Targets are absolute, making retries safe when an XML-RPC response is
+        lost after the update was committed. The local chief remains the
+        authority for admission and waiting; this manager method validates the
+        immutable job limit and keeps engine telemetry/autogrow accounting exact.
+        """
+
+        self.lock.acquire()
+        try:
+            key = str(jobid)
+            job = self.jobs_by_id.get(key)
+            if job is None:
+                return {
+                    'ok': False,
+                    'code': 3,
+                    'message': f"unknown job {key}",
+                }
+            if job.state != "RUNNING" or str(job.node_id) != str(nodeid):
+                return {
+                    'ok': False,
+                    'code': 3,
+                    'message': (
+                        f"job {key} is not running on engine {nodeid}"
+                    ),
+                }
+            engine = engines.engine_by_id.get(nodeid)
+            if engine is None:
+                return {
+                    'ok': False,
+                    'code': 3,
+                    'message': f"unknown engine {nodeid}",
+                }
+            try:
+                target_cpu = float(target_cpu)
+                target_mem_mb = float(target_mem_mb)
+            except (TypeError, ValueError):
+                return {
+                    'ok': False,
+                    'code': 2,
+                    'message': "lease targets must be numeric",
+                }
+            if (
+                not math.isfinite(target_cpu)
+                or not math.isfinite(target_mem_mb)
+                or target_cpu < 0.0
+                or target_mem_mb < 0.0
+            ):
+                return {
+                    'ok': False,
+                    'code': 2,
+                    'message': "lease targets must be finite and non-negative",
+                }
+
+            max_cpu = float(getattr(job, 'max_ncpu', job.ncpu))
+            max_mem_mb = float(getattr(job, 'max_mem', job.mem))
+            if target_cpu > max_cpu + 1e-9 or target_mem_mb > max_mem_mb + 1e-9:
+                return {
+                    'ok': False,
+                    'code': 2,
+                    'message': (
+                        f"target {target_cpu} cores/{target_mem_mb} MB exceeds "
+                        f"maximum {max_cpu} cores/{max_mem_mb} MB"
+                    ),
+                }
+
+            old_cpu = float(getattr(job, 'held_ncpu', job.ncpu))
+            old_mem_mb = float(getattr(job, 'held_mem', job.mem))
+            future_cpu = float(engine.res_cpu_reserved) - old_cpu + target_cpu
+            future_mem_mb = (
+                float(engine.res_mem_reserved_mb) - old_mem_mb + target_mem_mb
+            )
+            if (
+                future_cpu > float(engine.cores) + 1e-9
+                or future_mem_mb > float(engine.totmem) + 1e-9
+            ):
+                return {
+                    'ok': False,
+                    'code': 4,
+                    'message': (
+                        f"engine {nodeid} lacks capacity for target "
+                        f"{target_cpu} cores/{target_mem_mb} MB"
+                    ),
+                }
+
+            engine.res_cpu_reserved = max(0.0, future_cpu)
+            engine.res_mem_reserved_mb = max(0.0, future_mem_mb)
+            job.held_ncpu = target_cpu
+            job.held_mem = target_mem_mb
+            job.lease_epoch = int(getattr(job, 'lease_epoch', 0)) + 1
+            add_log_line(
+                gb,
+                f"Job {job.job_name} (id: {key}) lease on {nodeid}: "
+                f"{old_cpu:.2f}C/{old_mem_mb:.0f}MB -> "
+                f"{target_cpu:.2f}C/{target_mem_mb:.0f}MB",
+                CYAN,
+            )
+            return {
+                'ok': True,
+                'code': 0,
+                'jobid': key,
+                'held_cores': target_cpu,
+                'held_mem_mb': target_mem_mb,
+                'max_cores': max_cpu,
+                'max_mem_mb': max_mem_mb,
+                'epoch': job.lease_epoch,
+            }
+        finally:
+            self.lock.release()
+
     def job_start(self, node_id, jobid):
         self.lock.acquire()
         try:
@@ -1913,8 +2051,8 @@ class JobManager(object):
             job.started(node_id)
             e = engines.engine_by_id.get(node_id, None)
             if e is not None:
-                e.res_cpu_reserved += float(job.ncpu)
-                e.res_mem_reserved_mb += float(job.mem)
+                e.res_cpu_reserved += float(job.held_ncpu)
+                e.res_mem_reserved_mb += float(job.held_mem)
                 try:
                     if getattr(job, 'ssd_use', 'no') != 'no' and getattr(e, 'has_ssd', False):
                         need = float(getattr(job, 'ssd_gb', 0.0))
@@ -1947,8 +2085,12 @@ class JobManager(object):
                         self.dcache_inuse -= job.dcache_start_use_add
                     e = engines.engine_by_id.get(job.node_id, None)
                     if e is not None:
-                        e.res_cpu_reserved -= float(job.ncpu)
-                        e.res_mem_reserved_mb -= float(job.mem)
+                        e.res_cpu_reserved -= float(
+                            getattr(job, 'held_ncpu', job.ncpu)
+                        )
+                        e.res_mem_reserved_mb -= float(
+                            getattr(job, 'held_mem', job.mem)
+                        )
                         try:
                             alloc = float(getattr(job, 'ssd_alloc_gb', 0.0))
                             if alloc > 0.0:
@@ -2142,6 +2284,7 @@ queue_stats = lambda *args: jobs.queue_stats(*args)
 request_jobs = lambda *args: jobs.request_jobs(*args)
 job_finished = lambda *args: jobs.job_finished(*args)
 can_run_assigned_job = lambda *args: jobs.can_run_assigned_job(*args)
+resize_running_job = lambda *args: jobs.resize_running_job(*args)
 
 
 # ===========================================================================
@@ -4440,6 +4583,7 @@ def thread_start_manager_server(port, rpc_path):
     server.register_function(request_jobs, "request_jobs")
     server.register_function(job_finished, "job_finished")
     server.register_function(can_run_assigned_job, "can_run_assigned_job")
+    server.register_function(resize_running_job, "resize_running_job")
 
     Servers.manager_server = server
     add_log_line(gb, f"[manager] started on port {port} with rpc path {rpc_path}", GREEN)

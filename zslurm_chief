@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import subprocess, sys, getopt, time, shlex
 from subprocess import Popen
+import atexit
 import os,sys
 import signal
 import psutil
@@ -10,6 +11,7 @@ import threading
 import traceback
 import getpass
 import zslurm_shared
+import zslurm_lease
 import socket
 
 try:
@@ -754,8 +756,9 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     # Avoid double resource accounting if multiple monitors exist for the same job
     if jobid not in status.completed_jobs:
         status.completed_jobs.add(jobid)
-        status.current_cpu += ncpu
-        status.current_mem += mem
+        # The job may have released part of its original maximum. Return only
+        # its current holding; legacy/unregistered jobs use the fixed fallback.
+        lease_controller.finish_job(jobid, ncpu, mem)
     removed_proc = status.running_processes.pop(jobid, None)
     if removed_proc is None:
         sys.stderr.write(f"job_monitor cleanup: jobid {jobid} not in running_processes (already cleaned?)\n")
@@ -793,6 +796,79 @@ last_seen = time.time()
 mode = zslurm_shared.RUNNING
 idle_start = 0
 event_timer = threading.Event()
+
+
+def _lease_manager_resize(jobid, target_cpu, target_mem_mb):
+    # Use a fresh proxy because xmlrpc.client.ServerProxy/Transport caches a
+    # connection and is not safe to share between the main poll loop and the
+    # local lease server's handler threads.
+    proxy = zslurm_shared.TimeoutServerProxy(
+        uri, timeout=REQUEST_TIMEOUT, allow_none=True
+    )
+    return proxy.resize_running_job(
+        myid, str(jobid), float(target_cpu), float(target_mem_mb)
+    )
+
+
+def _lease_memory_available():
+    # Match normal job admission: both the configured reservation envelope and
+    # current cgroup/system availability must be able to cover a growth delta.
+    reserved_envelope_free = max(
+        0.0,
+        e_memtot_buffer - sum(status.current_mem_usage.values(), 0.0),
+    )
+    physical_free = max(0.0, cap_fraction * get_effective_available_mb())
+    return min(reserved_envelope_free, physical_free)
+
+
+lease_controller = zslurm_lease.ChiefLeaseController(
+    status=status,
+    total_cpu=e_ncpu,
+    total_mem_mb=e_memtot_buffer,
+    manager_resize=_lease_manager_resize,
+    memory_available=_lease_memory_available,
+    wake_event=event_timer,
+    min_cpu=float(config.get("lease_min_cpu", 0.1)),
+    memory_headroom_fraction=float(
+        config.get("lease_memory_headroom_fraction", 0.2)
+    ),
+    memory_headroom_mb=float(config.get("lease_memory_headroom_mb", 512.0)),
+)
+
+
+def _lease_socket_path():
+    configured = config.get("lease_socket_dir")
+    if configured:
+        base = os.path.expanduser(str(configured))
+    elif scratch_path and os.path.isdir(scratch_path):
+        base = scratch_path
+    else:
+        base = os.environ.get("TMPDIR") or "/tmp"
+    runtime_dir = os.path.join(
+        base, f".zslurm-lease-{os.getuid()}-{os.getpid()}"
+    )
+    candidate = os.path.join(
+        runtime_dir, "chief.sock"
+    )
+    # sockaddr_un.sun_path is commonly limited to 108 bytes.
+    if len(os.fsencode(candidate)) >= 100:
+        runtime_dir = os.path.join(
+            "/tmp", f".zslurm-lease-{os.getuid()}-{os.getpid()}"
+        )
+        candidate = os.path.join(
+            runtime_dir, "chief.sock"
+        )
+    return candidate
+
+
+lease_socket_path = _lease_socket_path()
+lease_server = zslurm_lease.LeaseServer(
+    lease_socket_path, lease_controller
+).start()
+atexit.register(lease_server.close)
+sys.stderr.write(f"{xtime()} - LEASE SERVER; INFO: {lease_socket_path}\n")
+sys.stderr.flush()
+
 last_cpu_times = psutil.cpu_times()
 last_cpu_total = sum(last_cpu_times)
 last_cgroup_cpu_time = get_cgroup_cpu_time_sec()
@@ -831,7 +907,16 @@ try :
         
         status.lock.acquire()  
         #print("%s - CYCLE" % xtime(), str(status.current_cpu), str(status.current_mem), str(mb_memory_available))
-        if mode == zslurm_shared.RUNNING and status.current_cpu > 0 and status.current_mem > 0 and mb_memory_available > float(config.get('mem_min_requestable_mb', 256.0)):
+        # A waiting reacquisition is a local admission barrier: let existing
+        # children drain, but do not fill the capacity that the oldest waiter
+        # needs. Acquisitions are FIFO and all-or-nothing in the controller.
+        lease_acquire_pending = lease_controller.has_pending_acquire()
+        if (
+            mode == zslurm_shared.RUNNING
+            and not lease_acquire_pending
+            and status.current_cpu > 0 and status.current_mem > 0
+            and mb_memory_available > float(config.get('mem_min_requestable_mb', 256.0))
+        ):
             if status.assigned_jobs:
                 jobs = list(status.assigned_jobs.values())
             else:
@@ -891,6 +976,10 @@ try :
                     if isinstance(env, dict):
                         env = {k: v for k, v in env.items() if not k.startswith("SLURM")}
                         env.update({k: v for k, v in os.environ.items() if k.startswith("SLURM")})
+                    lease_env = lease_controller.prepare_job(jobid, ncpu, mem)
+                    lease_env[zslurm_lease.ENV_SOCKET] = lease_socket_path
+                    if isinstance(env, dict):
+                        env.update(lease_env)
                     process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
 
                     status.current_cpu -= ncpu
@@ -904,6 +993,12 @@ try :
                     t.start()
                 except Exception as e:
                     import traceback
+                    # Spawn never reached the point where the initial maximum
+                    # was subtracted, so discard without returning resources.
+                    try:
+                        lease_controller.discard_prepared_job(jobid)
+                    except Exception:
+                        pass
                     sys.stderr.write(traceback.format_exc())
                     sys.stderr.write(f"{xtime()}:{jobid} - ERROR; INFO: {ncpu} {mem} {command} {logfile_path} {str(e)}\n")
                     status.return_codes[jobid] = -20

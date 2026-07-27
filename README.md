@@ -520,6 +520,81 @@ cancellation, or loss of the assigned worker. Leave this resource out of
 Snakemake's global `resources:` capacity list: that lets Snakemake submit the
 whole runnable DAG while ZSlurm enforces the cross-node limit.
 
+## Dynamic CPU and memory leases
+
+A running child job can temporarily return CPU cores and memory to its local
+`zslurm_chief`, then wait to reacquire them for a later phase. The underlying
+Slurm allocation is not resized: the lease controls only zslurm's internal
+multiplexing of jobs within that allocation.
+
+This is intended for multi-phase jobs, for example a highly parallel alignment
+followed by a lightly threaded merge:
+
+```bash
+# The job initially holds its complete zsbatch request.
+zslurm_lease status
+
+run_alignment
+
+# Keep only the resources needed by the serial phase.
+zslurm_lease set --cores 2 --mem-gb 12
+run_merge
+
+# A later increase blocks until the local chief can grant all of it.
+zslurm_lease set --cores 16 --mem-gb 48 --wait 3600
+run_parallel_postprocessing
+```
+
+Targets are absolute, not relative. Repeating the same `set` command is safe:
+it cannot release the same cores or memory twice. A target may not exceed the
+job's original `zsbatch` request.
+
+### Reacquisition and fairness
+
+When an increase cannot be granted immediately:
+
+- the request enters a FIFO queue on the local chief
+- the chief stops admitting new child jobs on that engine
+- already-running child jobs are allowed to finish
+- the request is granted all-or-nothing once both CPU and memory fit
+- `zslurm_lease set` remains blocked until grant or `--wait` expires
+
+There is no preemption. A timeout leaves the job's previous lease unchanged.
+
+### Memory safety
+
+The chief monitors the complete process tree's proportional set size (PSS). It
+will not shrink a lease below observed memory plus configurable headroom. The
+response reports when this safety floor adjusted the requested target.
+
+Relevant manager/chief configuration keys are:
+
+```yaml
+lease_min_cpu: 0.1
+lease_memory_headroom_fraction: 0.20
+lease_memory_headroom_mb: 512
+# Optional; defaults to this chief's node-local scratch, then TMPDIR or /tmp.
+lease_socket_dir: /some/node-local/path
+```
+
+CPU leases are cooperative scheduling reservations; they do not change an
+application's thread count or create a new Slurm step/cgroup. The pipeline must
+set each tool's thread arguments consistently with the lease it acquires.
+
+### Local protocol and environment
+
+The chief injects `ZSLURM_LEASE_SOCKET`, `ZSLURM_LEASE_TOKEN`,
+`ZSLURM_JOB_ID`, `ZSLURM_LEASE_MAX_CORES`, and
+`ZSLURM_LEASE_MAX_MEM_MB` into every child. The socket is node-local and mode
+`0600`; every request additionally requires the job-specific capability token.
+Jobs should use `zslurm_lease` rather than speaking the JSON protocol directly.
+
+Dynamic leases are backward compatible: a job that never calls
+`zslurm_lease` holds its original resources until completion. Deploy the
+manager before restarting chiefs because new chiefs call the manager's
+`resize_running_job` RPC. Existing chiefs and already-running jobs cannot gain
+lease support in place.
+
 ## Configuration and instances
 
 ZSlurm stores user configuration under `~/.zslurm`.
