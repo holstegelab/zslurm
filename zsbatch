@@ -5,8 +5,10 @@ import os
 import socket
 try: 
     import http.client as httplib
+    from xmlrpc.client import Fault as XMLRPCFault
 except:
     import httplib
+    from xmlrpclib import Fault as XMLRPCFault
 import sys
 import shlex
 import time
@@ -36,6 +38,7 @@ parser.add_argument('--info-input-mb', type=float, default=0.0, help='Used to se
 parser.add_argument('--info-output-file', type=str, default='', help='Used to set path of primary output file (helpful for identifying specific jobs in reports.tsv)')
 parser.add_argument('--ssd-use', type=str, default='no', help="SSD usage: 'no' (default), 'possible' (aliases: yes, can_use), or 'required'")
 parser.add_argument('--ssd-gb', type=float, default=0.0, help='SSD capacity requested in GB (used with ssd-use possible/required)')
+parser.add_argument('--priority', type=int, default=0, help='ZSlurm scheduling priority. Higher integer values run before lower values; default: 0.')
 parser.add_argument('--instance', type=str, default=None, help='Submit to a specific ZSlurm instance (defaults to $ZSLURM_INSTANCE or the configured default).')
 
 parser.add_argument('job_args', nargs='*')
@@ -155,12 +158,34 @@ attempt = 4
 while attempt > 0 :
     try:
         for i in range(int(args.ntasks)):
-            jobid = proxy.submit_job(job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime, int(args.requeue), args.dependency, args.arch_use_add, args.arch_use_remove, args.dcache_use_add, args.dcache_use_remove, args.active_use_add, args.active_use_remove, args.partition, args.info_input_mb, args.info_output_file, '', args.ssd_use, args.ssd_gb)
+            submit_args = [
+                job_name, cmd, cwd, env, args.cpus_per_task, args.mem, reqtime,
+                int(args.requeue), args.dependency, args.arch_use_add,
+                args.arch_use_remove, args.dcache_use_add, args.dcache_use_remove,
+                args.active_use_add, args.active_use_remove, args.partition,
+                args.info_input_mb, args.info_output_file, '', args.ssd_use,
+                args.ssd_gb,
+            ]
+            # Keep the default call compatible with older managers. Priority
+            # was appended after owner/idempotency_key in the extended API.
+            if args.priority != 0:
+                submit_args.extend([None, None, args.priority])
+            jobid = proxy.submit_job(*submit_args)
             if args.parsable:
                 print(jobid)
             else:
                 print('Submitted batch job ' + jobid)
         sys.exit(0)
+    except XMLRPCFault as serror:
+        if args.priority != 0:
+            print(
+                'zsbatch: error: priority-aware submission was rejected; '
+                'update the running ZSlurm manager before using --priority: %s'
+                % serror
+            )
+        else:
+            print('zsbatch: error: submission was rejected: %s' % serror)
+        sys.exit(1)
     except (socket.error, httplib.HTTPException) as serror:
         attempt -= 1
         time.sleep(15)

@@ -98,6 +98,29 @@ On Snellius, starting Slurm engines also offers an SSD scratch-node reservation 
 
 Besides simple FIFO-style scheduling, ZSlurm contains a few higher-level queue management strategies that strongly affect throughput and workflow shape.
 
+### Pipeline priority
+
+Every submitted job has an integer priority. Higher values are dispatched before
+lower values; the default is 0. Set it directly with:
+
+    zsbatch --priority 100 -- command arguments
+
+The native Snakemake executor exposes the same value once per pipeline:
+
+    snakemake --executor zslurm --zslurm-priority 100 ...
+
+Priority is evaluated independently in each applicable worker queue, including
+compute and archive or transfer workers. It therefore governs CPU work as well
+as staging, downloads, uploads, and final writes that carry the pipeline value.
+Already-running work is never preempted. A high-priority job that is ineligible
+for an engine because of partition, SSD, walltime, or a storage budget does not
+block eligible lower-priority work on that engine.
+
+The memory-aware packer may reorder jobs only within the same numeric priority
+band. FIFO remains the default tie-breaker; compute LIFO, when enabled, reverses
+order only within a band. Manual prioritize or deprioritize similarly adjusts
+the legacy order within a numeric band, not across pipeline priorities.
+
 ### Memory-aware filling
 
 The `m` control sets the **memory optimization search window** used by the scheduler.
@@ -757,6 +780,7 @@ Useful options:
 - **`--limit-threads`**: limit thread-related environment variables
 - **`--info-input-mb`**: annotate input size in `report-*.tsv`
 - **`--info-output-file`**: annotate primary output path in `report-*.tsv`
+- **`--priority`**: integer scheduling priority; higher values run first (default 0)
 - **`--ssd-use`**: SSD requirement mode (`no`, `possible`, `required`)
 - **`--ssd-gb`**: requested SSD capacity in GB
 - **`--instance`**: submit to a specific ZSlurm instance
@@ -998,8 +1022,8 @@ the interface design and phasing.
   `ping`/`health`, `get_status_json`, `match_jobs`, `whatif_budget`, `forecast_budget`,
   `list_jobs_detailed`, `get_autogrow_plan`, `set_budgets`, `set_scheduler_mode`,
   `set_autogrow`, `prioritize`/`deprioritize`, `recompute_inuse_from_running`,
-  `grow`/`shrink`. `submit_job` accepts an optional `idempotency_key` for retry-safe
-  submission.
+  `grow`/`shrink`. `submit_job` accepts optional `idempotency_key` and `priority`
+  arguments for retry-safe, priority-aware submission.
 
 ### Claude Code skill
 

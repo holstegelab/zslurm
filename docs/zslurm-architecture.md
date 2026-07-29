@@ -364,8 +364,10 @@ There are two submission paths, both ending at the same `submit_job` RPC:
   `time`, `n`, `partition`, the six storage deltas, `limit_auto_threads`, `input_mb`,
   `output[0]`.
 - **Native executor plugin** (`snakemake_executor_plugin_zslurm`): a `RemoteExecutor` that
-  calls `submit_job` over XML-RPC directly (22 positional args incl. a per-run `owner`
-  UUID), polls `list_jobs`/`list_done_jobs(last_seen_jobid, owner)` scoped to that owner,
+  calls `submit_job` over XML-RPC directly (22 legacy positional args incl. a per-run
+  `owner` UUID; non-zero pipeline priority appends `idempotency_key=None` and
+  `priority`), and forwards `dcache_transfer_slots` as submission metadata. It polls
+  `list_jobs`/`list_done_jobs(last_seen_jobid, owner)` scoped to that owner,
   maps zslurm states to Snakemake success/error/running, uses an adaptive 30→180 s backoff,
   hardcodes `requeue=0` (retries via Snakemake `restart-times`), and **does not cancel**
   (its `cancel_jobs` is a no-op + drain). Note a **units mismatch**: the plugin treats

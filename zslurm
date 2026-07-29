@@ -418,7 +418,8 @@ class Job(object):
         ssd_use='no',
         ssd_gb=0,
         dcache_transfer_slots=0,
-        owner=None
+        owner=None,
+        priority=0
     ):
         self.job_name = job_name
         self.jobid = jobid
@@ -448,6 +449,10 @@ class Job(object):
         self.output_file = info_output_file
         self.comment = comment
         self.owner = owner
+        try:
+            self.priority = int(priority or 0)
+        except (TypeError, ValueError):
+            self.priority = 0
         try:
             su = (ssd_use or 'no')
             if isinstance(su, str):
@@ -906,6 +911,7 @@ class JobManager(object):
                     'dcache_transfer_slots': float(
                         getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
                     ),
+                    'priority': int(getattr(job, 'priority', 0) or 0),
                     'comment': getattr(job, 'comment', ''),
                 })
             return out
@@ -1105,6 +1111,31 @@ class JobManager(object):
                 nodes.add(job.node_id)
         return nodes
 
+    def _jobs_in_priority_order(self, lastin_first=False):
+        """Return jobs ordered by numeric priority, preserving legacy order as
+        the tie-breaker.
+
+        Higher numbers run first. FIFO remains the default within a priority
+        band; the existing compute-only LIFO mode reverses only that band. A
+        bucketed implementation avoids sorting every individual job when many
+        jobs share the same per-pipeline priority.
+        """
+        buckets = {}
+        for job in self.jobs_by_id.values():
+            try:
+                priority = int(getattr(job, 'priority', 0) or 0)
+            except (TypeError, ValueError):
+                priority = 0
+            buckets.setdefault(priority, []).append(job)
+
+        ordered = []
+        for priority in sorted(buckets, reverse=True):
+            bucket = buckets[priority]
+            if lastin_first:
+                bucket = reversed(bucket)
+            ordered.extend(bucket)
+        return ordered
+
     def prioritize(self, job_pattern):
         self._reorder_jobs(job_pattern, not status.lastin_first)
 
@@ -1158,7 +1189,8 @@ class JobManager(object):
         ssd_use='no',
         ssd_gb=0,
         owner=None,
-        idempotency_key=None
+        idempotency_key=None,
+        priority=0
     ):
         # Idempotent submission: a retried submit with the same key returns the
         # already-created jobid instead of double-submitting (see seen_tokens).
@@ -1215,7 +1247,8 @@ class JobManager(object):
             ssd_use,
             ssd_gb,
             dcache_transfer_slots,
-            owner
+            owner,
+            priority
         )
 
         self.jobs_by_id[jobid] = job
@@ -1231,13 +1264,13 @@ class JobManager(object):
         ):
             add_log_line(
                 gb,
-                f"Job {job_name} (id: {jobid}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}, arch+: {arch_use_add} GB, arch-: {arch_use_remove} GB, d+: {dcache_use_add} GB, d-: {dcache_use_remove} GB, active+: {active_use_add} GB, active-: {active_use_remove} GB, dcache-transfer: {dcache_transfer_slots}) submitted.",
+                f"Job {job_name} (id: {jobid}, priority: {job.priority}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}, arch+: {arch_use_add} GB, arch-: {arch_use_remove} GB, d+: {dcache_use_add} GB, d-: {dcache_use_remove} GB, active+: {active_use_add} GB, active-: {active_use_remove} GB, dcache-transfer: {dcache_transfer_slots}) submitted.",
                  GREEN,
             )
         else:
             add_log_line(
                 gb,
-                f"Job {job_name} (id: {jobid}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}) submitted.",
+                f"Job {job_name} (id: {jobid}, priority: {job.priority}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}) submitted.",
                 GREEN,
             )
         return jobid
@@ -1513,10 +1546,9 @@ class JobManager(object):
             queued = []
             assigned = []
 
-            jobs_view = self.jobs_by_id.values()
-
-            if status.lastin_first and partition != 'archive':
-                jobs_view = reversed(jobs_view)
+            jobs_view = self._jobs_in_priority_order(
+                lastin_first=(status.lastin_first and partition != 'archive')
+            )
             
             jobs_view_iter = iter(jobs_view)
 
@@ -1666,7 +1698,18 @@ class JobManager(object):
                                 traceback.print_exc()
                                 ssd_bonus = 0.0
 
-                            score = memory_penalty + over_use_penalty - ssd_bonus
+                            # Pipeline priority is strict. Memory/CPU packing
+                            # optimizes only within the same priority band.
+                            try:
+                                candidate_priority = int(
+                                    getattr(job_candidate, 'priority', 0) or 0
+                                )
+                            except (TypeError, ValueError):
+                                candidate_priority = 0
+                            score = (
+                                -candidate_priority,
+                                memory_penalty + over_use_penalty - ssd_bonus,
+                            )
                             if (best_score is None) or (score < best_score):
                                 best_score = score
                                 best_idx = startpos
@@ -2323,6 +2366,7 @@ def ping():
         "controller_alive": bool(_CONTROLLER_THREAD is not None and _CONTROLLER_THREAD.is_alive()),
         "lastin_first": bool(status.lastin_first),
         "prio_fillmem_context": int(status.prio_fillmem_context),
+        "submit_job_priority": True,
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
     }
 
