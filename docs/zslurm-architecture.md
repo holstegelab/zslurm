@@ -111,9 +111,10 @@ unseen for `TIMEOUT=1200 s` (`zslurm:2718-2746`), requeuing their running jobs.
 
 ## 3. The job queue & dispatch (the heart of the scheduler)
 
-`JobManager.jobs_by_id` is an **`OrderedDict` keyed by a monotonically increasing integer**
-(`zslurm:448-450`). `submit_job` appends (`zslurm:632`). **There is no numeric priority
-field — position in this dict *is* the priority.** A `Job` (`zslurm:319-416`) carries:
+`JobManager.jobs_by_id` is an **`OrderedDict` keyed by a monotonically increasing integer**.
+`submit_job` appends, and each job also carries an integer `priority` (default 100).
+Dispatch considers higher numeric priority first; ordered-dict position supplies the
+FIFO/LIFO tie-break within one priority band. A `Job` carries:
 `ncpu` (**float — fractional cores allowed**), `mem` (MB), `reqtime` (s), `partition`,
 the three storage deltas (`{archive,dcache,active}_start_use_add` / `_end_use_remove`),
 `ssd_use ∈ {no,possible,required}` + `ssd_gb`, `requeue`, `dependency`,
@@ -366,7 +367,8 @@ There are two submission paths, both ending at the same `submit_job` RPC:
 - **Native executor plugin** (`snakemake_executor_plugin_zslurm`): a `RemoteExecutor` that
   calls `submit_job` over XML-RPC directly (22 legacy positional args incl. a per-run
   `owner` UUID; non-zero pipeline priority appends `idempotency_key=None` and
-  `priority`), and forwards `dcache_transfer_slots` as submission metadata. It polls
+  `priority`), and forwards `dcache_download_slots` / `dcache_upload_slots`
+  (plus conservative legacy `dcache_transfer_slots`) as submission metadata. It polls
   `list_jobs`/`list_done_jobs(last_seen_jobid, owner)` scoped to that owner,
   maps zslurm states to Snakemake success/error/running, uses an adaptive 30→180 s backoff,
   hardcodes `requeue=0` (retries via Snakemake `restart-times`), and **does not cancel**

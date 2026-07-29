@@ -112,6 +112,9 @@ The native Snakemake executor exposes the same value once per pipeline:
 Priority is evaluated independently in each applicable worker queue, including
 compute and archive or transfer workers. It therefore governs CPU work as well
 as staging, downloads, uploads, and final writes that carry the pipeline value.
+`zsqueue` shows the numeric value in its `PRIO` column; `zsqueue --json`
+includes it as the numeric `priority` field.
+
 Already-running work is never preempted. A high-priority job that is ineligible
 for an engine because of partition, SSD, walltime, or a storage budget does not
 block eligible lower-priority work on that engine.
@@ -523,25 +526,39 @@ In practice, this means ZSlurm can act as a lightweight global resource monitor 
 ### Limiting concurrent dCache transfers
 
 The durable dCache counter above measures storage in GB. Transfer concurrency is
-a separate, transient resource. Configure its instance-wide capacity in
-`~/.zslurm/config.yaml`:
+a separate, transient resource with independent download and upload pools.
+Configure their instance-wide capacities in `~/.zslurm/config.yaml`:
 
 ```yaml
-dcache_transfer_slots: 4
+dcache_download_slots: 4
+dcache_upload_slots: 2
 ```
 
-A Snakemake job that uploads or downloads data requests one slot with:
+A Snakemake transfer job requests a directional slot:
 
 ```python
 resources:
-    dcache_transfer_slots=1
+    dcache_download_slots=1  # use dcache_upload_slots=1 for outbound data
 ```
 
-The executor passes this request as job metadata. ZSlurm reserves it while the
-job is `ASSIGNED` or `RUNNING` and releases it on completion, failure, requeue,
-cancellation, or loss of the assigned worker. Leave this resource out of
-Snakemake's global `resources:` capacity list: that lets Snakemake submit the
-whole runnable DAG while ZSlurm enforces the cross-node limit.
+The native executor passes these requests as job metadata. ZSlurm reserves them
+while the job is `ASSIGNED` or `RUNNING` and releases them on completion,
+failure, requeue, cancellation, or loss of the assigned worker. A full download
+pool does not block an upload, and vice versa. Leave these resources out of
+Snakemake's global `resources:` capacity list: Snakemake can then submit the
+whole runnable DAG while ZSlurm enforces the cross-node limits.
+
+For compatibility, the old manager setting `dcache_transfer_slots` supplies the
+default for both directional maxima when the new settings are absent. A legacy
+per-job `dcache_transfer_slots` request consumes the requested amount from both
+pools, conservatively throttling clients whose direction is unknown. Do not mix
+legacy and directional resources on one job.
+
+Limits can also be changed at runtime (in-use reservations are left intact):
+
+```bash
+zscontrol transfer-slots --download 4 --upload 2
+```
 
 ## Dynamic CPU and memory leases
 
@@ -781,6 +798,8 @@ Useful options:
 - **`--info-input-mb`**: annotate input size in `report-*.tsv`
 - **`--info-output-file`**: annotate primary output path in `report-*.tsv`
 - **`--priority`**: integer scheduling priority; higher values run first (default 100)
+- **`--dcache-download-slots`**: transient download concurrency requested by the job
+- **`--dcache-upload-slots`**: transient upload concurrency requested by the job
 - **`--ssd-use`**: SSD requirement mode (`no`, `possible`, `required`)
 - **`--ssd-gb`**: requested SSD capacity in GB
 - **`--instance`**: submit to a specific ZSlurm instance
@@ -1011,7 +1030,7 @@ the interface design and phasing.
 - **`zscontrol`**: a control plane mirroring the TUI keys. Reads (no token): `status`,
   `whatif`, `match`, `forecast` (will a planned DAG fit the budgets?), `jobs`,
   `autogrow-plan`. Gated writes (require `enable_control_rpc` + `control_token`): `budget`,
-  `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`, `recompute-inuse`,
+  `transfer-slots`, `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`, `recompute-inuse`,
   `grow`/`shrink`.
 - **`--json`** on `zsqueue` and `zsnodes` emits numeric, schema-versioned rows;
   `zsqueue_stats`/`zsoccupancy`/`zsstats` already have `--json`. Exit-code contract across
@@ -1020,7 +1039,7 @@ the interface design and phasing.
 - New RPCs on the job server (gated writes behind `enable_control_rpc` + `control_token`,
   set in `~/.zslurm/config.yaml` or via the `--enable-control`/`--control-token` flags):
   `ping`/`health`, `get_status_json`, `match_jobs`, `whatif_budget`, `forecast_budget`,
-  `list_jobs_detailed`, `get_autogrow_plan`, `set_budgets`, `set_scheduler_mode`,
+  `list_jobs_detailed`, `get_autogrow_plan`, `set_budgets`, `set_transfer_limits`, `set_scheduler_mode`,
   `set_autogrow`, `prioritize`/`deprioritize`, `recompute_inuse_from_running`,
   `grow`/`shrink`. `submit_job` accepts optional `idempotency_key` and `priority`
   arguments for retry-safe, priority-aware submission.

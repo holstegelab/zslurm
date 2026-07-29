@@ -16,6 +16,7 @@ Exit codes (see docs/agent-interface-plan.md):
 
 Subcommands:
   budget   --active GB --dcache GB --archive GB [--active-inuse GB ...]   set storage budgets
+  transfer-slots [--download N] [--upload N]                              set dCache concurrency
   lifo     on|off                                                        depth-first/LIFO toggle
   context  N                                                             greedy memory window (>=1)
   autogrow on|off [--max-nodes N]                                        autoscale + node cap
@@ -89,6 +90,10 @@ def main():
     sp.add_argument("--active-inuse", dest="active_inuse", type=float, default=None)
     sp.add_argument("--dcache-inuse", dest="dcache_inuse", type=float, default=None)
     sp.add_argument("--archive-inuse", dest="archive_inuse", type=float, default=None)
+
+    sp = sub.add_parser("transfer-slots", help="set dCache download/upload concurrency limits")
+    sp.add_argument("--download", type=float, default=None)
+    sp.add_argument("--upload", type=float, default=None)
 
     sp = sub.add_parser("lifo", help="toggle depth-first/last-in-first-out scheduling")
     sp.add_argument("state", choices=["on", "off"])
@@ -207,6 +212,16 @@ def main():
         if args.cmd == "budget":
             _finish(proxy.set_budgets(token, args.active, args.dcache, args.archive,
                                       args.active_inuse, args.dcache_inuse, args.archive_inuse))
+
+        if args.cmd == "transfer-slots":
+            if args.download is None and args.upload is None:
+                sys.stderr.write("zscontrol: transfer-slots needs --download and/or --upload\n")
+                sys.exit(3)
+            if ((args.download is not None and args.download < 0) or
+                    (args.upload is not None and args.upload < 0)):
+                sys.stderr.write("zscontrol: transfer slot limits must be non-negative\n")
+                sys.exit(3)
+            _finish(proxy.set_transfer_limits(token, args.download, args.upload))
 
         if args.cmd == "lifo":
             _finish(proxy.set_scheduler_mode(token, args.state == "on", None))

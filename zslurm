@@ -420,7 +420,9 @@ class Job(object):
         ssd_gb=0,
         dcache_transfer_slots=0,
         owner=None,
-        priority=DEFAULT_JOB_PRIORITY
+        priority=DEFAULT_JOB_PRIORITY,
+        dcache_download_slots=0,
+        dcache_upload_slots=0
     ):
         self.job_name = job_name
         self.jobid = jobid
@@ -481,6 +483,14 @@ class Job(object):
             self.dcache_transfer_slots = max(0.0, float(dcache_transfer_slots))
         except Exception:
             self.dcache_transfer_slots = 0.0
+        try:
+            self.dcache_download_slots = max(0.0, float(dcache_download_slots))
+        except Exception:
+            self.dcache_download_slots = 0.0
+        try:
+            self.dcache_upload_slots = max(0.0, float(dcache_upload_slots))
+        except Exception:
+            self.dcache_upload_slots = 0.0
 
         self.state = "PENDING"
         self.node_id = None
@@ -576,8 +586,10 @@ class JobManager(object):
         # Transient transfer concurrency is separate from dcache_{total,inuse},
         # which account for durable storage in GiB.  Jobs reserve these slots
         # only while ASSIGNED/RUNNING.
-        self.dcache_transfer_total = 4.0
-        self.dcache_transfer_inuse = 0.0
+        self.dcache_download_total = 4.0
+        self.dcache_download_inuse = 0.0
+        self.dcache_upload_total = 4.0
+        self.dcache_upload_inuse = 0.0
 
         # idempotent submission: maps a client-supplied idempotency_key -> jobid,
         # so a retried submit_job (e.g. after a socket timeout that actually
@@ -601,37 +613,62 @@ class JobManager(object):
             inuse_val = 0.0
         return total_val >= (inuse_val + needed_val)
 
-    def _dcache_transfer_fits_locked(self, job):
-        return self._resource_fits_locked(
-            self.dcache_transfer_total,
-            self.dcache_transfer_inuse,
-            getattr(job, 'dcache_transfer_slots', 0.0),
-        )
+    def _dcache_slot_needs(self, job):
+        """Return (download, upload) needs for a job.
+
+        Legacy dcache_transfer_slots consumes both pools. That is deliberately
+        conservative: old clients remain throttled regardless of transfer
+        direction, while updated clients can use the pools independently.
+        """
+        legacy = float(getattr(job, 'dcache_transfer_slots', 0.0) or 0.0)
+        download = float(getattr(job, 'dcache_download_slots', 0.0) or 0.0)
+        upload = float(getattr(job, 'dcache_upload_slots', 0.0) or 0.0)
+        return download + legacy, upload + legacy
+
+    def _dcache_transfer_fits_locked(self, job, download_available=None,
+                                     upload_available=None):
+        download_need, upload_need = self._dcache_slot_needs(job)
+        if download_available is None:
+            download_available = self.dcache_download_total - self.dcache_download_inuse
+        if upload_available is None:
+            upload_available = self.dcache_upload_total - self.dcache_upload_inuse
+        return (download_need <= max(0.0, float(download_available)) and
+                upload_need <= max(0.0, float(upload_available)))
 
     def _reserve_dcache_transfer_locked(self, job):
-        self.dcache_transfer_inuse += float(
-            getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
-        )
+        download_need, upload_need = self._dcache_slot_needs(job)
+        self.dcache_download_inuse += download_need
+        self.dcache_upload_inuse += upload_need
         self._eligible_cache_ts = 0.0
 
     def _release_dcache_transfer_locked(self, job):
-        self.dcache_transfer_inuse -= float(
-            getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
+        download_need, upload_need = self._dcache_slot_needs(job)
+        self.dcache_download_inuse = max(
+            0.0, self.dcache_download_inuse - download_need
         )
-        if self.dcache_transfer_inuse < 0.0:
-            self.dcache_transfer_inuse = 0.0
+        self.dcache_upload_inuse = max(
+            0.0, self.dcache_upload_inuse - upload_need
+        )
         self._eligible_cache_ts = 0.0
 
     def configure_transfer_limits(self, config):
-        """Load transient transfer limits from the manager configuration."""
-        raw_total = (config or {}).get('dcache_transfer_slots', 4)
+        """Load directional transfer limits from the manager configuration."""
+        cfg = config or {}
+        legacy_total = cfg.get('dcache_transfer_slots', 4)
+        raw_download = cfg.get('dcache_download_slots', legacy_total)
+        raw_upload = cfg.get('dcache_upload_slots', legacy_total)
         try:
-            total = max(0.0, float(raw_total))
+            download_total = max(0.0, float(raw_download))
         except Exception:
-            total = 4.0
+            download_total = 4.0
+        try:
+            upload_total = max(0.0, float(raw_upload))
+        except Exception:
+            upload_total = 4.0
         self.lock.acquire()
         try:
-            self.dcache_transfer_total = total
+            self.dcache_download_total = download_total
+            self.dcache_upload_total = upload_total
             self._eligible_cache_ts = 0.0
         finally:
             self.lock.release()
@@ -689,21 +726,25 @@ class JobManager(object):
             return
 
         counts = {}
-        transfer_available = max(
-            0.0, self.dcache_transfer_total - self.dcache_transfer_inuse
+        download_available = max(
+            0.0, self.dcache_download_total - self.dcache_download_inuse
+        )
+        upload_available = max(
+            0.0, self.dcache_upload_total - self.dcache_upload_inuse
         )
         for job in list(self.jobs_by_id.values()):
             if self._is_job_eligible_locked(job):
-                transfer_need = float(
-                    getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
-                )
                 if (
                     getattr(job, 'state', None) in queue_states
-                    and transfer_need > transfer_available
+                    and not self._dcache_transfer_fits_locked(
+                        job, download_available, upload_available
+                    )
                 ):
                     continue
                 if getattr(job, 'state', None) in queue_states:
-                    transfer_available -= transfer_need
+                    download_need, upload_need = self._dcache_slot_needs(job)
+                    download_available -= download_need
+                    upload_available -= upload_need
                 part = str(getattr(job, 'partition', 'compute') or 'compute')
                 counts[part] = counts.get(part, 0) + 1
 
@@ -723,14 +764,19 @@ class JobManager(object):
         try:
             pend_add = {'active': 0.0, 'dcache': 0.0, 'archive': 0.0}
             min_add = {'active': None, 'dcache': None, 'archive': None}
-            pending_transfer_slots = 0.0
+            pending_download_slots = 0.0
+            pending_upload_slots = 0.0
+            pending_legacy_slots = 0.0
             n_pending = 0
             n_budget_pending = 0
             for job in self.jobs_by_id.values():
                 if getattr(job, 'state', None) not in queue_states:
                     continue
                 n_pending += 1
-                pending_transfer_slots += float(
+                download_need, upload_need = self._dcache_slot_needs(job)
+                pending_download_slots += download_need
+                pending_upload_slots += upload_need
+                pending_legacy_slots += float(
                     getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
                 )
                 vals = {
@@ -753,9 +799,17 @@ class JobManager(object):
             return {
                 'budgets': budgets,
                 'dcache_transfers': {
-                    'total_slots': float(self.dcache_transfer_total),
-                    'inuse_slots': float(self.dcache_transfer_inuse),
-                    'pending_slots': pending_transfer_slots,
+                    'download': {
+                        'total_slots': float(self.dcache_download_total),
+                        'inuse_slots': float(self.dcache_download_inuse),
+                        'pending_slots': pending_download_slots,
+                    },
+                    'upload': {
+                        'total_slots': float(self.dcache_upload_total),
+                        'inuse_slots': float(self.dcache_upload_inuse),
+                        'pending_slots': pending_upload_slots,
+                    },
+                    'legacy_pending_slots': pending_legacy_slots,
                 },
                 'scheduler': {
                     'lastin_first': bool(status.lastin_first),
@@ -860,6 +914,28 @@ class JobManager(object):
         finally:
             self.lock.release()
 
+    def set_transfer_limits(self, download_total=None, upload_total=None):
+        """Set directional transfer concurrency without changing in-use slots."""
+        self.lock.acquire()
+        try:
+            if download_total is not None:
+                self.dcache_download_total = max(0.0, float(download_total))
+            if upload_total is not None:
+                self.dcache_upload_total = max(0.0, float(upload_total))
+            self._eligible_cache_ts = 0.0
+            return {
+                'download': {
+                    'total_slots': float(self.dcache_download_total),
+                    'inuse_slots': float(self.dcache_download_inuse),
+                },
+                'upload': {
+                    'total_slots': float(self.dcache_upload_total),
+                    'inuse_slots': float(self.dcache_upload_inuse),
+                },
+            }
+        finally:
+            self.lock.release()
+
     def list_jobs_detailed(self, owner=None, states=None):
         """Like list_jobs but named-key dicts with the extra signals an agent needs
         to spot stuck / OOM-looping jobs: requeue_remaining, current vs reserved mem
@@ -910,7 +986,13 @@ class JobManager(object):
                     'arch_use_gb': float(getattr(job, 'archive_start_use_add', 0.0) - getattr(job, 'archive_end_use_remove', 0.0)),
                     'ssd_use': getattr(job, 'ssd_use', 'no'),
                     'ssd_gb': float(getattr(job, 'ssd_gb', 0.0) or 0.0),
-                    'dcache_transfer_slots': float(
+                    'dcache_download_slots': float(
+                        getattr(job, 'dcache_download_slots', 0.0) or 0.0
+                    ),
+                    'dcache_upload_slots': float(
+                        getattr(job, 'dcache_upload_slots', 0.0) or 0.0
+                    ),
+                    'dcache_transfer_slots_legacy': float(
                         getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
                     ),
                     'priority': int(getattr(job, 'priority', 0) or 0),
@@ -929,21 +1011,23 @@ class JobManager(object):
         try:
             before = {'active': float(self.active_inuse), 'dcache': float(self.dcache_inuse),
                       'archive': float(self.archive_inuse),
-                      'dcache_transfers': float(self.dcache_transfer_inuse)}
+                      'dcache_downloads': float(self.dcache_download_inuse),
+                      'dcache_uploads': float(self.dcache_upload_inuse)}
             sums = {'active': 0.0, 'dcache': 0.0, 'archive': 0.0,
-                    'dcache_transfers': 0.0}
+                    'dcache_downloads': 0.0, 'dcache_uploads': 0.0}
             for job in self.jobs_by_id.values():
                 if getattr(job, 'state', None) in ('RUNNING', 'ASSIGNED'):
                     sums['active'] += float(getattr(job, 'active_start_use_add', 0.0) or 0.0)
                     sums['dcache'] += float(getattr(job, 'dcache_start_use_add', 0.0) or 0.0)
                     sums['archive'] += float(getattr(job, 'archive_start_use_add', 0.0) or 0.0)
-                    sums['dcache_transfers'] += float(
-                        getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
-                    )
+                    download_need, upload_need = self._dcache_slot_needs(job)
+                    sums['dcache_downloads'] += download_need
+                    sums['dcache_uploads'] += upload_need
             self.active_inuse = sums['active']
             self.dcache_inuse = sums['dcache']
             self.archive_inuse = sums['archive']
-            self.dcache_transfer_inuse = sums['dcache_transfers']
+            self.dcache_download_inuse = sums['dcache_downloads']
+            self.dcache_upload_inuse = sums['dcache_uploads']
             self._eligible_cache_ts = 0.0
             return {'before': before, 'after': sums}
         finally:
@@ -1218,12 +1302,21 @@ class JobManager(object):
         if len(env) == 1 and "data" in env:
             env = env["data"]
 
-        try:
-            dcache_transfer_slots = max(
-                0.0, float(env.get("ZSLURM_DCACHE_TRANSFER_SLOTS", 0.0))
-            )
-        except Exception:
-            dcache_transfer_slots = 0.0
+        def transfer_slots_from_env(name):
+            try:
+                return max(0.0, float(env.get(name, 0.0)))
+            except Exception:
+                return 0.0
+
+        dcache_transfer_slots = transfer_slots_from_env(
+            "ZSLURM_DCACHE_TRANSFER_SLOTS"
+        )
+        dcache_download_slots = transfer_slots_from_env(
+            "ZSLURM_DCACHE_DOWNLOAD_SLOTS"
+        )
+        dcache_upload_slots = transfer_slots_from_env(
+            "ZSLURM_DCACHE_UPLOAD_SLOTS"
+        )
 
         job = Job(
             job_name,
@@ -1250,7 +1343,9 @@ class JobManager(object):
             ssd_gb,
             dcache_transfer_slots,
             owner,
-            priority
+            priority,
+            dcache_download_slots,
+            dcache_upload_slots
         )
 
         self.jobs_by_id[jobid] = job
@@ -1263,10 +1358,12 @@ class JobManager(object):
             or active_use_add
             or active_use_remove
             or dcache_transfer_slots
+            or dcache_download_slots
+            or dcache_upload_slots
         ):
             add_log_line(
                 gb,
-                f"Job {job_name} (id: {jobid}, priority: {job.priority}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}, arch+: {arch_use_add} GB, arch-: {arch_use_remove} GB, d+: {dcache_use_add} GB, d-: {dcache_use_remove} GB, active+: {active_use_add} GB, active-: {active_use_remove} GB, dcache-transfer: {dcache_transfer_slots}) submitted.",
+                f"Job {job_name} (id: {jobid}, priority: {job.priority}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}, arch+: {arch_use_add} GB, arch-: {arch_use_remove} GB, d+: {dcache_use_add} GB, d-: {dcache_use_remove} GB, active+: {active_use_add} GB, active-: {active_use_remove} GB, dcache-download: {dcache_download_slots}, dcache-upload: {dcache_upload_slots}, dcache-transfer-legacy: {dcache_transfer_slots}) submitted.",
                  GREEN,
             )
         else:
@@ -1329,7 +1426,8 @@ class JobManager(object):
         finally:
             self.lock.release()
 
-    def list_done_jobs(self, last_seen_jobid=None, owner=None):
+    def list_done_jobs(self, last_seen_jobid=None, owner=None,
+                           include_priority=False):
         def serialize(job):
             if not job.starttime is None:
                 runtime = job.endtime - job.starttime
@@ -1355,7 +1453,8 @@ class JobManager(object):
                 dcache_use,
                 job.cwd,
                 job.comment,
-            ]
+            ] + ([int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY))]
+                 if include_priority else [])
 
         jobs = []
         target_jobid = None if last_seen_jobid is None else str(last_seen_jobid)
@@ -1444,7 +1543,7 @@ class JobManager(object):
             'engines': engines_info,
         }
 
-    def list_jobs(self, owner=None):
+    def list_jobs(self, owner=None, include_priority=False):
         jobs = []
         for job in list(self.jobs_by_id.values()):
             if owner is not None and str(getattr(job, 'owner', None)) != str(owner):
@@ -1478,7 +1577,8 @@ class JobManager(object):
                     dcache_use,
                     job.cwd,
                     job.comment
-                ]
+                ] + ([int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY))]
+                     if include_priority else [])
             )
 
         return jobs
@@ -2340,7 +2440,7 @@ resize_running_job = lambda *args: jobs.resize_running_job(*args)
 # {"ok": ...} dict (instead of raising) keeps the contract jsonable and lets
 # clients map code 3 -> non-retryable exit without parsing XML-RPC Faults.
 # ===========================================================================
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _MANAGER_START_TS = None
 _CONTROLLER_THREAD = None
 
@@ -2370,6 +2470,8 @@ def ping():
         "prio_fillmem_context": int(status.prio_fillmem_context),
         "submit_job_priority": True,
         "default_job_priority": DEFAULT_JOB_PRIORITY,
+        "list_jobs_priority": True,
+        "directional_dcache_slots": True,
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
     }
 
@@ -2398,6 +2500,18 @@ def set_budgets(token=None, active_total=None, dcache_total=None, archive_total=
                            active_inuse, dcache_inuse, archive_inuse)
     add_log_line(gb, f"[agent] budgets set -> {res}", CYAN)
     return {"ok": True, "budgets": res}
+
+
+def set_transfer_limits(token=None, download_total=None, upload_total=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    try:
+        res = jobs.set_transfer_limits(download_total, upload_total)
+    except (TypeError, ValueError) as error:
+        return {"ok": False, "code": 3, "error": str(error)}
+    add_log_line(gb, f"[agent] dCache transfer limits set -> {res}", CYAN)
+    return {"ok": True, "dcache_transfers": res}
 
 
 def set_scheduler_mode(token=None, lastin_first=None, prio_fillmem_context=None):
@@ -2561,6 +2675,7 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(match_jobs, "match_jobs")
         server.register_function(whatif_budget, "whatif_budget")
         server.register_function(set_budgets, "set_budgets")
+        server.register_function(set_transfer_limits, "set_transfer_limits")
         server.register_function(set_scheduler_mode, "set_scheduler_mode")
         server.register_function(set_autogrow, "set_autogrow")
         server.register_function(rpc_prioritize, "prioritize")
@@ -3687,6 +3802,7 @@ class EngineManager(object):
                             jobs.active_inuse += job.active_start_use_add
                             jobs.dcache_inuse += job.dcache_start_use_add
                             jobs.archive_inuse += job.archive_start_use_add
+                            jobs._reserve_dcache_transfer_locked(job)
                         # Transition to RUNNING on this engine (increments running_jobs and updates node_id)
                         jobs.job_start(myid, job.jobid)
                         add_log_line(
@@ -3763,23 +3879,27 @@ failed_node = lambda *args: engines.failed_node(*args)
 
 def compute_autogrow_plan(all_engines, partition):    
     eligible = []
-    transfer_available = max(
-        0.0, jobs.dcache_transfer_total - jobs.dcache_transfer_inuse
+    download_available = max(
+        0.0, jobs.dcache_download_total - jobs.dcache_download_inuse
+    )
+    upload_available = max(
+        0.0, jobs.dcache_upload_total - jobs.dcache_upload_inuse
     )
     for j in list(jobs.jobs_by_id.values()):
-        transfer_need = float(
-            getattr(j, 'dcache_transfer_slots', 0.0) or 0.0
-        )
         if (
             j.partition == partition
             and j.state in queue_states
             and ((jobs.active_total >= (jobs.active_inuse + j.active_start_use_add)) or j.active_start_use_add == 0)
             and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
             and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
-            and transfer_need <= transfer_available
+            and jobs._dcache_transfer_fits_locked(
+                j, download_available, upload_available
+            )
         ):
             eligible.append(j)
-            transfer_available -= transfer_need
+            download_need, upload_need = jobs._dcache_slot_needs(j)
+            download_available -= download_need
+            upload_available -= upload_need
 
     unique_part = list(set([part_name for part_name,_ in status.autogrow_prefer_partitions]))
     fallback_part = str(getattr(status, 'autogrow_fallback_partition', '') or '')
@@ -4295,14 +4415,15 @@ def thread_check_commands():
                         cap_mem_mb_max = 0.0
 
                     pending_eligible = []
-                    transfer_available = max(
+                    download_available = max(
                         0.0,
-                        jobs.dcache_transfer_total - jobs.dcache_transfer_inuse,
+                        jobs.dcache_download_total - jobs.dcache_download_inuse,
+                    )
+                    upload_available = max(
+                        0.0,
+                        jobs.dcache_upload_total - jobs.dcache_upload_inuse,
                     )
                     for j in list(jobs.jobs_by_id.values()):
-                        transfer_need = float(
-                            getattr(j, 'dcache_transfer_slots', 0.0) or 0.0
-                        )
                         if (
                             j.partition == part
                             and j.state in queue_states
@@ -4316,14 +4437,18 @@ def thread_check_commands():
                             and ((jobs.active_total >= (jobs.active_inuse + j.active_start_use_add)) or j.active_start_use_add == 0)
                             and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
                             and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
-                            and transfer_need <= transfer_available
+                            and jobs._dcache_transfer_fits_locked(
+                                j, download_available, upload_available
+                            )
                             and (
                                 str(getattr(j, 'ssd_use', 'no') or 'no') != 'required'
                                 or jobs._any_ssd_engine_available(getattr(j, 'ssd_gb', 0.0))
                             )
                         ):
                             pending_eligible.append(j)
-                            transfer_available -= transfer_need
+                            download_need, upload_need = jobs._dcache_slot_needs(j)
+                            download_available -= download_need
+                            upload_available -= upload_need
                       
                     if pending_eligible and part == 'archive':
                         # archive/staging stays FIFO and is grown on demand, not
@@ -5064,6 +5189,18 @@ def thread_display_status(gb, status):
                     "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total),
                     curses.color_pair(GREEN),
                 )
+                gb.wcom_status.addstr(16, 1, "DCache xfer D/U: ")
+                gb.wcom_status.addstr(
+                    16,
+                    18,
+                    "%.1f/%.1f | %.1f/%.1f" % (
+                        jobs.dcache_download_inuse,
+                        jobs.dcache_download_total,
+                        jobs.dcache_upload_inuse,
+                        jobs.dcache_upload_total,
+                    ),
+                    curses.color_pair(GREEN),
+                )
 
 
                 # Consolidation status (compute only if present)
@@ -5338,7 +5475,7 @@ def init_commands(gb):
             
             gb.wcom.addstr(6, 1, "Prioritize jobs: p")
             gb.wcom.addstr(7, 1, "Deprioritize jobs: n")
-            gb.wcom.addstr(8, 1, "Set archive/active/dcache total capacity: 1/2/3")
+            gb.wcom.addstr(8, 1, "Set storage totals: 1/2/3; dCache xfer D/U: 7/8")
             gb.wcom.addstr(9, 1, "Toggle last in/first out: l")
             gb.wcom.addstr(10, 1, "Set memory optimization job search window: m")
             gb.wcom.addstr(11, 1, "Toggle autogrow: g")
@@ -5812,6 +5949,20 @@ def main(scr, *args, **kwds):
                 )
                 if not dcache_inuse is None:
                     jobs.dcache_inuse = dcache_inuse
+            elif c == ord("7"):
+                download_total = get_number(
+                    gb, "Enter dCache download slot limit: ",
+                    int(jobs.dcache_download_total),
+                )
+                if download_total is not None:
+                    jobs.set_transfer_limits(download_total=download_total)
+            elif c == ord("8"):
+                upload_total = get_number(
+                    gb, "Enter dCache upload slot limit: ",
+                    int(jobs.dcache_upload_total),
+                )
+                if upload_total is not None:
+                    jobs.set_transfer_limits(upload_total=upload_total)
 
             elif c == ord("c"):  # STOP SLURM engines
                 group_cmd = enter_command(

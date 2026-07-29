@@ -373,6 +373,7 @@ class SchedulerPriorityTests(unittest.TestCase):
     def add_job(
         self, jobid, name, priority=100, cpu=1, mem_mb=1000,
         partition="compute", ssd_use="no", dcache_transfer_slots=0,
+        dcache_download_slots=0, dcache_upload_slots=0,
     ):
         z = self.zslurm
         job = z.Job(
@@ -380,6 +381,8 @@ class SchedulerPriorityTests(unittest.TestCase):
             0, 0, 0, 0, 0, 0, partition, 0, None, "",
             ssd_use=ssd_use,
             dcache_transfer_slots=dcache_transfer_slots,
+            dcache_download_slots=dcache_download_slots,
+            dcache_upload_slots=dcache_upload_slots,
             owner="pipeline-" + str(priority),
             priority=priority,
         )
@@ -437,25 +440,63 @@ class SchedulerPriorityTests(unittest.TestCase):
 
     def test_priority_applies_to_archive_transfer_queue(self):
         self.engine.partition = "archive"
-        self.jobs.dcache_transfer_total = 1
+        self.jobs.dcache_download_total = 1
         low = self.add_job(
             "1", "low-download", priority=0, partition="archive",
-            dcache_transfer_slots=1,
+            dcache_download_slots=1,
         )
         high = self.add_job(
             "2", "high-download", priority=25, partition="archive",
-            dcache_transfer_slots=1,
+            dcache_download_slots=1,
         )
 
         assigned = self.dispatch_one(partition="archive")
 
         self.assertEqual(assigned[0][0], high.jobid)
         self.assertEqual(low.state, "PENDING")
-        self.assertEqual(self.jobs.dcache_transfer_inuse, 1)
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+        self.assertEqual(self.jobs.dcache_upload_inuse, 0)
+
+    def test_download_and_upload_pools_are_independent(self):
+        self.jobs.dcache_download_total = 1
+        self.jobs.dcache_upload_total = 1
+        download = self.add_job("1", "download", dcache_download_slots=1)
+        upload = self.add_job("2", "upload", dcache_upload_slots=1)
+        another_download = self.add_job(
+            "3", "another-download", dcache_download_slots=1
+        )
+
+        self.assertTrue(self.jobs._dcache_transfer_fits_locked(download))
+        self.jobs._reserve_dcache_transfer_locked(download)
+        self.assertTrue(self.jobs._dcache_transfer_fits_locked(upload))
+        self.assertFalse(self.jobs._dcache_transfer_fits_locked(another_download))
+        self.jobs._reserve_dcache_transfer_locked(upload)
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+        self.assertEqual(self.jobs.dcache_upload_inuse, 1)
+
+    def test_legacy_transfer_slot_reserves_both_pools(self):
+        legacy = self.add_job("1", "legacy", dcache_transfer_slots=1)
+        self.jobs._reserve_dcache_transfer_locked(legacy)
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+        self.assertEqual(self.jobs.dcache_upload_inuse, 1)
+        self.jobs._release_dcache_transfer_locked(legacy)
+        self.assertEqual(self.jobs.dcache_download_inuse, 0)
+        self.assertEqual(self.jobs.dcache_upload_inuse, 0)
+
+    def test_transfer_limit_configuration_and_runtime_control(self):
+        self.jobs.configure_transfer_limits({"dcache_transfer_slots": 7})
+        self.assertEqual(self.jobs.dcache_download_total, 7)
+        self.assertEqual(self.jobs.dcache_upload_total, 7)
+        result = self.jobs.set_transfer_limits(download_total=2, upload_total=5)
+        self.assertEqual(result["download"]["total_slots"], 2)
+        self.assertEqual(result["upload"]["total_slots"], 5)
 
     def test_submit_api_defaults_and_exposes_priority(self):
         jobid = self.jobs.submit_job(
-            job_name="submitted", cmd="true", cwd="/tmp", env={},
+            job_name="submitted", cmd="true", cwd="/tmp", env={
+                "ZSLURM_DCACHE_DOWNLOAD_SLOTS": "1",
+                "ZSLURM_DCACHE_UPLOAD_SLOTS": "2",
+            },
             ncpu=1, mem=1000, reqtime=60, requeue=0, dependency=None,
             arch_use_add=0, arch_use_remove=0, dcache_use_add=0,
             dcache_use_remove=0, active_use_add=0, active_use_remove=0,
@@ -463,8 +504,17 @@ class SchedulerPriorityTests(unittest.TestCase):
             owner="pipeline-a", priority=12,
         )
 
-        self.assertEqual(self.jobs.jobs_by_id[jobid].priority, 12)
-        self.assertEqual(self.jobs.list_jobs_detailed()[0]["priority"], 12)
+        job = self.jobs.jobs_by_id[jobid]
+        self.assertEqual(job.priority, 12)
+        self.assertEqual(job.dcache_download_slots, 1)
+        self.assertEqual(job.dcache_upload_slots, 2)
+        detailed = self.jobs.list_jobs_detailed()[0]
+        self.assertEqual(detailed["priority"], 12)
+        self.assertEqual(detailed["dcache_download_slots"], 1)
+        self.assertEqual(detailed["dcache_upload_slots"], 2)
+        self.assertEqual(len(self.jobs.list_jobs()), 1)
+        self.assertEqual(len(self.jobs.list_jobs()[0]), 14)
+        self.assertEqual(self.jobs.list_jobs(None, True)[0][-1], 12)
 
 
 if __name__ == "__main__":

@@ -11,13 +11,14 @@ import sys
 import traceback
 import json
 
-SCHEMA_VERSION = 1
-# Stable, numeric field order for the 14-field list_jobs/list_done_jobs row
+SCHEMA_VERSION = 2
+# Stable, numeric field order for the priority-aware 15-field row requested by
+# zsqueue. Managers retain the legacy 14-field row unless explicitly requested.
 # (see docs/agent-interface-plan.md). Units: runtime_s seconds, cores float,
 # cpu_usage core-equivalent fraction, mem_usage_mb MB, *_use_gb GB.
 JOB_FIELDS = ["jobid", "name", "state", "runtime_s", "cores", "partition", "node",
               "cpu_usage", "mem_usage_mb", "arch_use_gb", "active_use_gb",
-              "dcache_use_gb", "cwd", "comment"]
+              "dcache_use_gb", "cwd", "comment", "priority"]
 
 parser = argparse.ArgumentParser(description='ZSlurm Job queue listing')
 parser.add_argument('--all', action='store_true', help='Show also completed jobs.')
@@ -31,7 +32,7 @@ args = parser.parse_args()
 # Exit 2 only when EVERY targeted instance failed (consistent across all output modes).
 _fail_count = [0]
 
-def _pad(row, n=14):
+def _pad(row, n=15):
     # tolerate managers that return shorter rows (older field set)
     row = list(row)
     return row + [None] * (n - len(row)) if len(row) < n else row
@@ -51,11 +52,25 @@ def _fetch_jobs(instance):
     try:
         url = zslurm_shared.get_job_url(instance=instance)
         proxy = zslurm_shared.TimeoutServerProxy(url, allow_none=True)
+        try:
+            capabilities = proxy.ping()
+        except Exception:
+            capabilities = {}
+        priority_rows = bool(
+            isinstance(capabilities, dict)
+            and capabilities.get("list_jobs_priority")
+        )
+        if priority_rows:
+            active = lambda: proxy.list_jobs(None, True)
+            done = lambda: proxy.list_done_jobs(None, None, True)
+        else:
+            active = lambda: proxy.list_jobs()
+            done = lambda: proxy.list_done_jobs()
         if args.done:
-            return proxy.list_done_jobs()
+            return done()
         if args.all:
-            return proxy.list_done_jobs() + proxy.list_jobs()
-        return proxy.list_jobs()
+            return done() + active()
+        return active()
     except (socket.error, httplib.HTTPException) as ex:
         if url is None:
             url = "<unresolved>"
@@ -82,7 +97,8 @@ if args.as_json:
         rows = []
         for row in _fetch_jobs(instance):
             (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage,
-             mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(row)
+             mem_usage, arch_use, active_use, dcache_use, cwd, job_comment,
+             priority) = _pad(row)
             rows.append({
                 "jobid": str(jobid),
                 "name": job_name,
@@ -98,6 +114,7 @@ if args.as_json:
                 "dcache_use_gb": float(dcache_use),
                 "cwd": cwd,
                 "comment": job_comment,
+                "priority": None if priority is None else int(priority),
             })
         out["instances"][instance] = rows
     print(json.dumps(out, indent=2, sort_keys=True))
@@ -115,7 +132,7 @@ if use_pretty:
 
 if args.parseable:
     header = [
-        "INSTANCE","JOBID","PARTITION","NAME","USER","STATE","TIME","CORES","NODE","CPU","MEM","ACTIVE","ARCH","DCACHE","CWD"
+        "INSTANCE","JOBID","PARTITION","NAME","USER","STATE","PRIO","TIME","CORES","NODE","CPU","MEM","ACTIVE","ARCH","DCACHE","CWD"
     ]
     print("\t".join(header))
 
@@ -123,7 +140,7 @@ for instance in instances:
     jobs = _fetch_jobs(instance)
     if args.parseable:
         for _row in jobs:
-            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(_row)
+            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment, priority) = _pad(_row)
             runtime_fmt = zslurm_shared.format_time(runtime)
             row = [
                 instance,
@@ -132,6 +149,7 @@ for instance in instances:
                 str(job_name),
                 str(user),
                 str(state),
+                "" if priority is None else str(priority),
                 runtime_fmt,
                 str(cpus),
                 str(node),
@@ -148,28 +166,30 @@ for instance in instances:
     if use_pretty and tabulate_module is not None:
         table = []
         for _row in jobs:
-            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(_row)
+            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment, priority) = _pad(_row)
             runtime_fmt = zslurm_shared.format_time(runtime)
             table.append([
-                jobid, partition, job_name, user, state, runtime_fmt, cpus, node,
+                jobid, partition, job_name, user, state,
+                "" if priority is None else priority, runtime_fmt, cpus, node,
                 f"{cpu_usage * 100.0:.1f}", f"{mem_usage / 1024.0:.1f} Gb",
                 f"{active_use:.1f} Gb", f"{arch_use:.1f} Gb", f"{dcache_use:.1f} Gb", cwd
             ])
         if len(instances) > 1:
             print(f"Instance: {instance}")
         
-        print(tabulate_module.tabulate(table, headers=['JOBID','PARTITION','NAME','USER','STATE','TIME','CORES','NODE','CPU','MEM','ACTIVE','ARCH','DCACHE','CWD']))
+        print(tabulate_module.tabulate(table, headers=['JOBID','PARTITION','NAME','USER','STATE','PRIO','TIME','CORES','NODE','CPU','MEM','ACTIVE','ARCH','DCACHE','CWD']))
         
         if len(instances) > 1:
             print()
     else:
         if len(instances) > 1:
             print(f"Instance: {instance}")
-        print("JOBID\tPARTITION\tNAME\tUSER\tST\tTIME\tCORES\tNODE\tCPU\tMEM\tACTIVE\tARCH\tDCACHE\tCWD")
+        print("JOBID\tPARTITION\tNAME\tUSER\tST\tPRIO\tTIME\tCORES\tNODE\tCPU\tMEM\tACTIVE\tARCH\tDCACHE\tCWD")
         for _row in jobs:
-            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment) = _pad(_row)
+            (jobid, job_name, state, runtime, cpus, partition, node, cpu_usage, mem_usage, arch_use, active_use, dcache_use, cwd, job_comment, priority) = _pad(_row)
             runtime_fmt = zslurm_shared.format_time(runtime)
-            print(f'{jobid}\t{partition}\t{job_name}\t{user}\t{state}\t{runtime_fmt}\t{cpus}\t{node}\t{cpu_usage * 100.0:.1f}\t{mem_usage / 1024.0:.1f} Gb\t{active_use:.1f} Gb\t{arch_use:.1f} Gb\t{dcache_use:.1f} Gb\t{cwd}')
+            priority_fmt = "" if priority is None else priority
+            print(f'{jobid}\t{partition}\t{job_name}\t{user}\t{state}\t{priority_fmt}\t{runtime_fmt}\t{cpus}\t{node}\t{cpu_usage * 100.0:.1f}\t{mem_usage / 1024.0:.1f} Gb\t{active_use:.1f} Gb\t{arch_use:.1f} Gb\t{dcache_use:.1f} Gb\t{cwd}')
         if len(instances) > 1:
             print()
 

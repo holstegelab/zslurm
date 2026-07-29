@@ -44,11 +44,11 @@ gated behind `enable_control_rpc` (default off) + a `control_token`**.
 |---|---|---|
 | `ping()` / `health()` | `{schema_version, uptime_s, job_thread_alive, engine_thread_alive, instance, lastin_first, prio_fillmem_context}` | new, ~15 lines |
 | `get_status_json()` | budgets `{active,dcache,archive: {total, inuse, pending_add}}` + scheduler mode | the only read data missing from `queue_stats` (`zslurm:469-474`, sum `*_start_use_add` over PENDING) |
-| `--json` on `zsqueue` / `zsnodes` | the 14-/20-field rows as keyed objects, **numeric** (no unit suffixes) | mirror existing `--parseable` branches |
+| `--json` on `zsqueue` / `zsnodes` | priority-aware 15-field job rows / 20-field node rows as keyed objects, **numeric** (no unit suffixes) | legacy job RPC rows remain 14 fields unless priority is requested |
 | `zsstatus --json` (new client) | one schema-versioned blob: queue (`queue_stats`) + engines (`list_nodes`) + budgets (`get_status_json`) + scheduler + Snellius free nodes (`scontrol`) **+ derived alarms** | fans out existing RPCs |
 | `whatif_budget(active,dcache,archive)` | `{eligible_delta_by_partition}` — how many pending jobs become (in)eligible at those totals | reuse `_is_job_eligible_locked` |
 | `match_jobs(pattern)` | `[jobids]` matching a substring (dry-run before any pattern write) | walk `jobs_by_id` |
-| `list_jobs_detailed(owner,states)` | named-key per-job dicts incl. `requeue_remaining`, `current_mem_mb`, `mem_pressure` | separate from the stable 14-field `list_jobs` tuple |
+| `list_jobs_detailed(owner,states)` | named-key per-job dicts incl. `requeue_remaining`, `current_mem_mb`, `mem_pressure` | separate from the legacy 14-field / opt-in priority 15-field `list_jobs` row |
 | `get_autogrow_plan()` | the controller's last autogrow plan (TUI-only today) + cap | reads `status.autogrow_plan` |
 | `forecast_budget(plan)` | per-budget `{current_inuse, total, headroom, optimistic_peak, worst_case_peak, verdict, first_blocking_job}` + compute-fit; verdict ∈ SAFE / ORDER_SENSITIVE / INFEASIBLE | DAG topo-walk; pure read |
 
@@ -62,6 +62,7 @@ gated behind `enable_control_rpc` (default off) + a `control_token`**.
 | RPC / command | Mirrors | Notes |
 |---|---|---|
 | `set_budgets(active_total, dcache_total, archive_total, *_inuse=None)` | TUI keys 1–6 (`zslurm:4173-4208`) | **closes the #1 blocker**; takes `jobs.lock` (hardening vs TUI which doesn't) |
+| `set_transfer_limits(download_total=None, upload_total=None)` | TUI `7`/`8` | changes directional concurrency; existing in-use slots are retained |
 | `set_scheduler_mode(lastin_first=None, prio_fillmem_context=None)` | TUI `l`/`m` | `prio_fillmem_context ≥ 1` |
 | `prioritize(pattern)` / `deprioritize(pattern)` | TUI `p`/`n` | methods exist (`zslurm:542-546`), just register on the job server; LIFO-aware; return count moved |
 | `submit_job(..., idempotency_key=None)` | extend existing | `seen_tokens → jobid` replay map; prevents double-submit on retry |
@@ -71,8 +72,8 @@ gated behind `enable_control_rpc` (default off) + a `control_token`**.
 
 ### New clients
 - **`zsstatus`** — the single read-only command the agent polls (one JSON blob + alarms).
-- **`zscontrol`** — subcommands `budget` / `lifo` / `context` / `prioritize` /
-  `deprioritize` / `autogrow` (writes; reads `control_token` from env/file).
+- **`zscontrol`** — subcommands `budget` / `transfer-slots` / `lifo` / `context` /
+  `prioritize` / `deprioritize` / `autogrow` (writes; reads `control_token` from env/file).
 - `--json` added to `zsqueue` and `zsnodes`.
 
 ### Headless launch

@@ -39,6 +39,8 @@ parser.add_argument('--info-output-file', type=str, default='', help='Used to se
 parser.add_argument('--ssd-use', type=str, default='no', help="SSD usage: 'no' (default), 'possible' (aliases: yes, can_use), or 'required'")
 parser.add_argument('--ssd-gb', type=float, default=0.0, help='SSD capacity requested in GB (used with ssd-use possible/required)')
 parser.add_argument('--priority', type=int, default=100, help='ZSlurm scheduling priority. Higher integer values run before lower values; default: 100.')
+parser.add_argument('--dcache-download-slots', type=float, default=0.0, help='Transient dCache download concurrency requested by this job.')
+parser.add_argument('--dcache-upload-slots', type=float, default=0.0, help='Transient dCache upload concurrency requested by this job.')
 parser.add_argument('--instance', type=str, default=None, help='Submit to a specific ZSlurm instance (defaults to $ZSLURM_INSTANCE or the configured default).')
 
 parser.add_argument('job_args', nargs='*')
@@ -76,6 +78,13 @@ proxy = zslurm_shared.TimeoutServerProxy(JOB_URL, allow_none = True)
 
 cwd = os.getcwd()
 env = dict(os.environ)
+
+if args.dcache_download_slots < 0 or args.dcache_upload_slots < 0:
+    parser.error('dCache transfer slots must be non-negative')
+if args.dcache_download_slots > 0:
+    env['ZSLURM_DCACHE_DOWNLOAD_SLOTS'] = str(args.dcache_download_slots)
+if args.dcache_upload_slots > 0:
+    env['ZSLURM_DCACHE_UPLOAD_SLOTS'] = str(args.dcache_upload_slots)
 
 if args.limit_threads >= 1:
     t = str(int(args.limit_threads))
