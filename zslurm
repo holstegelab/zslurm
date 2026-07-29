@@ -616,14 +616,16 @@ class JobManager(object):
     def _dcache_slot_needs(self, job):
         """Return (download, upload) needs for a job.
 
-        Legacy dcache_transfer_slots consumes both pools. That is deliberately
-        conservative: old clients remain throttled regardless of transfer
-        direction, while updated clients can use the pools independently.
+        Legacy dcache_transfer_slots consumes both pools only when directional
+        metadata is absent. Updated clients may also send a legacy fallback for
+        rolling upgrades; a new manager ignores it when a direction is known.
         """
         legacy = float(getattr(job, 'dcache_transfer_slots', 0.0) or 0.0)
         download = float(getattr(job, 'dcache_download_slots', 0.0) or 0.0)
         upload = float(getattr(job, 'dcache_upload_slots', 0.0) or 0.0)
-        return download + legacy, upload + legacy
+        if download > 0.0 or upload > 0.0:
+            return download, upload
+        return legacy, legacy
 
     def _dcache_transfer_fits_locked(self, job, download_available=None,
                                      upload_available=None):

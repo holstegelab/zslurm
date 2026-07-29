@@ -551,8 +551,11 @@ whole runnable DAG while ZSlurm enforces the cross-node limits.
 For compatibility, the old manager setting `dcache_transfer_slots` supplies the
 default for both directional maxima when the new settings are absent. A legacy
 per-job `dcache_transfer_slots` request consumes the requested amount from both
-pools, conservatively throttling clients whose direction is unknown. Do not mix
-legacy and directional resources on one job.
+pools, conservatively throttling clients whose direction is unknown. Updated
+plugins also send a legacy fallback value during rolling upgrades, so an old
+manager still throttles the job; a directional manager ignores that fallback
+whenever download or upload metadata is present. Do not configure both legacy
+and directional Snakemake resources explicitly on one job.
 
 Limits can also be changed at runtime (in-use reservations are left intact):
 

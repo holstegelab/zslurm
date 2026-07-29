@@ -483,6 +483,15 @@ class SchedulerPriorityTests(unittest.TestCase):
         self.assertEqual(self.jobs.dcache_download_inuse, 0)
         self.assertEqual(self.jobs.dcache_upload_inuse, 0)
 
+    def test_directional_metadata_overrides_legacy_upgrade_fallback(self):
+        job = self.add_job(
+            "1", "rolling-upgrade", dcache_transfer_slots=3,
+            dcache_download_slots=1,
+        )
+        self.jobs._reserve_dcache_transfer_locked(job)
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+        self.assertEqual(self.jobs.dcache_upload_inuse, 0)
+
     def test_transfer_limit_configuration_and_runtime_control(self):
         self.jobs.configure_transfer_limits({"dcache_transfer_slots": 7})
         self.assertEqual(self.jobs.dcache_download_total, 7)
@@ -496,6 +505,7 @@ class SchedulerPriorityTests(unittest.TestCase):
             job_name="submitted", cmd="true", cwd="/tmp", env={
                 "ZSLURM_DCACHE_DOWNLOAD_SLOTS": "1",
                 "ZSLURM_DCACHE_UPLOAD_SLOTS": "2",
+                "ZSLURM_DCACHE_TRANSFER_SLOTS": "2",
             },
             ncpu=1, mem=1000, reqtime=60, requeue=0, dependency=None,
             arch_use_add=0, arch_use_remove=0, dcache_use_add=0,
@@ -508,6 +518,7 @@ class SchedulerPriorityTests(unittest.TestCase):
         self.assertEqual(job.priority, 12)
         self.assertEqual(job.dcache_download_slots, 1)
         self.assertEqual(job.dcache_upload_slots, 2)
+        self.assertEqual(self.jobs._dcache_slot_needs(job), (1, 2))
         detailed = self.jobs.list_jobs_detailed()[0]
         self.assertEqual(detailed["priority"], 12)
         self.assertEqual(detailed["dcache_download_slots"], 1)
