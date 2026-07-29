@@ -101,7 +101,7 @@ Besides simple FIFO-style scheduling, ZSlurm contains a few higher-level queue m
 ### Pipeline priority
 
 Every submitted job has an integer priority. Higher values are dispatched before
-lower values; the default is 0. Set it directly with:
+lower values; the default is 100. Set it directly with:
 
     zsbatch --priority 100 -- command arguments
 
@@ -780,7 +780,7 @@ Useful options:
 - **`--limit-threads`**: limit thread-related environment variables
 - **`--info-input-mb`**: annotate input size in `report-*.tsv`
 - **`--info-output-file`**: annotate primary output path in `report-*.tsv`
-- **`--priority`**: integer scheduling priority; higher values run first (default 0)
+- **`--priority`**: integer scheduling priority; higher values run first (default 100)
 - **`--ssd-use`**: SSD requirement mode (`no`, `possible`, `required`)
 - **`--ssd-gb`**: requested SSD capacity in GB
 - **`--instance`**: submit to a specific ZSlurm instance

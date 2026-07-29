@@ -371,7 +371,7 @@ class SchedulerPriorityTests(unittest.TestCase):
         z.jobs = self.jobs
 
     def add_job(
-        self, jobid, name, priority=0, cpu=1, mem_mb=1000,
+        self, jobid, name, priority=100, cpu=1, mem_mb=1000,
         partition="compute", ssd_use="no", dcache_transfer_slots=0,
     ):
         z = self.zslurm
@@ -390,6 +390,11 @@ class SchedulerPriorityTests(unittest.TestCase):
         return self.jobs.request_jobs(
             self.engine.engine_id, 1, mem_mb, partition
         )
+
+    def test_default_priority_is_100(self):
+        job = self.add_job("1", "default")
+        self.assertEqual(job.priority, 100)
+        self.assertEqual(self.zslurm.DEFAULT_JOB_PRIORITY, 100)
 
     def test_higher_pipeline_priority_precedes_earlier_job(self):
         low = self.add_job("1", "low", priority=0)

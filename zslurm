@@ -390,6 +390,7 @@ def parse_timeleft(time):
 
 
 queue_states = set(["PENDING", "REQUEUED"])
+DEFAULT_JOB_PRIORITY = 100
 
 
 class Job(object):
@@ -419,7 +420,7 @@ class Job(object):
         ssd_gb=0,
         dcache_transfer_slots=0,
         owner=None,
-        priority=0
+        priority=DEFAULT_JOB_PRIORITY
     ):
         self.job_name = job_name
         self.jobid = jobid
@@ -450,9 +451,10 @@ class Job(object):
         self.comment = comment
         self.owner = owner
         try:
-            self.priority = int(priority or 0)
+            value = DEFAULT_JOB_PRIORITY if priority is None else priority
+            self.priority = int(value)
         except (TypeError, ValueError):
-            self.priority = 0
+            self.priority = DEFAULT_JOB_PRIORITY
         try:
             su = (ssd_use or 'no')
             if isinstance(su, str):
@@ -1190,7 +1192,7 @@ class JobManager(object):
         ssd_gb=0,
         owner=None,
         idempotency_key=None,
-        priority=0
+        priority=DEFAULT_JOB_PRIORITY
     ):
         # Idempotent submission: a retried submit with the same key returns the
         # already-created jobid instead of double-submitting (see seen_tokens).
@@ -2367,6 +2369,7 @@ def ping():
         "lastin_first": bool(status.lastin_first),
         "prio_fillmem_context": int(status.prio_fillmem_context),
         "submit_job_priority": True,
+        "default_job_priority": DEFAULT_JOB_PRIORITY,
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
     }
 
