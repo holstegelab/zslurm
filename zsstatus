@@ -116,8 +116,12 @@ def main():
         jobs = proxy.list_jobs()
         try:
             running_detail = proxy.list_jobs_detailed(None, ["RUNNING"])
+            pending_detail = proxy.list_jobs_detailed(
+                None, ["PENDING", "REQUEUED"]
+            )
         except Exception:
             running_detail = []  # older manager without the Phase-3 RPC
+            pending_detail = []
     except (socket.error, httplib.HTTPException, KeyError) as ex:
         sys.stderr.write(f"zsstatus: cannot reach manager for instance '{instance}': {ex}\n")
         _emit({"ok": False, "code": 2, "instance": instance, "error": str(ex)})
@@ -133,7 +137,21 @@ def main():
 
     # Pending jobs + max requirement (deadlock / oversized detection)
     pending = [j for j in jobs if str(j[2]) in QUEUE_STATES]
-    max_req_cores = max([float(j[4]) for j in pending], default=0.0)
+    dependency_ready_pending = [
+        job for job in pending_detail
+        if job.get("dependency_state") in (None, "satisfied")
+    ]
+    if pending_detail:
+        max_req_cores = max(
+            [float(j.get("max_cores", j.get("cores", 0.0)) or 0.0)
+             for j in dependency_ready_pending],
+            default=0.0,
+        )
+        runnable_pending_count = len(dependency_ready_pending)
+    else:
+        # Compatibility with an older manager that has no dependency details.
+        max_req_cores = max([float(j[4]) for j in pending], default=0.0)
+        runnable_pending_count = len(pending)
     # list_jobs has no mem column; mem requirement comes from queue_stats pending totals
     # only (aggregate), so deadlock-by-mem is heuristic via the largest engine.
     sched = (status or {}).get("scheduler", {}) or {}
@@ -159,10 +177,10 @@ def main():
                           f"or let in-flight jobs release *_use_remove (keep LIFO on)",
             })
 
-    if pending and running_engines == 0 and (not autogrow_on or autogrow_cap == 0):
+    if runnable_pending_count and running_engines == 0 and (not autogrow_on or autogrow_cap == 0):
         alarms.append({
             "alarm": "no_engines",
-            "detail": f"{len(pending)} pending jobs but 0 running engines and autogrow is "
+            "detail": f"{runnable_pending_count} runnable pending jobs but 0 running engines and autogrow is "
                       f"{'off' if not autogrow_on else 'capped at 0'}",
             "remedy": "start engines (TUI 'd' / headless agent-managed scaling) or enable autogrow",
         })
@@ -199,6 +217,11 @@ def main():
         "budgets": budgets,
         "pending_jobs": (status or {}).get("pending_jobs", len(pending)),
         "budgeted_pending_jobs": (status or {}).get("budgeted_pending_jobs", 0),
+        "dependency_waiting_jobs": (status or {}).get("dependency_waiting_jobs", 0),
+        "dependency_never_satisfied_jobs": (status or {}).get(
+            "dependency_never_satisfied_jobs", 0
+        ),
+        "runnable_pending_jobs": runnable_pending_count,
         "queue": qstats,
         "engines": engines,
         "running_engines": running_engines,

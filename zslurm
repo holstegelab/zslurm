@@ -14,6 +14,7 @@ except:
     from SimpleXMLRPCServer import SimpleXMLRPCServer,SimpleXMLRPCRequestHandler
 import socket
 import threading
+import re
 
 
 class ReuseAddrXMLRPCServer(SimpleXMLRPCServer):
@@ -392,6 +393,117 @@ def parse_timeleft(time):
 queue_states = set(["PENDING", "REQUEUED"])
 DEFAULT_JOB_PRIORITY = 100
 
+DEPENDENCY_ACTIVE_JOB_STATES = queue_states | {"ASSIGNED", "RUNNING"}
+
+DEPENDENCY_SATISFIED = "satisfied"
+DEPENDENCY_WAITING = "waiting"
+DEPENDENCY_NEVER_SATISFIED = "never_satisfied"
+SUPPORTED_DEPENDENCY_TYPES = {
+    "after", "afterany", "afterok", "afternotok", "singleton"
+}
+
+
+def parse_job_dependency(dependency):
+    """Parse the supported subset of Slurm's dependency syntax.
+
+    A comma combines every atomic condition with AND; a question mark combines
+    them with OR.  Multiple ids in one clause are atomic conditions too, which
+    matches Slurm's ``afterok:20:21?afterany:23`` behaviour.  ``after`` accepts
+    Slurm's optional ``+minutes`` delay.  The returned structure contains only
+    XML-RPC/pickle-friendly primitives so it can safely live on a Job object.
+    """
+
+    if dependency is None:
+        return None
+    text = str(dependency).strip()
+    if not text or text.lower() == "none":
+        return None
+    if "," in text and "?" in text:
+        raise ValueError(
+            "dependency may use ',' (AND) or '?' (OR), but not both"
+        )
+
+    if "?" in text:
+        mode = "any"
+        clauses = text.split("?")
+    elif "," in text:
+        mode = "all"
+        clauses = text.split(",")
+    else:
+        mode = "all"
+        clauses = [text]
+
+    conditions = []
+    seen = set()
+    for raw_clause in clauses:
+        clause = raw_clause.strip()
+        if not clause:
+            raise ValueError("dependency contains an empty condition")
+        parts = [part.strip() for part in clause.split(":")]
+        if any(not part for part in parts):
+            raise ValueError("dependency contains an empty job id")
+
+        if len(parts) == 1 and parts[0].lower() == "singleton":
+            key = ("singleton", None, 0.0)
+            if key not in seen:
+                conditions.append({"type": "singleton"})
+                seen.add(key)
+            continue
+
+        # Slurm documents afterany as the default dependency type.  Supporting
+        # a bare id is useful for compatibility while keeping multi-id clauses
+        # explicit and unambiguous.
+        if len(parts) == 1 and re.match(r"^[0-9]+$", parts[0]):
+            dep_type = "afterany"
+            references = parts
+        else:
+            dep_type = parts[0].lower()
+            references = parts[1:]
+
+        if dep_type not in SUPPORTED_DEPENDENCY_TYPES:
+            if dep_type == "expand":
+                raise ValueError(
+                    "dependency type 'expand' is not supported by ZSlurm"
+                )
+            raise ValueError(
+                "unsupported dependency type %r; supported types: %s"
+                % (dep_type, ", ".join(sorted(SUPPORTED_DEPENDENCY_TYPES)))
+            )
+        if dep_type == "singleton":
+            raise ValueError("singleton does not accept job ids")
+        if not references:
+            raise ValueError("dependency type %r requires a job id" % dep_type)
+
+        for reference in references:
+            delay_seconds = 0.0
+            jobid = reference
+            if dep_type == "after":
+                match = re.match(r"^([0-9]+)(?:\+([0-9]+))?$", reference)
+                if match is None:
+                    raise ValueError(
+                        "invalid after dependency %r; expected JOBID or "
+                        "JOBID+MINUTES" % reference
+                    )
+                jobid = match.group(1)
+                if match.group(2) is not None:
+                    delay_seconds = float(match.group(2)) * 60.0
+            elif re.match(r"^[0-9]+$", reference) is None:
+                raise ValueError("invalid dependency job id %r" % reference)
+
+            key = (dep_type, str(jobid), delay_seconds)
+            if key in seen:
+                continue
+            conditions.append({
+                "type": dep_type,
+                "jobid": str(jobid),
+                "delay_seconds": delay_seconds,
+            })
+            seen.add(key)
+
+    if not conditions:
+        raise ValueError("dependency does not contain any conditions")
+    return {"raw": text, "mode": mode, "conditions": conditions}
+
 
 class Job(object):
     def __init__(
@@ -441,6 +553,15 @@ class Job(object):
         self.reqtime = reqtime
         self.requeue = requeue
         self.dependency = dependency
+        self.dependency_spec = None
+        self.dependency_satisfied_conditions = []
+        self.dependency_released = dependency is None or not str(dependency).strip()
+        self.dependency_never_satisfied = False
+        self.dependency_state = (
+            DEPENDENCY_SATISFIED if self.dependency_released
+            else DEPENDENCY_WAITING
+        )
+        self.dependency_reason = ""
         self.archive_start_use_add = arch_use_add
         self.archive_end_use_remove = arch_use_remove
         self.dcache_start_use_add = dcache_use_add
@@ -495,6 +616,7 @@ class Job(object):
         self.state = "PENDING"
         self.node_id = None
         self.starttime = None
+        self.first_starttime = None
         self.endtime = None
         self.current_cpu_usage = 0.0
         self.current_mem_usage = 0.0
@@ -503,6 +625,8 @@ class Job(object):
     def started(self, nodeid):
         self.node_id = nodeid
         self.starttime = time.time()
+        if self.first_starttime is None:
+            self.first_starttime = self.starttime
         self.state = "RUNNING"
         # A requeued job starts with its complete (possibly enlarged) request.
         self.max_ncpu = float(self.ncpu)
@@ -595,6 +719,264 @@ class JobManager(object):
         # so a retried submit_job (e.g. after a socket timeout that actually
         # succeeded) returns the existing jobid instead of double-submitting.
         self.seen_tokens = {}
+
+        # Compact terminal outcomes used by dependencies.  Finished Job objects
+        # are retained separately for queue/report output and may be trimmed per
+        # owner; dependency correctness must not depend on that presentation
+        # history still containing a predecessor.
+        self.dependency_history = OrderedDict()
+
+    @staticmethod
+    def _dependency_owner(owner, env):
+        if owner is not None:
+            return str(owner)
+        values = env if isinstance(env, dict) else {}
+        for name in ("USER", "LOGNAME"):
+            value = values.get(name)
+            if value:
+                return str(value)
+        return None
+
+    def _prepare_dependency_locked(self, parsed, job_name, owner, env,
+                                   exclude_jobid=None):
+        if parsed is None:
+            return None
+
+        conditions = []
+        dependency_owner = self._dependency_owner(owner, env)
+        for condition in parsed["conditions"]:
+            dep_type = condition["type"]
+            if dep_type == "singleton":
+                predecessors = []
+                for other in self.jobs_by_id.values():
+                    other_id = str(getattr(other, "jobid", ""))
+                    if exclude_jobid is not None and other_id == str(exclude_jobid):
+                        continue
+                    if (
+                        getattr(other, "state", None)
+                        not in DEPENDENCY_ACTIVE_JOB_STATES
+                    ):
+                        continue
+                    if str(getattr(other, "job_name", "")) != str(job_name):
+                        continue
+                    other_owner = self._dependency_owner(
+                        getattr(other, "owner", None), getattr(other, "env", {})
+                    )
+                    if other_owner == dependency_owner:
+                        predecessors.append(other_id)
+                conditions.append({
+                    "type": "singleton",
+                    "jobids": predecessors,
+                })
+                continue
+
+            target = str(condition["jobid"])
+            if exclude_jobid is not None and target == str(exclude_jobid):
+                raise ValueError("a job cannot depend on itself (%s)" % target)
+            if (
+                target not in self.jobs_by_id
+                and target not in self.dependency_history
+            ):
+                raise ValueError("unknown dependency job id %s" % target)
+            conditions.append(dict(condition))
+
+        return {
+            "raw": parsed["raw"],
+            "mode": parsed["mode"],
+            "conditions": conditions,
+        }
+
+    def _remember_dependency_outcome_locked(self, job):
+        self.dependency_history[str(job.jobid)] = {
+            "jobid": str(job.jobid),
+            "state": str(getattr(job, "state", "")),
+            "return_code": getattr(job, "return_code", None),
+            "first_starttime": getattr(job, "first_starttime", None),
+            "endtime": getattr(job, "endtime", None),
+        }
+
+    def _dependency_target_locked(self, jobid):
+        """Return (is_terminal, record), or (None, None) when unknown."""
+        target = self.jobs_by_id.get(str(jobid))
+        if target is not None:
+            if (
+                getattr(target, "state", None)
+                in DEPENDENCY_ACTIVE_JOB_STATES
+            ):
+                return False, target
+            return True, target
+        outcome = self.dependency_history.get(str(jobid))
+        if outcome is not None:
+            return True, outcome
+        return None, None
+
+    @staticmethod
+    def _dependency_value(record, name, default=None):
+        if isinstance(record, dict):
+            return record.get(name, default)
+        return getattr(record, name, default)
+
+    def _dependency_condition_status_locked(self, condition, now):
+        dep_type = condition["type"]
+        if dep_type == "singleton":
+            for target in condition.get("jobids", []):
+                is_terminal, _record = self._dependency_target_locked(target)
+                if is_terminal is None:
+                    return (
+                        DEPENDENCY_NEVER_SATISFIED,
+                        "singleton predecessor %s is no longer known" % target,
+                    )
+                if not is_terminal:
+                    return (
+                        DEPENDENCY_WAITING,
+                        "waiting for singleton predecessor %s" % target,
+                    )
+            return DEPENDENCY_SATISFIED, ""
+
+        target = str(condition["jobid"])
+        is_terminal, record = self._dependency_target_locked(target)
+        label = "%s:%s" % (dep_type, target)
+        if is_terminal is None:
+            return (
+                DEPENDENCY_NEVER_SATISFIED,
+                "%s references an unknown job" % label,
+            )
+
+        if dep_type == "after":
+            anchor = self._dependency_value(record, "first_starttime")
+            if anchor is None and is_terminal:
+                # Slurm also satisfies `after` when a predecessor is cancelled
+                # before it ever starts.
+                anchor = self._dependency_value(record, "endtime")
+            if anchor is None:
+                return DEPENDENCY_WAITING, "waiting for %s to start" % target
+            ready_at = float(anchor) + float(condition.get("delay_seconds", 0.0))
+            if now < ready_at:
+                return (
+                    DEPENDENCY_WAITING,
+                    "waiting for delay after job %s started" % target,
+                )
+            return DEPENDENCY_SATISFIED, ""
+
+        if not is_terminal:
+            return DEPENDENCY_WAITING, "waiting for %s" % label
+
+        state = self._dependency_value(record, "state", "")
+        return_code = self._dependency_value(record, "return_code")
+        successful = state == "COMPLETED" and return_code == RC_SUCCESS
+        if dep_type == "afterany":
+            return DEPENDENCY_SATISFIED, ""
+        if dep_type == "afterok":
+            if successful:
+                return DEPENDENCY_SATISFIED, ""
+            return (
+                DEPENDENCY_NEVER_SATISFIED,
+                "%s did not complete successfully" % label,
+            )
+        if dep_type == "afternotok":
+            if not successful:
+                return DEPENDENCY_SATISFIED, ""
+            return (
+                DEPENDENCY_NEVER_SATISFIED,
+                "%s completed successfully" % label,
+            )
+        return DEPENDENCY_NEVER_SATISFIED, "unsupported %s" % label
+
+    def _dependency_status_locked(self, job, now=None):
+        if getattr(job, "dependency_released", False):
+            job.dependency_state = DEPENDENCY_SATISFIED
+            job.dependency_reason = ""
+            return DEPENDENCY_SATISFIED, ""
+        if getattr(job, "dependency_never_satisfied", False):
+            return (
+                DEPENDENCY_NEVER_SATISFIED,
+                getattr(job, "dependency_reason", "dependency can never be satisfied"),
+            )
+
+        spec = getattr(job, "dependency_spec", None)
+        if spec is None:
+            try:
+                parsed = parse_job_dependency(getattr(job, "dependency", None))
+                spec = self._prepare_dependency_locked(
+                    parsed,
+                    getattr(job, "job_name", ""),
+                    getattr(job, "owner", None),
+                    getattr(job, "env", {}),
+                    exclude_jobid=getattr(job, "jobid", None),
+                )
+                job.dependency_spec = spec
+            except ValueError as ex:
+                job.dependency_never_satisfied = True
+                job.dependency_state = DEPENDENCY_NEVER_SATISFIED
+                job.dependency_reason = str(ex)
+                return DEPENDENCY_NEVER_SATISFIED, str(ex)
+        if spec is None:
+            job.dependency_released = True
+            job.dependency_state = DEPENDENCY_SATISFIED
+            job.dependency_reason = ""
+            return DEPENDENCY_SATISFIED, ""
+
+        if now is None:
+            now = time.time()
+        satisfied = set(getattr(job, "dependency_satisfied_conditions", []))
+        statuses = []
+        for index, condition in enumerate(spec["conditions"]):
+            if index in satisfied:
+                statuses.append((DEPENDENCY_SATISFIED, ""))
+                continue
+            condition_status = self._dependency_condition_status_locked(
+                condition, now
+            )
+            statuses.append(condition_status)
+            if condition_status[0] == DEPENDENCY_SATISFIED:
+                satisfied.add(index)
+        job.dependency_satisfied_conditions = sorted(satisfied)
+
+        if spec["mode"] == "any":
+            released = any(state == DEPENDENCY_SATISFIED for state, _ in statuses)
+            impossible = all(
+                state == DEPENDENCY_NEVER_SATISFIED for state, _ in statuses
+            )
+        else:
+            released = all(state == DEPENDENCY_SATISFIED for state, _ in statuses)
+            impossible = any(
+                state == DEPENDENCY_NEVER_SATISFIED for state, _ in statuses
+            )
+
+        if released:
+            state, reason = DEPENDENCY_SATISFIED, ""
+            job.dependency_released = True
+        elif impossible:
+            state = DEPENDENCY_NEVER_SATISFIED
+            reason = next(
+                reason for item_state, reason in statuses
+                if item_state == DEPENDENCY_NEVER_SATISFIED
+            )
+            # Slurm does not reconsider a failed dependency if a predecessor is
+            # later requeued; latch that terminal result.
+            job.dependency_never_satisfied = True
+        else:
+            state = DEPENDENCY_WAITING
+            reason = next(
+                (reason for item_state, reason in statuses
+                 if item_state == DEPENDENCY_WAITING),
+                "waiting for dependency",
+            )
+        job.dependency_state = state
+        job.dependency_reason = reason
+        return state, reason
+
+    def dependency_status(self, job):
+        self.lock.acquire()
+        try:
+            state, reason = self._dependency_status_locked(job)
+            return {"state": state, "reason": reason}
+        finally:
+            self.lock.release()
+
+    def _dependency_allows_run_locked(self, job):
+        state, _reason = self._dependency_status_locked(job)
+        return state == DEPENDENCY_SATISFIED
 
     def _resource_fits_locked(self, total, inuse, needed):
         try:
@@ -706,6 +1088,8 @@ class JobManager(object):
             return True
         if st not in queue_states:
             return False
+        if not self._dependency_allows_run_locked(job):
+            return False
         if not self._resource_fits_locked(self.active_total, self.active_inuse, getattr(job, 'active_start_use_add', 0.0)):
             return False
         if not self._resource_fits_locked(self.dcache_total, self.dcache_inuse, getattr(job, 'dcache_start_use_add', 0.0)):
@@ -759,9 +1143,10 @@ class JobManager(object):
 
         The three storage budgets are not exposed by queue_stats(); this is the
         only place they are readable over RPC. pending_add is the sum of the
-        *_start_use_add of currently PENDING/REQUEUED jobs (i.e. demand that has
-        not yet been reserved), and min_pending_add is the smallest positive add
-        per tier (used by the budget_stall alarm in zsstatus)."""
+        *_start_use_add of dependency-ready PENDING/REQUEUED jobs (i.e. demand
+        that can compete for resources but has not yet been reserved), and
+        min_pending_add is the smallest positive add per tier (used by the
+        budget_stall alarm in zsstatus)."""
         self.lock.acquire()
         try:
             pend_add = {'active': 0.0, 'dcache': 0.0, 'archive': 0.0}
@@ -771,10 +1156,19 @@ class JobManager(object):
             pending_legacy_slots = 0.0
             n_pending = 0
             n_budget_pending = 0
+            dependency_counts = {
+                DEPENDENCY_WAITING: 0,
+                DEPENDENCY_NEVER_SATISFIED: 0,
+            }
             for job in self.jobs_by_id.values():
                 if getattr(job, 'state', None) not in queue_states:
                     continue
                 n_pending += 1
+                dependency_state, _reason = self._dependency_status_locked(job)
+                if dependency_state in dependency_counts:
+                    dependency_counts[dependency_state] += 1
+                if dependency_state != DEPENDENCY_SATISFIED:
+                    continue
                 download_need, upload_need = self._dcache_slot_needs(job)
                 pending_download_slots += download_need
                 pending_upload_slots += upload_need
@@ -822,6 +1216,8 @@ class JobManager(object):
                 },
                 'pending_jobs': n_pending,
                 'budgeted_pending_jobs': n_budget_pending,
+                'dependency_waiting_jobs': dependency_counts[DEPENDENCY_WAITING],
+                'dependency_never_satisfied_jobs': dependency_counts[DEPENDENCY_NEVER_SATISFIED],
             }
         finally:
             self.lock.release()
@@ -954,6 +1350,9 @@ class JobManager(object):
                 st = getattr(job, 'state', None)
                 if want_states is not None and st not in want_states:
                     continue
+                dependency_state, dependency_reason = (
+                    self._dependency_status_locked(job)
+                )
                 max_cores = float(getattr(job, 'max_ncpu', job.ncpu) or 0.0)
                 max_mem = float(getattr(job, 'max_mem', job.mem) or 0.0)
                 if st == "RUNNING":
@@ -998,6 +1397,9 @@ class JobManager(object):
                         getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
                     ),
                     'priority': int(getattr(job, 'priority', 0) or 0),
+                    'dependency': getattr(job, 'dependency', None),
+                    'dependency_state': dependency_state,
+                    'dependency_reason': dependency_reason,
                     'comment': getattr(job, 'comment', ''),
                 })
             return out
@@ -1280,26 +1682,6 @@ class JobManager(object):
         idempotency_key=None,
         priority=DEFAULT_JOB_PRIORITY
     ):
-        # Idempotent submission: a retried submit with the same key returns the
-        # already-created jobid instead of double-submitting (see seen_tokens).
-        # The check and the jobid-reservation MUST be atomic (one lock hold), else
-        # two concurrent retries both miss the token and both create a job.
-        self.lock.acquire()
-        try:
-            existing = self.seen_tokens.get(str(idempotency_key)) if idempotency_key else None
-            if existing is None:
-                jobid = str(self.jobid_counter)
-                self.jobid_counter += 1
-                self.total_jobs[partition] = self.total_jobs.get(partition, 0) + 1
-                if idempotency_key:
-                    self.seen_tokens[str(idempotency_key)] = jobid
-        finally:
-            self.lock.release()
-
-        if existing is not None:
-            add_log_line(gb, f"Job {job_name} idempotency_key={idempotency_key} replayed -> jobid {existing}", YELLOW)
-            return existing
-
         # weird xml-rpc problem?
         if len(env) == 1 and "data" in env:
             env = env["data"]
@@ -1319,38 +1701,64 @@ class JobManager(object):
         dcache_upload_slots = transfer_slots_from_env(
             "ZSLURM_DCACHE_UPLOAD_SLOTS"
         )
+        parsed_dependency = parse_job_dependency(dependency)
 
-        job = Job(
-            job_name,
-            jobid,
-            cmd,
-            cwd,
-            env,
-            ncpu,
-            mem,
-            reqtime,
-            requeue,
-            dependency,
-            float(arch_use_add),
-            float(arch_use_remove),
-            float(dcache_use_add),
-            float(dcache_use_remove),
-            float(active_use_add),
-            float(active_use_remove),
-            partition,
-            info_input_mb,
-            info_output_file,
-            comment,
-            ssd_use,
-            ssd_gb,
-            dcache_transfer_slots,
-            owner,
-            priority,
-            dcache_download_slots,
-            dcache_upload_slots
-        )
+        # Idempotency, dependency validation (including singleton predecessor
+        # capture), id allocation and insertion are one atomic operation.  This
+        # prevents concurrent singleton submissions from overlooking each other.
+        self.lock.acquire()
+        try:
+            existing = (
+                self.seen_tokens.get(str(idempotency_key))
+                if idempotency_key else None
+            )
+            if existing is None:
+                dependency_spec = self._prepare_dependency_locked(
+                    parsed_dependency, job_name, owner, env
+                )
+                jobid = str(self.jobid_counter)
+                self.jobid_counter += 1
+                job = Job(
+                    job_name,
+                    jobid,
+                    cmd,
+                    cwd,
+                    env,
+                    ncpu,
+                    mem,
+                    reqtime,
+                    requeue,
+                    dependency,
+                    float(arch_use_add),
+                    float(arch_use_remove),
+                    float(dcache_use_add),
+                    float(dcache_use_remove),
+                    float(active_use_add),
+                    float(active_use_remove),
+                    partition,
+                    info_input_mb,
+                    info_output_file,
+                    comment,
+                    ssd_use,
+                    ssd_gb,
+                    dcache_transfer_slots,
+                    owner,
+                    priority,
+                    dcache_download_slots,
+                    dcache_upload_slots
+                )
+                job.dependency_spec = dependency_spec
+                self.jobs_by_id[jobid] = job
+                self.total_jobs[partition] = self.total_jobs.get(partition, 0) + 1
+                self._eligible_cache_ts = 0.0
+                if idempotency_key:
+                    self.seen_tokens[str(idempotency_key)] = jobid
+        finally:
+            self.lock.release()
 
-        self.jobs_by_id[jobid] = job
+        if existing is not None:
+            add_log_line(gb, f"Job {job_name} idempotency_key={idempotency_key} replayed -> jobid {existing}", YELLOW)
+            return existing
 
         if (
             arch_use_add
@@ -1697,6 +2105,11 @@ class JobManager(object):
             def eligible(job):
                 if job.partition != partition:
                     return False
+                if (
+                    job.state != 'ASSIGNED'
+                    and not self._dependency_allows_run_locked(job)
+                ):
+                    return False
                 # Phase-out overflow gate: a draining engine may only pick up a
                 # queued job after it has waited unclaimed for at least
                 # phaseout_backfill_min_job_age_sec, giving the active (non-draining)
@@ -1875,6 +2288,7 @@ class JobManager(object):
                             BLUE,
                         )
                         job.started(myid)
+                        self._eligible_cache_ts = 0.0
                         self.running_jobs[job.partition] = (
                             self.running_jobs.get(job.partition, 0) + 1
                         )
@@ -2196,6 +2610,7 @@ class JobManager(object):
                 self.running_jobs.get(job.partition, 0) + 1
             )
             job.started(node_id)
+            self._eligible_cache_ts = 0.0
             e = engines.engine_by_id.get(node_id, None)
             if e is not None:
                 e.res_cpu_reserved += float(job.held_ncpu)
@@ -2303,6 +2718,9 @@ class JobManager(object):
                         newstate = "COMPLETED"
 
                 job.done(return_code, reason, newstate)
+                if newstate not in queue_states:
+                    self._remember_dependency_outcome_locked(job)
+                self._eligible_cache_ts = 0.0
                 with self.finished_jobs_lock:
                     if job.owner not in self.finished_jobs_by_owner:
                         self.finished_jobs_by_owner[job.owner] = []
@@ -2474,6 +2892,8 @@ def ping():
         "default_job_priority": DEFAULT_JOB_PRIORITY,
         "list_jobs_priority": True,
         "directional_dcache_slots": True,
+        "job_dependencies": True,
+        "job_dependency_types": sorted(SUPPORTED_DEPENDENCY_TYPES),
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
     }
 
@@ -3891,6 +4311,7 @@ def compute_autogrow_plan(all_engines, partition):
         if (
             j.partition == partition
             and j.state in queue_states
+            and jobs.dependency_status(j)["state"] == DEPENDENCY_SATISFIED
             and ((jobs.active_total >= (jobs.active_inuse + j.active_start_use_add)) or j.active_start_use_add == 0)
             and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
             and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
@@ -4429,6 +4850,7 @@ def thread_check_commands():
                         if (
                             j.partition == part
                             and j.state in queue_states
+                            and jobs.dependency_status(j)["state"] == DEPENDENCY_SATISFIED
                             and float(j.ncpu) <= float(cap_cpu_max)
                             and float(j.mem) <= float(cap_mem_mb_max)
                             and (

@@ -791,7 +791,7 @@ Useful options:
 - **`-t, --time`**: requested runtime
 - **`-p, --partition`**: target partition
 - **`-n, --ntasks`**: number of tasks
-- **`-d, --dependency`**: Slurm-style dependency string
+- **`-d, --dependency`**: Slurm-style dependency string (`after`, `afterany`, `afterok`, `afternotok`, or `singleton`)
 - **`-J, --job-name`**: job name override
 - **`--requeue`**: allow requeue after failure/cancel
 - **`--arch-use-add/--arch-use-remove`**: archive storage accounting in GB
@@ -809,6 +809,32 @@ Useful options:
 - **`--parsable`**: print only job id / parse-friendly output
 
 The storage flags are interpreted by the manager as instance-wide resource accounting. Jobs may stay queued until enough archive/active/dcache capacity is available.
+
+Dependencies are enforced by the ZSlurm manager before any CPU, memory, SSD,
+storage-budget, or dCache transfer resources are reserved. Examples:
+
+```bash
+first=$(zsbatch --parsable -- preprocess.sh)
+zsbatch --dependency="afterok:${first}" -- analyse.sh
+zsbatch --dependency="afterany:${first}" -- cleanup.sh
+zsbatch --dependency="afterok:${first}?afternotok:12345" -- fallback.sh
+zsbatch --job-name nightly-import --dependency=singleton -- import.sh
+```
+
+Within one dependency string, `,` means all conditions must be satisfied and
+`?` means any condition may release the job; the separators cannot be mixed.
+`after:JOBID+MINUTES` adds a delay after the predecessor starts (or is cancelled
+before starting). A bare job id is treated as `afterany:JOBID`.
+
+Dependency job ids must belong to the same running ZSlurm instance and must
+still be active or known in its terminal history when the dependent job is
+submitted. A dependency that becomes impossible (for example `afterok` after a
+failed predecessor) remains `PENDING` and never runs, matching Slurm's default
+behaviour without `--kill-on-invalid-dep`. Its `dependency_state` and
+`dependency_reason` are available from `list_jobs_detailed`; manager status also
+reports counts for waiting and never-satisfiable dependencies. `expand`, job
+arrays, cross-instance dependencies, and changing dependencies after submission
+are not supported.
 
 The `--partition` flag here refers to the **ZSlurm job partition**:
 

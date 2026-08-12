@@ -343,8 +343,10 @@ The current surface is built for a **human operator at a terminal**. Concretely:
 7. **No liveness/health, no events.** No `ping`, no completion callback; clients must poll.
    The eligible-count cache is 15 s stale, the controller loop is 5 s, engine poll 20 s,
    autogrow cooldown 500 s — control latency is bounded by these.
-8. **zslurm ignores `job.dependency`** in `eligible()` — the agent (or Snakemake) must own
-   DAG completion; "done" is not a scheduler concept.
+8. **Job dependencies are manager-enforced.** `after`, `afterany`, `afterok`,
+   `afternotok`, and `singleton` participate in scheduler eligibility. Terminal
+   predecessor outcomes are retained separately from presentation history so a
+   dependency remains evaluable after its predecessor leaves the active queue.
 9. **`zsb.py` is a stale trap** (hardcoded `localhost:38865`, old 21-arg signature, old
    10-field unpack) — do not use it as a programmatic entry point.
 
