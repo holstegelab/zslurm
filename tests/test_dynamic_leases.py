@@ -1,8 +1,10 @@
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import pathlib
+import subprocess
 import tempfile
 import threading
 import time
@@ -106,6 +108,88 @@ class ChiefLeaseControllerTests(unittest.TestCase):
         self.assertEqual(status.current_cpu, 30)
         self.assertEqual(status.current_mem, 116000)
         self.assertEqual(len(calls), 2)
+
+    def test_parallel_relative_releases_are_atomic(self):
+        status, controller, calls = self.make_controller(cpu=16, mem_mb=64000)
+        env = self.start_job(status, controller, cpu=12, mem_mb=12000)
+        token = env[zslurm_lease.ENV_TOKEN]
+        barrier = threading.Barrier(6)
+        responses = []
+        response_lock = threading.Lock()
+
+        def release(index):
+            barrier.wait()
+            response = controller.release_resources(
+                "job-1",
+                token,
+                cores=2,
+                mem_mb=1000,
+                release_id=f"consumer-{index}",
+            )
+            with response_lock:
+                responses.append(response)
+
+        threads = [threading.Thread(target=release, args=(index,)) for index in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(responses), 6)
+        self.assertTrue(all(response["ok"] for response in responses))
+        self.assertEqual(len(calls), 6)
+        current = controller.status_for("job-1", token)
+        self.assertAlmostEqual(current["held_cores"], 0.1)
+        self.assertEqual(current["held_mem_mb"], 6000)
+        self.assertAlmostEqual(status.current_cpu, 15.9)
+        self.assertEqual(status.current_mem, 58000)
+
+    def test_relative_release_id_is_idempotent(self):
+        status, controller, calls = self.make_controller(cpu=16, mem_mb=64000)
+        env = self.start_job(status, controller, cpu=12, mem_mb=12000)
+        token = env[zslurm_lease.ENV_TOKEN]
+
+        first = controller.release_resources(
+            "job-1", token, cores=2, mem_mb=1000, release_id="verifybamid"
+        )
+        duplicate = controller.release_resources(
+            "job-1", token, cores=2, mem_mb=1000, release_id="verifybamid"
+        )
+        conflicting = controller.release_resources(
+            "job-1", token, cores=1, mem_mb=1000, release_id="verifybamid"
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(duplicate["ok"])
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["status"], "already-released")
+        self.assertFalse(conflicting["ok"])
+        self.assertEqual(conflicting["status"], "invalid")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(status.current_cpu, 6)
+        self.assertEqual(status.current_mem, 53000)
+
+    def test_relative_release_respects_observed_memory_floor(self):
+        status, controller, _ = self.make_controller(
+            headroom_fraction=0.25, headroom_mb=512
+        )
+        env = self.start_job(status, controller)
+        status.current_mem_usage["job-1"] = 8000
+
+        response = controller.release_resources(
+            "job-1",
+            env[zslurm_lease.ENV_TOKEN],
+            cores=2,
+            mem_mb=60000,
+            release_id="memory-heavy-consumer",
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["safety"]["adjusted"])
+        self.assertEqual(response["held_mem_mb"], 10512)
+        self.assertEqual(response["released_mem_mb"], 53488)
 
     def test_growth_waits_fifo_and_raises_admission_barrier(self):
         status, controller, _ = self.make_controller(cpu=16, mem_mb=64000)
@@ -235,6 +319,45 @@ class ChiefLeaseControllerTests(unittest.TestCase):
 
         self.assertTrue(response["ok"])
         self.assertEqual(response["held_cores"], 24)
+
+    def test_relative_release_cli_round_trip(self):
+        status, controller, _ = self.make_controller()
+        env = self.start_job(status, controller)
+        with tempfile.TemporaryDirectory() as tempdir:
+            socket_path = os.path.join(tempdir, "chief.sock")
+            server = zslurm_lease.LeaseServer(socket_path, controller).start()
+            try:
+                child_env = os.environ.copy()
+                child_env.update(env)
+                child_env[zslurm_lease.ENV_SOCKET] = socket_path
+                process = subprocess.run(
+                    [
+                        str(ROOT / "zslurm_lease"),
+                        "--json",
+                        "release",
+                        "--cores",
+                        "2",
+                        "--mem-mb",
+                        "1000",
+                        "--release-id",
+                        "cli-consumer",
+                    ],
+                    cwd=ROOT,
+                    env=child_env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                server.close()
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        response = json.loads(process.stdout)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["status"], "released")
+        self.assertEqual(response["release_id"], "cli-consumer")
+        self.assertEqual(response["held_cores"], 22)
+        self.assertEqual(response["held_mem_mb"], 63000)
 
 
 class ManagerLeaseAccountingTests(unittest.TestCase):

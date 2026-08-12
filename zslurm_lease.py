@@ -5,9 +5,10 @@ how much of that allocation zslurm reserves for one child job.  Jobs address
 the local chief through a Unix-domain socket and authenticate with a
 per-job capability token inherited in their environment.
 
-Lease targets are absolute rather than deltas.  This is important: if a
-manager RPC succeeds but its reply is lost, retrying the same target is
-idempotent and cannot release or acquire the resources twice.
+Lease ``set`` targets are absolute rather than deltas.  Independent parallel
+consumers can instead use an atomic relative ``release`` identified by a
+stable release id.  Repeating the same release id is idempotent, including
+when a manager RPC succeeded but its reply was lost.
 """
 
 import hmac
@@ -115,6 +116,7 @@ class ChiefLeaseController:
                 "held_mem_mb": max_mem_mb,
                 "epoch": 0,
                 "created_at": time.time(),
+                "completed_releases": {},
             }
             return {
                 ENV_TOKEN: token,
@@ -450,6 +452,172 @@ class ChiefLeaseController:
                     self.condition.notify_all()
                     self._wake()
 
+    def release_resources(
+        self,
+        job_id,
+        token,
+        cores=0.0,
+        mem_mb=0.0,
+        release_id=None,
+        request_id=None,
+    ):
+        """Atomically release CPU/memory relative to the current holding.
+
+        ``release_id`` identifies one logical consumer completion. Reusing it
+        with the same amounts returns the original response without applying
+        the decrement twice. Reusing it with different amounts is rejected.
+        """
+
+        key = self._key(job_id)
+        request_id = str(request_id or uuid.uuid4())
+        release_id = str(release_id or request_id)
+        if not release_id:
+            return {
+                "ok": False,
+                "code": 2,
+                "status": "invalid",
+                "message": "release_id must not be empty",
+            }
+        try:
+            release_cpu = _finite_float(cores, "cores")
+            release_mem_mb = _finite_float(mem_mb, "mem_mb")
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "code": 2,
+                "status": "invalid",
+                "message": str(exc),
+            }
+        if release_cpu < 0.0 or release_mem_mb < 0.0:
+            return {
+                "ok": False,
+                "code": 2,
+                "status": "invalid",
+                "message": "relative release amounts cannot be negative",
+            }
+        if release_cpu <= 0.0 and release_mem_mb <= 0.0:
+            return {
+                "ok": False,
+                "code": 2,
+                "status": "invalid",
+                "message": "release requires a positive core or memory amount",
+            }
+
+        with self.condition:
+            record = self._authenticate_locked(key, token)
+            if record is None:
+                return {
+                    "ok": False,
+                    "code": 3,
+                    "status": "denied",
+                    "message": "unknown job or invalid lease token",
+                }
+
+            completed = record.setdefault("completed_releases", {})
+            previous = completed.get(release_id)
+            if previous is not None:
+                if (
+                    abs(previous["cores"] - release_cpu) > 1e-9
+                    or abs(previous["mem_mb"] - release_mem_mb) > 1e-9
+                ):
+                    return {
+                        "ok": False,
+                        "code": 2,
+                        "status": "invalid",
+                        "message": (
+                            f"release_id {release_id!r} was already used with "
+                            "different resource amounts"
+                        ),
+                    }
+                response = dict(previous["response"])
+                response.update(
+                    {
+                        "status": "already-released",
+                        "duplicate": True,
+                        "request_id": request_id,
+                    }
+                )
+                return response
+
+            old_cpu = record["held_cpu"]
+            old_mem_mb = record["held_mem_mb"]
+            requested_target_cpu = max(0.0, old_cpu - release_cpu)
+            requested_target_mem_mb = max(0.0, old_mem_mb - release_mem_mb)
+            try:
+                target_cpu, target_mem_mb, safety = self._safe_target_locked(
+                    record, requested_target_cpu, requested_target_mem_mb
+                )
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "code": 2,
+                    "status": "invalid",
+                    "message": str(exc),
+                }
+
+            try:
+                manager_result = self.manager_resize(key, target_cpu, target_mem_mb)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "code": 5,
+                    "status": "manager-error",
+                    "message": f"manager resize failed: {exc}",
+                }
+            if not isinstance(manager_result, dict) or not manager_result.get(
+                "ok", False
+            ):
+                message = (
+                    manager_result.get("message", "manager rejected resize")
+                    if isinstance(manager_result, dict)
+                    else "manager returned an invalid resize response"
+                )
+                return {
+                    "ok": False,
+                    "code": 5,
+                    "status": "manager-rejected",
+                    "message": message,
+                }
+
+            self.status.current_cpu = min(
+                self.total_cpu,
+                max(0.0, self.status.current_cpu + old_cpu - target_cpu),
+            )
+            self.status.current_mem = min(
+                self.total_mem_mb,
+                max(0.0, self.status.current_mem + old_mem_mb - target_mem_mb),
+            )
+            record["held_cpu"] = target_cpu
+            record["held_mem_mb"] = target_mem_mb
+            record["epoch"] = int(
+                manager_result.get("epoch", record["epoch"] + 1)
+            )
+            record["updated_at"] = time.time()
+            response = self._response_locked(
+                record,
+                status="released",
+                safety=safety,
+                request_id=request_id,
+            )
+            response.update(
+                {
+                    "release_id": release_id,
+                    "requested_release_cores": release_cpu,
+                    "requested_release_mem_mb": release_mem_mb,
+                    "released_cores": old_cpu - target_cpu,
+                    "released_mem_mb": old_mem_mb - target_mem_mb,
+                    "duplicate": False,
+                }
+            )
+            completed[release_id] = {
+                "cores": release_cpu,
+                "mem_mb": release_mem_mb,
+                "response": dict(response),
+            }
+            self.condition.notify_all()
+            self._wake()
+            return response
+
     def _response_locked(
         self, record, status, safety=None, request_id=None
     ):
@@ -497,6 +665,15 @@ class ChiefLeaseController:
                 cores=request.get("cores"),
                 mem_mb=request.get("mem_mb"),
                 timeout_s=request.get("timeout_s", 3600.0),
+                request_id=request.get("request_id"),
+            )
+        if action == "release":
+            return self.release_resources(
+                job_id,
+                token,
+                cores=request.get("cores", 0.0),
+                mem_mb=request.get("mem_mb", 0.0),
+                release_id=request.get("release_id"),
                 request_id=request.get("request_id"),
             )
         return {

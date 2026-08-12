@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Inspect or set the dynamic zslurm lease inherited by this job."""
+"""Inspect, set, or partially release this job's dynamic zslurm lease."""
 
 import argparse
 import json
@@ -12,8 +12,8 @@ def _parser():
     parser = argparse.ArgumentParser(
         prog="zslurm_lease",
         description=(
-            "Inspect or set this running job's local zslurm CPU/memory lease. "
-            "Targets are absolute and cannot exceed the original job request."
+            "Inspect or change this running job's local zslurm CPU/memory "
+            "lease. Set targets are absolute; release amounts are relative."
         ),
     )
     parser.add_argument(
@@ -38,11 +38,32 @@ def _parser():
         metavar="SECONDS",
         help="maximum time to wait for growth (default: 3600)",
     )
+
+    release_parser = subparsers.add_parser(
+        "release",
+        help="atomically release CPU/memory relative to the current holding",
+    )
+    release_parser.add_argument("--cores", type=float, help="CPU cores to release")
+    release_memory = release_parser.add_mutually_exclusive_group()
+    release_memory.add_argument("--mem-mb", type=float, help="memory MB to release")
+    release_memory.add_argument("--mem-gb", type=float, help="memory GiB to release")
+    release_parser.add_argument(
+        "--release-id",
+        help="stable logical completion id; retries with this id are idempotent",
+    )
     return parser
 
 
 def _print_human(response):
     if response.get("ok"):
+        if "released_cores" in response:
+            print(
+                "{status}: released {released_cores:g} cores and "
+                "{released_mem_mb:g} MB; holding {held_cores:g}/{max_cores:g} "
+                "cores and {held_mem_mb:g}/{max_mem_mb:g} MB "
+                "(epoch {epoch})".format(**response)
+            )
+            return
         print(
             "{status}: {held_cores:g}/{max_cores:g} cores, "
             "{held_mem_mb:g}/{max_mem_mb:g} MB "
@@ -73,7 +94,7 @@ def main(argv=None):
             response = lease.request_from_environment(
                 "status", socket_timeout_s=10.0
             )
-        else:
+        elif args.command == "set":
             mem_mb = args.mem_mb
             if args.mem_gb is not None:
                 mem_mb = args.mem_gb * 1024.0
@@ -87,6 +108,19 @@ def main(argv=None):
                 cores=args.cores,
                 mem_mb=mem_mb,
                 timeout_s=args.wait,
+            )
+        else:
+            mem_mb = args.mem_mb
+            if args.mem_gb is not None:
+                mem_mb = args.mem_gb * 1024.0
+            if args.cores is None and mem_mb is None:
+                parser.error("release requires --cores, --mem-mb, or --mem-gb")
+            response = lease.request_from_environment(
+                "release",
+                socket_timeout_s=10.0,
+                cores=args.cores or 0.0,
+                mem_mb=mem_mb or 0.0,
+                release_id=args.release_id,
             )
     except Exception as exc:
         print(f"zslurm_lease: {exc}", file=sys.stderr)

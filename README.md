@@ -592,6 +592,19 @@ Targets are absolute, not relative. Repeating the same `set` command is safe:
 it cannot release the same cores or memory twice. A target may not exceed the
 job's original `zsbatch` request.
 
+Parallel consumers within one child job can return their individual shares
+without racing on an absolute target:
+
+```bash
+consumer_a
+zslurm_lease release --cores 2 --mem-gb 4 --release-id consumer-a
+```
+
+`release` amounts are relative to the holding at the moment the chief handles
+the request. The update is atomic. A stable `--release-id` makes retries
+idempotent; reusing that id with different amounts is rejected. The same
+observed-memory and minimum-CPU safety floors apply as for an absolute shrink.
+
 ### Reacquisition and fairness
 
 When an increase cannot be granted immediately:
