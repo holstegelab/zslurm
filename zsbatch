@@ -41,6 +41,7 @@ parser.add_argument('--ssd-gb', type=float, default=0.0, help='SSD capacity requ
 parser.add_argument('--priority', type=int, default=100, help='ZSlurm scheduling priority. Higher integer values run before lower values; default: 100.')
 parser.add_argument('--dcache-download-slots', type=float, default=0.0, help='Transient dCache download concurrency requested by this job.')
 parser.add_argument('--dcache-upload-slots', type=float, default=0.0, help='Transient dCache upload concurrency requested by this job.')
+parser.add_argument('--s3-download-slots', type=float, default=0.0, help='Transient S3 download concurrency requested by this job.')
 parser.add_argument('--instance', type=str, default=None, help='Submit to a specific ZSlurm instance (defaults to $ZSLURM_INSTANCE or the configured default).')
 
 parser.add_argument('job_args', nargs='*')
@@ -79,12 +80,22 @@ proxy = zslurm_shared.TimeoutServerProxy(JOB_URL, allow_none = True)
 cwd = os.getcwd()
 env = dict(os.environ)
 
-if args.dcache_download_slots < 0 or args.dcache_upload_slots < 0:
-    parser.error('dCache transfer slots must be non-negative')
+if (args.dcache_download_slots < 0 or args.dcache_upload_slots < 0 or
+        args.s3_download_slots < 0):
+    parser.error('transfer slots must be non-negative')
+if args.s3_download_slots > 0 and (
+        args.dcache_download_slots > 0 or args.dcache_upload_slots > 0):
+    parser.error('S3 and dCache transfer slots cannot be combined')
 if args.dcache_download_slots > 0:
     env['ZSLURM_DCACHE_DOWNLOAD_SLOTS'] = str(args.dcache_download_slots)
 if args.dcache_upload_slots > 0:
     env['ZSLURM_DCACHE_UPLOAD_SLOTS'] = str(args.dcache_upload_slots)
+if args.s3_download_slots > 0:
+    # Rolling upgrade: current managers ignore the native S3 field but honor
+    # the dCache-download fallback. Updated managers ignore the fallback.
+    env['ZSLURM_S3_DOWNLOAD_SLOTS'] = str(args.s3_download_slots)
+    env['ZSLURM_DCACHE_DOWNLOAD_SLOTS'] = str(args.s3_download_slots)
+    env['ZSLURM_DCACHE_TRANSFER_SLOTS'] = str(args.s3_download_slots)
 
 if args.limit_threads >= 1:
     t = str(int(args.limit_threads))

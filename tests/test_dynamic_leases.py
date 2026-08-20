@@ -829,7 +829,7 @@ class SchedulerPriorityTests(unittest.TestCase):
     def add_job(
         self, jobid, name, priority=100, cpu=1, mem_mb=1000,
         partition="compute", ssd_use="no", dcache_transfer_slots=0,
-        dcache_download_slots=0, dcache_upload_slots=0,
+        dcache_download_slots=0, dcache_upload_slots=0, s3_download_slots=0,
     ):
         z = self.zslurm
         job = z.Job(
@@ -839,6 +839,7 @@ class SchedulerPriorityTests(unittest.TestCase):
             dcache_transfer_slots=dcache_transfer_slots,
             dcache_download_slots=dcache_download_slots,
             dcache_upload_slots=dcache_upload_slots,
+            s3_download_slots=s3_download_slots,
             owner="pipeline-" + str(priority),
             priority=priority,
         )
@@ -962,13 +963,59 @@ class SchedulerPriorityTests(unittest.TestCase):
         self.assertEqual(self.jobs.dcache_download_inuse, 1)
         self.assertEqual(self.jobs.dcache_upload_inuse, 0)
 
+    def test_s3_metadata_uses_independent_pool_and_ignores_fallbacks(self):
+        self.jobs.dcache_download_total = 1
+        self.jobs.s3_download_total = 1
+        dcache = self.add_job("1", "dcache", dcache_download_slots=1)
+        s3 = self.add_job(
+            "2", "s3", dcache_transfer_slots=1,
+            dcache_download_slots=1, s3_download_slots=1,
+        )
+        another_s3 = self.add_job(
+            "3", "another-s3", dcache_download_slots=1,
+            s3_download_slots=1,
+        )
+
+        self.jobs._reserve_dcache_transfer_locked(dcache)
+        self.assertTrue(self.jobs._dcache_transfer_fits_locked(s3))
+        self.jobs._reserve_dcache_transfer_locked(s3)
+        self.assertFalse(self.jobs._dcache_transfer_fits_locked(another_s3))
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+        self.assertEqual(self.jobs.dcache_upload_inuse, 0)
+        self.assertEqual(self.jobs.s3_download_inuse, 1)
+        self.jobs._release_dcache_transfer_locked(s3)
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+        self.assertEqual(self.jobs.s3_download_inuse, 0)
+
+    def test_s3_pool_limits_dispatch_independently(self):
+        self.jobs.s3_download_total = 1
+        first = self.add_job("1", "first-s3", s3_download_slots=1)
+        second = self.add_job("2", "second-s3", s3_download_slots=1)
+        normal = self.add_job("3", "normal")
+
+        assigned = self.jobs.request_jobs(
+            self.engine.engine_id, 32, 128000, "compute"
+        )
+
+        self.assertEqual({row[0] for row in assigned}, {first.jobid, normal.jobid})
+        self.assertEqual(second.state, "PENDING")
+        self.assertEqual(self.jobs.s3_download_inuse, 1)
+
     def test_transfer_limit_configuration_and_runtime_control(self):
         self.jobs.configure_transfer_limits({"dcache_transfer_slots": 7})
         self.assertEqual(self.jobs.dcache_download_total, 7)
         self.assertEqual(self.jobs.dcache_upload_total, 7)
-        result = self.jobs.set_transfer_limits(download_total=2, upload_total=5)
+        self.assertEqual(self.jobs.s3_download_total, 4)
+        result = self.jobs.set_transfer_limits(
+            download_total=2, upload_total=5, s3_download_total=3
+        )
         self.assertEqual(result["download"]["total_slots"], 2)
         self.assertEqual(result["upload"]["total_slots"], 5)
+        self.assertEqual(result["s3_download"]["total_slots"], 3)
+        status_json = self.jobs.get_status_json()
+        self.assertEqual(
+            status_json["s3_transfers"]["download"]["total_slots"], 3
+        )
 
     def test_submit_api_defaults_and_exposes_priority(self):
         jobid = self.jobs.submit_job(
@@ -976,6 +1023,7 @@ class SchedulerPriorityTests(unittest.TestCase):
                 "ZSLURM_DCACHE_DOWNLOAD_SLOTS": "1",
                 "ZSLURM_DCACHE_UPLOAD_SLOTS": "2",
                 "ZSLURM_DCACHE_TRANSFER_SLOTS": "2",
+                "ZSLURM_S3_DOWNLOAD_SLOTS": "1",
             },
             ncpu=1, mem=1000, reqtime=60, requeue=0, dependency=None,
             arch_use_add=0, arch_use_remove=0, dcache_use_add=0,
@@ -988,11 +1036,13 @@ class SchedulerPriorityTests(unittest.TestCase):
         self.assertEqual(job.priority, 12)
         self.assertEqual(job.dcache_download_slots, 1)
         self.assertEqual(job.dcache_upload_slots, 2)
-        self.assertEqual(self.jobs._dcache_slot_needs(job), (1, 2))
+        self.assertEqual(job.s3_download_slots, 1)
+        self.assertEqual(self.jobs._dcache_slot_needs(job), (0, 0))
         detailed = self.jobs.list_jobs_detailed()[0]
         self.assertEqual(detailed["priority"], 12)
         self.assertEqual(detailed["dcache_download_slots"], 1)
         self.assertEqual(detailed["dcache_upload_slots"], 2)
+        self.assertEqual(detailed["s3_download_slots"], 1)
         self.assertEqual(len(self.jobs.list_jobs()), 1)
         self.assertEqual(len(self.jobs.list_jobs()[0]), 14)
         self.assertEqual(self.jobs.list_jobs(None, True)[0][-1], 12)

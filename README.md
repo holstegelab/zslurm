@@ -532,6 +532,7 @@ Configure their instance-wide capacities in `~/.zslurm/config.yaml`:
 ```yaml
 dcache_download_slots: 4
 dcache_upload_slots: 2
+s3_download_slots: 4
 ```
 
 A Snakemake transfer job requests a directional slot:
@@ -539,6 +540,13 @@ A Snakemake transfer job requests a directional slot:
 ```python
 resources:
     dcache_download_slots=1  # use dcache_upload_slots=1 for outbound data
+```
+
+An S3 ingress job instead requests the independent S3 pool:
+
+```python
+resources:
+    s3_download_slots=1
 ```
 
 The native executor passes these requests as job metadata. ZSlurm reserves them
@@ -557,10 +565,16 @@ manager still throttles the job; a directional manager ignores that fallback
 whenever download or upload metadata is present. Do not configure both legacy
 and directional Snakemake resources explicitly on one job.
 
+S3 requests use the same rolling-upgrade pattern: the executor sends native S3
+metadata plus dCache-download and legacy fallbacks. A manager with
+`s3_download_slots` capability charges only the S3 pool; the current older
+manager charges the dCache download pool. Do not combine S3 and dCache transfer
+resources explicitly on one job.
+
 Limits can also be changed at runtime (in-use reservations are left intact):
 
 ```bash
-zscontrol transfer-slots --download 4 --upload 2
+zscontrol transfer-slots --download 4 --upload 2 --s3-download 4
 ```
 
 ## Dynamic CPU and memory leases

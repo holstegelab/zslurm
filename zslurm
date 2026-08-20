@@ -634,7 +634,8 @@ class Job(object):
         owner=None,
         priority=DEFAULT_JOB_PRIORITY,
         dcache_download_slots=0,
-        dcache_upload_slots=0
+        dcache_upload_slots=0,
+        s3_download_slots=0
     ):
         self.job_name = job_name
         self.jobid = jobid
@@ -712,6 +713,10 @@ class Job(object):
             self.dcache_upload_slots = max(0.0, float(dcache_upload_slots))
         except Exception:
             self.dcache_upload_slots = 0.0
+        try:
+            self.s3_download_slots = max(0.0, float(s3_download_slots))
+        except Exception:
+            self.s3_download_slots = 0.0
 
         self.state = "PENDING"
         self.node_id = None
@@ -821,6 +826,8 @@ class JobManager(object):
         self.dcache_download_inuse = 0.0
         self.dcache_upload_total = 4.0
         self.dcache_upload_inuse = 0.0
+        self.s3_download_total = 4.0
+        self.s3_download_inuse = 0.0
 
         # idempotent submission: maps a client-supplied idempotency_key -> jobid,
         # so a retried submit_job (e.g. after a socket timeout that actually
@@ -1109,6 +1116,11 @@ class JobManager(object):
         metadata is absent. Updated clients may also send a legacy fallback for
         rolling upgrades; a new manager ignores it when a direction is known.
         """
+        # Updated clients send dCache metadata as a fallback alongside a native
+        # S3 request. Do not charge those fallbacks once this manager can see
+        # the independent S3 pool.
+        if self._s3_download_slot_need(job) > 0.0:
+            return 0.0, 0.0
         legacy = float(getattr(job, 'dcache_transfer_slots', 0.0) or 0.0)
         download = float(getattr(job, 'dcache_download_slots', 0.0) or 0.0)
         upload = float(getattr(job, 'dcache_upload_slots', 0.0) or 0.0)
@@ -1116,20 +1128,30 @@ class JobManager(object):
             return download, upload
         return legacy, legacy
 
+    @staticmethod
+    def _s3_download_slot_need(job):
+        return float(getattr(job, 's3_download_slots', 0.0) or 0.0)
+
     def _dcache_transfer_fits_locked(self, job, download_available=None,
-                                     upload_available=None):
+                                     upload_available=None,
+                                     s3_download_available=None):
         download_need, upload_need = self._dcache_slot_needs(job)
+        s3_download_need = self._s3_download_slot_need(job)
         if download_available is None:
             download_available = self.dcache_download_total - self.dcache_download_inuse
         if upload_available is None:
             upload_available = self.dcache_upload_total - self.dcache_upload_inuse
+        if s3_download_available is None:
+            s3_download_available = self.s3_download_total - self.s3_download_inuse
         return (download_need <= max(0.0, float(download_available)) and
-                upload_need <= max(0.0, float(upload_available)))
+                upload_need <= max(0.0, float(upload_available)) and
+                s3_download_need <= max(0.0, float(s3_download_available)))
 
     def _reserve_dcache_transfer_locked(self, job):
         download_need, upload_need = self._dcache_slot_needs(job)
         self.dcache_download_inuse += download_need
         self.dcache_upload_inuse += upload_need
+        self.s3_download_inuse += self._s3_download_slot_need(job)
         self._eligible_cache_ts = 0.0
 
     def _release_dcache_transfer_locked(self, job):
@@ -1140,14 +1162,18 @@ class JobManager(object):
         self.dcache_upload_inuse = max(
             0.0, self.dcache_upload_inuse - upload_need
         )
+        self.s3_download_inuse = max(
+            0.0, self.s3_download_inuse - self._s3_download_slot_need(job)
+        )
         self._eligible_cache_ts = 0.0
 
     def configure_transfer_limits(self, config):
-        """Load directional transfer limits from the manager configuration."""
+        """Load dCache and S3 transfer limits from manager configuration."""
         cfg = config or {}
         legacy_total = cfg.get('dcache_transfer_slots', 4)
         raw_download = cfg.get('dcache_download_slots', legacy_total)
         raw_upload = cfg.get('dcache_upload_slots', legacy_total)
+        raw_s3_download = cfg.get('s3_download_slots', 4)
         try:
             download_total = max(0.0, float(raw_download))
         except Exception:
@@ -1156,10 +1182,15 @@ class JobManager(object):
             upload_total = max(0.0, float(raw_upload))
         except Exception:
             upload_total = 4.0
+        try:
+            s3_download_total = max(0.0, float(raw_s3_download))
+        except Exception:
+            s3_download_total = 4.0
         self.lock.acquire()
         try:
             self.dcache_download_total = download_total
             self.dcache_upload_total = upload_total
+            self.s3_download_total = s3_download_total
             self._eligible_cache_ts = 0.0
         finally:
             self.lock.release()
@@ -1225,12 +1256,16 @@ class JobManager(object):
         upload_available = max(
             0.0, self.dcache_upload_total - self.dcache_upload_inuse
         )
+        s3_download_available = max(
+            0.0, self.s3_download_total - self.s3_download_inuse
+        )
         for job in list(self.jobs_by_id.values()):
             if self._is_job_eligible_locked(job):
                 if (
                     getattr(job, 'state', None) in queue_states
                     and not self._dcache_transfer_fits_locked(
-                        job, download_available, upload_available
+                        job, download_available, upload_available,
+                        s3_download_available
                     )
                 ):
                     continue
@@ -1238,6 +1273,7 @@ class JobManager(object):
                     download_need, upload_need = self._dcache_slot_needs(job)
                     download_available -= download_need
                     upload_available -= upload_need
+                    s3_download_available -= self._s3_download_slot_need(job)
                 part = str(getattr(job, 'partition', 'compute') or 'compute')
                 counts[part] = counts.get(part, 0) + 1
 
@@ -1260,6 +1296,7 @@ class JobManager(object):
             min_add = {'active': None, 'dcache': None, 'archive': None}
             pending_download_slots = 0.0
             pending_upload_slots = 0.0
+            pending_s3_download_slots = 0.0
             pending_legacy_slots = 0.0
             n_pending = 0
             n_budget_pending = 0
@@ -1279,6 +1316,7 @@ class JobManager(object):
                 download_need, upload_need = self._dcache_slot_needs(job)
                 pending_download_slots += download_need
                 pending_upload_slots += upload_need
+                pending_s3_download_slots += self._s3_download_slot_need(job)
                 pending_legacy_slots += float(
                     getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
                 )
@@ -1313,6 +1351,13 @@ class JobManager(object):
                         'pending_slots': pending_upload_slots,
                     },
                     'legacy_pending_slots': pending_legacy_slots,
+                },
+                's3_transfers': {
+                    'download': {
+                        'total_slots': float(self.s3_download_total),
+                        'inuse_slots': float(self.s3_download_inuse),
+                        'pending_slots': pending_s3_download_slots,
+                    },
                 },
                 'scheduler': {
                     'lastin_first': bool(status.lastin_first),
@@ -1419,14 +1464,17 @@ class JobManager(object):
         finally:
             self.lock.release()
 
-    def set_transfer_limits(self, download_total=None, upload_total=None):
-        """Set directional transfer concurrency without changing in-use slots."""
+    def set_transfer_limits(self, download_total=None, upload_total=None,
+                            s3_download_total=None):
+        """Set transfer concurrency without changing in-use reservations."""
         self.lock.acquire()
         try:
             if download_total is not None:
                 self.dcache_download_total = max(0.0, float(download_total))
             if upload_total is not None:
                 self.dcache_upload_total = max(0.0, float(upload_total))
+            if s3_download_total is not None:
+                self.s3_download_total = max(0.0, float(s3_download_total))
             self._eligible_cache_ts = 0.0
             return {
                 'download': {
@@ -1436,6 +1484,10 @@ class JobManager(object):
                 'upload': {
                     'total_slots': float(self.dcache_upload_total),
                     'inuse_slots': float(self.dcache_upload_inuse),
+                },
+                's3_download': {
+                    'total_slots': float(self.s3_download_total),
+                    'inuse_slots': float(self.s3_download_inuse),
                 },
             }
         finally:
@@ -1503,6 +1555,9 @@ class JobManager(object):
                     'dcache_transfer_slots_legacy': float(
                         getattr(job, 'dcache_transfer_slots', 0.0) or 0.0
                     ),
+                    's3_download_slots': float(
+                        getattr(job, 's3_download_slots', 0.0) or 0.0
+                    ),
                     'priority': int(getattr(job, 'priority', 0) or 0),
                     'dependency': getattr(job, 'dependency', None),
                     'dependency_state': dependency_state,
@@ -1523,9 +1578,11 @@ class JobManager(object):
             before = {'active': float(self.active_inuse), 'dcache': float(self.dcache_inuse),
                       'archive': float(self.archive_inuse),
                       'dcache_downloads': float(self.dcache_download_inuse),
-                      'dcache_uploads': float(self.dcache_upload_inuse)}
+                      'dcache_uploads': float(self.dcache_upload_inuse),
+                      's3_downloads': float(self.s3_download_inuse)}
             sums = {'active': 0.0, 'dcache': 0.0, 'archive': 0.0,
-                    'dcache_downloads': 0.0, 'dcache_uploads': 0.0}
+                    'dcache_downloads': 0.0, 'dcache_uploads': 0.0,
+                    's3_downloads': 0.0}
             for job in self.jobs_by_id.values():
                 if getattr(job, 'state', None) in ('RUNNING', 'ASSIGNED'):
                     sums['active'] += float(getattr(job, 'active_start_use_add', 0.0) or 0.0)
@@ -1534,11 +1591,13 @@ class JobManager(object):
                     download_need, upload_need = self._dcache_slot_needs(job)
                     sums['dcache_downloads'] += download_need
                     sums['dcache_uploads'] += upload_need
+                    sums['s3_downloads'] += self._s3_download_slot_need(job)
             self.active_inuse = sums['active']
             self.dcache_inuse = sums['dcache']
             self.archive_inuse = sums['archive']
             self.dcache_download_inuse = sums['dcache_downloads']
             self.dcache_upload_inuse = sums['dcache_uploads']
+            self.s3_download_inuse = sums['s3_downloads']
             self._eligible_cache_ts = 0.0
             return {'before': before, 'after': sums}
         finally:
@@ -1808,6 +1867,9 @@ class JobManager(object):
         dcache_upload_slots = transfer_slots_from_env(
             "ZSLURM_DCACHE_UPLOAD_SLOTS"
         )
+        s3_download_slots = transfer_slots_from_env(
+            "ZSLURM_S3_DOWNLOAD_SLOTS"
+        )
         parsed_dependency = parse_job_dependency(dependency)
 
         # Idempotency, dependency validation (including singleton predecessor
@@ -1852,7 +1914,8 @@ class JobManager(object):
                     owner,
                     priority,
                     dcache_download_slots,
-                    dcache_upload_slots
+                    dcache_upload_slots,
+                    s3_download_slots
                 )
                 job.dependency_spec = dependency_spec
                 self.jobs_by_id[jobid] = job
@@ -1877,10 +1940,11 @@ class JobManager(object):
             or dcache_transfer_slots
             or dcache_download_slots
             or dcache_upload_slots
+            or s3_download_slots
         ):
             add_log_line(
                 gb,
-                f"Job {job_name} (id: {jobid}, priority: {job.priority}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}, arch+: {arch_use_add} GB, arch-: {arch_use_remove} GB, d+: {dcache_use_add} GB, d-: {dcache_use_remove} GB, active+: {active_use_add} GB, active-: {active_use_remove} GB, dcache-download: {dcache_download_slots}, dcache-upload: {dcache_upload_slots}, dcache-transfer-legacy: {dcache_transfer_slots}) submitted.",
+                f"Job {job_name} (id: {jobid}, priority: {job.priority}, ncore: {ncpu}, mem: {mem} mb, partition: {partition}, arch+: {arch_use_add} GB, arch-: {arch_use_remove} GB, d+: {dcache_use_add} GB, d-: {dcache_use_remove} GB, active+: {active_use_add} GB, active-: {active_use_remove} GB, dcache-download: {dcache_download_slots}, dcache-upload: {dcache_upload_slots}, s3-download: {s3_download_slots}, dcache-transfer-legacy: {dcache_transfer_slots}) submitted.",
                  GREEN,
             )
         else:
@@ -3047,6 +3111,7 @@ def ping():
         "default_job_priority": DEFAULT_JOB_PRIORITY,
         "list_jobs_priority": True,
         "directional_dcache_slots": True,
+        "s3_download_slots": True,
         "job_dependencies": True,
         "job_dependency_types": sorted(SUPPORTED_DEPENDENCY_TYPES),
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
@@ -3079,16 +3144,26 @@ def set_budgets(token=None, active_total=None, dcache_total=None, archive_total=
     return {"ok": True, "budgets": res}
 
 
-def set_transfer_limits(token=None, download_total=None, upload_total=None):
+def set_transfer_limits(token=None, download_total=None, upload_total=None,
+                        s3_download_total=None):
     denied = _control_denied(token)
     if denied:
         return denied
     try:
-        res = jobs.set_transfer_limits(download_total, upload_total)
+        res = jobs.set_transfer_limits(
+            download_total, upload_total, s3_download_total
+        )
     except (TypeError, ValueError) as error:
         return {"ok": False, "code": 3, "error": str(error)}
-    add_log_line(gb, f"[agent] dCache transfer limits set -> {res}", CYAN)
-    return {"ok": True, "dcache_transfers": res}
+    add_log_line(gb, f"[agent] transfer limits set -> {res}", CYAN)
+    return {
+        "ok": True,
+        "dcache_transfers": {
+            "download": res["download"],
+            "upload": res["upload"],
+        },
+        "s3_transfers": {"download": res["s3_download"]},
+    }
 
 
 def set_scheduler_mode(token=None, lastin_first=None, prio_fillmem_context=None):
@@ -4462,6 +4537,9 @@ def compute_autogrow_plan(all_engines, partition):
     upload_available = max(
         0.0, jobs.dcache_upload_total - jobs.dcache_upload_inuse
     )
+    s3_download_available = max(
+        0.0, jobs.s3_download_total - jobs.s3_download_inuse
+    )
     for j in list(jobs.jobs_by_id.values()):
         if (
             j.partition == partition
@@ -4471,13 +4549,15 @@ def compute_autogrow_plan(all_engines, partition):
             and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
             and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
             and jobs._dcache_transfer_fits_locked(
-                j, download_available, upload_available
+                j, download_available, upload_available,
+                s3_download_available
             )
         ):
             eligible.append(j)
             download_need, upload_need = jobs._dcache_slot_needs(j)
             download_available -= download_need
             upload_available -= upload_need
+            s3_download_available -= jobs._s3_download_slot_need(j)
 
     unique_part = list(set([part_name for part_name,_ in status.autogrow_prefer_partitions]))
     fallback_part = str(getattr(status, 'autogrow_fallback_partition', '') or '')
@@ -5001,6 +5081,10 @@ def thread_check_commands():
                         0.0,
                         jobs.dcache_upload_total - jobs.dcache_upload_inuse,
                     )
+                    s3_download_available = max(
+                        0.0,
+                        jobs.s3_download_total - jobs.s3_download_inuse,
+                    )
                     for j in list(jobs.jobs_by_id.values()):
                         if (
                             j.partition == part
@@ -5017,7 +5101,8 @@ def thread_check_commands():
                             and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
                             and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
                             and jobs._dcache_transfer_fits_locked(
-                                j, download_available, upload_available
+                                j, download_available, upload_available,
+                                s3_download_available
                             )
                             and (
                                 str(getattr(j, 'ssd_use', 'no') or 'no') != 'required'
@@ -5028,6 +5113,7 @@ def thread_check_commands():
                             download_need, upload_need = jobs._dcache_slot_needs(j)
                             download_available -= download_need
                             upload_available -= upload_need
+                            s3_download_available -= jobs._s3_download_slot_need(j)
                       
                     if pending_eligible and part == 'archive':
                         # archive/staging stays FIFO and is grown on demand, not
@@ -5768,15 +5854,17 @@ def thread_display_status(gb, status):
                     "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total),
                     curses.color_pair(GREEN),
                 )
-                gb.wcom_status.addstr(16, 1, "DCache xfer D/U: ")
+                gb.wcom_status.addstr(16, 1, "Xfer D/U/S3: ")
                 gb.wcom_status.addstr(
                     16,
                     18,
-                    "%.1f/%.1f | %.1f/%.1f" % (
+                    "%.1f/%.1f | %.1f/%.1f | %.1f/%.1f" % (
                         jobs.dcache_download_inuse,
                         jobs.dcache_download_total,
                         jobs.dcache_upload_inuse,
                         jobs.dcache_upload_total,
+                        jobs.s3_download_inuse,
+                        jobs.s3_download_total,
                     ),
                     curses.color_pair(GREEN),
                 )
@@ -6554,6 +6642,15 @@ def main(scr, *args, **kwds):
                 )
                 if upload_total is not None:
                     jobs.set_transfer_limits(upload_total=upload_total)
+            elif c == ord("9"):
+                s3_download_total = get_number(
+                    gb, "Enter S3 download slot limit: ",
+                    int(jobs.s3_download_total),
+                )
+                if s3_download_total is not None:
+                    jobs.set_transfer_limits(
+                        s3_download_total=s3_download_total
+                    )
 
             elif c == ord("c"):  # STOP SLURM engines
                 group_cmd = enter_command(
