@@ -550,7 +550,6 @@ class status:
     reports = {}
     current_cpu_usage = {}
     current_mem_usage = {}
-    completed_jobs = set()
 
 def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     memcache = [] #stores memory usage at different snapshots over time
@@ -649,8 +648,16 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
                     cpu_percentage = max(0.0, float(cpu_percentage))                
                     status.lock.acquire()
                     status.current_cpu_usage[jobid] = cpu_percentage
-                    status.current_mem_usage[jobid] = r['pss'] / (1024.0 * 1024.0)
+                    pss_mb = r['pss'] / (1024.0 * 1024.0)
+                    status.current_mem_usage[jobid] = pss_mb
                     status.lock.release()
+
+                    lease_controller.record_usage(
+                        jobid,
+                        cpu_cores=cpu_percentage,
+                        pss_mb=pss_mb,
+                        sampled_at=cur_time,
+                    )
 
                     last_live_sample_time = cur_time
                     last_live_spend_time = spend_time
@@ -749,22 +756,41 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     #print ("%s - Report %s" % (xtime(), str(report)))
 
     status.lock.acquire()
-    status.return_codes[jobid] = retcode
-    status.reports[jobid] = report
-    status.current_cpu_usage.pop(jobid, None)
-    status.current_mem_usage.pop(jobid, None)
-    # Avoid double resource accounting if multiple monitors exist for the same job
-    if jobid not in status.completed_jobs:
-        status.completed_jobs.add(jobid)
-        # The job may have released part of its original maximum. Return only
-        # its current holding; legacy/unregistered jobs use the fixed fallback.
-        lease_controller.finish_job(jobid, ncpu, mem)
-    removed_proc = status.running_processes.pop(jobid, None)
-    if removed_proc is None:
-        sys.stderr.write(f"job_monitor cleanup: jobid {jobid} not in running_processes (already cleaned?)\n")
+    current_attempt = zslurm_lease.claim_finished_attempt(
+        status.running_processes, jobid, process
+    )
+    if current_attempt:
+        # Finalising the lease also closes its last reporting phase. Attach
+        # both per-phase rows and time-integrated effective reservations to
+        # the normal job report before it is sent to the manager.
+        lease_report = lease_controller.finish_job(jobid, ncpu, mem)
+        phases = lease_report.get("phases", [])
+        report["lease_phases"] = phases
+        for field in (
+            "phase_count",
+            "reserved_core_seconds",
+            "sampled_reserved_core_seconds",
+            "used_core_seconds",
+            "reserved_mem_mb_seconds",
+            "sampled_reserved_mem_mb_seconds",
+            "pss_mb_seconds",
+            "cpu_efficiency",
+            "memory_efficiency",
+            "sample_coverage",
+        ):
+            if field in lease_report:
+                report["lease_" + field] = lease_report[field]
+        status.return_codes[jobid] = retcode
+        status.reports[jobid] = report
+        status.current_cpu_usage.pop(jobid, None)
+        status.current_mem_usage.pop(jobid, None)
+        event_timer.set()
+    else:
+        sys.stderr.write(
+            f"job_monitor cleanup: stale or duplicate attempt for jobid {jobid}; "
+            "current process left untouched\n"
+        )
         sys.stderr.flush()
-
-    event_timer.set()
     status.lock.release()
 
     logfile.close()

@@ -579,8 +579,8 @@ zslurm_lease status
 
 run_alignment
 
-# Keep only the resources needed by the serial phase.
-zslurm_lease set --cores 2 --mem-gb 12
+# Keep only the resources needed by the serial phase and name it in reports.
+zslurm_lease set --cores 2 --mem-gb 12 --phase merge
 run_merge
 
 # A later increase blocks until the local chief can grant all of it.
@@ -591,6 +591,17 @@ run_parallel_postprocessing
 Targets are absolute, not relative. Repeating the same `set` command is safe:
 it cannot release the same cores or memory twice. A target may not exceed the
 job's original `zsbatch` request.
+
+Every effective lease change starts a new reported lease interval. A semantic
+phase can also start without a resource change:
+
+```bash
+zslurm_lease phase sort
+```
+
+Repeated no-op targets do not create extra intervals. Relative releases create
+separate intervals but inherit the current semantic phase name, so parallel
+consumer releases remain groupable as one phase.
 
 Parallel consumers within one child job can return their individual shares
 without racing on an absolute target:
@@ -678,6 +689,7 @@ ZSlurm writes several useful files in the working directory of the manager or co
 
 - **`zslurm-<jobid>.out`**: stdout/stderr log for a job
 - **`report-YYYY-MM-DD_HH-MM.tsv`**: per-job resource usage and runtime summary
+- **`lease_phases-YYYY-MM-DD_HH-MM.tsv`**: one row per lease interval/phase
 - **`cluster.log`**: manager log output
 - **`node_usage-YYYY-MM-DD_HH-MM.tsv`**: periodic node usage snapshots when node reports are enabled
 
@@ -700,8 +712,28 @@ By default the file contains columns such as:
 - **Thread and CPU summaries**: `avg_cpu_percentage`, `nthreads_avg`, `nthreads_max`, `user`, `system`
 - **Memory and IO summaries**: `maxrss`, `mon_user`, `mon_system`, `iowait`, `read_count`, `write_count`, `read_bytes`, `write_bytes`
 - **Memory trace**: `memory_over_time`
+- **Lease-integrated usage**: effective reserved/used core-seconds,
+  memory-MB-seconds, PSS-MB-seconds, efficiencies, and sampling coverage
 
 This is the main input for `zsstats`.
+
+### `lease_phases-*.tsv`
+
+This file contains one row per effective lease interval. It records the
+semantic `phase_name`, transition type, lease epoch, held and requested
+resources, duration, average/P50/P95/max CPU and PSS, resource-time integrals,
+efficiencies, and sampling coverage. It is enabled by default and controlled
+with:
+
+- **`lease_phase_reports_enable`**
+- **`lease_phase_reports_file_prefix`**
+
+The file has report-compatible resource column names and can be aggregated
+directly:
+
+```bash
+python zsstats --files 'lease_phases-*.tsv' --group jobname,phase_name --json
+```
 
 ### `cluster.log`
 
@@ -981,6 +1013,9 @@ By default it calls `scontrol` directly.
 ### `zsstats`
 
 Aggregate one or more `report*.tsv` files for downstream analysis.
+New reports prefer lease-integrated effective reservations over the original
+maximum request and include memory/PSS efficiency. Older reports retain the
+original job-wide fallback calculation.
 
 Useful options:
 

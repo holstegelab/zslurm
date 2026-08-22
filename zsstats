@@ -44,6 +44,17 @@ def _to_int(v):
         return None
 
 
+def _memory_over_time_mean(value):
+    if value is None:
+        return None
+    samples = []
+    for item in str(value).split(";"):
+        parsed = _to_float(item)
+        if parsed is not None:
+            samples.append(parsed)
+    return float(mean(samples)) if samples else None
+
+
 def _percentile_columns(prefix):
     return [
         f"{prefix}_0",
@@ -69,6 +80,7 @@ class Agg:
         self.rss_med = []
         self.rss_max = []
         self.maxrss = []
+        self.pss_avg = []
 
         self.iowait = []
 
@@ -80,6 +92,8 @@ class Agg:
         self.runtime_sum = 0.0
         self.res_core_seconds = 0.0
         self.used_core_seconds = 0.0
+        self.res_mem_mb_seconds = 0.0
+        self.used_pss_mb_seconds = 0.0
 
     def add(self, row):
         self.count += 1
@@ -107,6 +121,11 @@ class Agg:
         v = _to_float(row.get("maxrss"))
         if v is not None:
             self.maxrss.append(v)
+        row_pss_avg = _to_float(row.get("pss_avg_mb"))
+        if row_pss_avg is None:
+            row_pss_avg = _memory_over_time_mean(row.get("memory_over_time"))
+        if row_pss_avg is not None:
+            self.pss_avg.append(row_pss_avg)
 
         v = _to_float(row.get("iowait"))
         if v is not None:
@@ -128,12 +147,39 @@ class Agg:
         v = _to_float(row.get("runtime"))
         if v is not None and v > 0:
             self.runtime_sum += v
-            cr = _to_float(row.get("cores_reserved"))
-            if cr is not None:
-                self.res_core_seconds += (cr * v)
-            acpu = _to_float(row.get("avg_cpu_percentage"))
-            if acpu is not None:
-                self.used_core_seconds += (acpu * v)
+            dynamic_reserved_cpu = _to_float(
+                row.get("lease_reserved_core_seconds")
+            )
+            if dynamic_reserved_cpu is not None:
+                self.res_core_seconds += dynamic_reserved_cpu
+            else:
+                cr = _to_float(row.get("cores_reserved"))
+                if cr is not None:
+                    self.res_core_seconds += (cr * v)
+
+            dynamic_used_cpu = _to_float(row.get("lease_used_core_seconds"))
+            if dynamic_used_cpu is not None:
+                self.used_core_seconds += dynamic_used_cpu
+            else:
+                acpu = _to_float(row.get("avg_cpu_percentage"))
+                if acpu is not None:
+                    self.used_core_seconds += (acpu * v)
+
+            dynamic_reserved_mem = _to_float(
+                row.get("lease_reserved_mem_mb_seconds")
+            )
+            if dynamic_reserved_mem is not None:
+                self.res_mem_mb_seconds += dynamic_reserved_mem
+            else:
+                reserved_mem = _to_float(row.get("mem_reserved_mb"))
+                if reserved_mem is not None:
+                    self.res_mem_mb_seconds += reserved_mem * v
+
+            dynamic_used_pss = _to_float(row.get("lease_pss_mb_seconds"))
+            if dynamic_used_pss is not None:
+                self.used_pss_mb_seconds += dynamic_used_pss
+            elif row_pss_avg is not None:
+                self.used_pss_mb_seconds += row_pss_avg * v
 
     def _safe_mean(self, arr):
         return float(mean(arr)) if arr else None
@@ -155,6 +201,8 @@ class Agg:
 
         res_ch = self.res_core_seconds / 3600.0 if self.res_core_seconds > 0 else 0.0
         used_ch = self.used_core_seconds / 3600.0 if self.used_core_seconds > 0 else 0.0
+        res_mem_gibh = self.res_mem_mb_seconds / (1024.0 * 3600.0)
+        used_pss_gibh = self.used_pss_mb_seconds / (1024.0 * 3600.0)
 
         return {
             "count": self.count,
@@ -176,6 +224,9 @@ class Agg:
             "rss_mb_mean": self._safe_mean(rss_med_list),
             "rss_mb_median": self._safe_median(rss_med_list),
             "rss_mb_max": self._safe_max(rss_max_list),
+            "pss_mb_mean": self._safe_mean(self.pss_avg),
+            "pss_mb_median": self._safe_median(self.pss_avg),
+            "pss_mb_max": self._safe_max(self.pss_avg),
 
             "iowait_mean": self._safe_mean(self.iowait),
             "iowait_median": self._safe_median(self.iowait),
@@ -192,6 +243,19 @@ class Agg:
             "reserved_core_hours": res_ch,
             "used_core_hours": used_ch,
             "cpu_efficiency": (used_ch / res_ch) if res_ch > 0 else None,
+            "effective_reserved_cores": (
+                self.res_core_seconds / self.runtime_sum
+                if self.runtime_sum > 0 else None
+            ),
+            "reserved_memory_gib_hours": res_mem_gibh,
+            "used_pss_gib_hours": used_pss_gibh,
+            "memory_efficiency": (
+                used_pss_gibh / res_mem_gibh if res_mem_gibh > 0 else None
+            ),
+            "effective_reserved_mem_mb": (
+                self.res_mem_mb_seconds / self.runtime_sum
+                if self.runtime_sum > 0 else None
+            ),
         }
 
 

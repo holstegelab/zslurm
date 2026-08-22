@@ -38,6 +38,15 @@ def _parser():
         metavar="SECONDS",
         help="maximum time to wait for growth (default: 3600)",
     )
+    set_parser.add_argument(
+        "--phase",
+        help="name the phase started by this request, even if resources are unchanged",
+    )
+
+    phase_parser = subparsers.add_parser(
+        "phase", help="start a named phase without changing held resources"
+    )
+    phase_parser.add_argument("name", help="semantic phase name")
 
     release_parser = subparsers.add_parser(
         "release",
@@ -98,8 +107,10 @@ def main(argv=None):
             mem_mb = args.mem_mb
             if args.mem_gb is not None:
                 mem_mb = args.mem_gb * 1024.0
-            if args.cores is None and mem_mb is None:
-                parser.error("set requires --cores, --mem-mb, or --mem-gb")
+            if args.cores is None and mem_mb is None and args.phase is None:
+                parser.error(
+                    "set requires --cores, --mem-mb, --mem-gb, or --phase"
+                )
             # The socket must remain open for slightly longer than the requested
             # chief-side wait so the final grant/timeout response can arrive.
             response = lease.request_from_environment(
@@ -108,6 +119,11 @@ def main(argv=None):
                 cores=args.cores,
                 mem_mb=mem_mb,
                 timeout_s=args.wait,
+                phase=args.phase,
+            )
+        elif args.command == "phase":
+            response = lease.request_from_environment(
+                "phase", socket_timeout_s=10.0, phase=args.name
             )
         else:
             mem_mb = args.mem_mb

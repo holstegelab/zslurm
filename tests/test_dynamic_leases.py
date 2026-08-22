@@ -1,3 +1,4 @@
+import errno
 import importlib.machinery
 import importlib.util
 import io
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import zslurm_lease
 
@@ -91,6 +93,115 @@ class ChiefLeaseControllerTests(unittest.TestCase):
         self.assertEqual(status.current_cpu, 32)
         self.assertEqual(status.current_mem, 128000)
 
+    def test_usage_is_reported_per_lease_phase(self):
+        status, controller, _ = self.make_controller()
+        with mock.patch.object(zslurm_lease.time, "time", return_value=100.0):
+            env = self.start_job(status, controller)
+        token = env[zslurm_lease.ENV_TOKEN]
+
+        controller.record_usage("job-1", 4.0, 8000.0, sampled_at=105.0)
+        with mock.patch.object(zslurm_lease.time, "time", return_value=110.0):
+            response = controller.set_target(
+                "job-1",
+                token,
+                cores=2,
+                mem_mb=12000,
+                phase="tail",
+            )
+        self.assertEqual(response["phase_name"], "tail")
+        controller.record_usage("job-1", 1.0, 2000.0, sampled_at=115.0)
+        with mock.patch.object(zslurm_lease.time, "time", return_value=120.0):
+            report = controller.finish_job("job-1", 24, 64000)
+
+        self.assertEqual(report["phase_count"], 2)
+        initial, tail = report["phases"]
+        self.assertEqual(initial["phase_name"], "initial")
+        self.assertEqual(initial["event"], "initial")
+        self.assertEqual(initial["lease_epoch"], 0)
+        self.assertEqual(initial["duration_s"], 10.0)
+        self.assertEqual(initial["avg_cpu_cores"], 4.0)
+        self.assertEqual(initial["avg_pss_mb"], 8000.0)
+        self.assertEqual(initial["reserved_core_seconds"], 240.0)
+        self.assertEqual(initial["used_core_seconds"], 40.0)
+
+        self.assertEqual(tail["phase_name"], "tail")
+        self.assertEqual(tail["event"], "set")
+        self.assertEqual(tail["lease_epoch"], 1)
+        self.assertEqual(tail["duration_s"], 10.0)
+        self.assertEqual(tail["held_cores"], 2.0)
+        self.assertEqual(tail["held_mem_mb"], 12000.0)
+        self.assertEqual(tail["avg_cpu_cores"], 1.0)
+        self.assertEqual(tail["avg_pss_mb"], 2000.0)
+        self.assertAlmostEqual(tail["cpu_efficiency"], 0.5)
+        self.assertAlmostEqual(tail["memory_efficiency"], 1.0 / 6.0)
+        self.assertEqual(report["reserved_core_seconds"], 260.0)
+        self.assertEqual(report["used_core_seconds"], 50.0)
+
+    def test_named_noop_starts_phase_but_plain_noop_does_not(self):
+        status, controller, calls = self.make_controller()
+        with mock.patch.object(zslurm_lease.time, "time", return_value=100.0):
+            env = self.start_job(status, controller)
+        token = env[zslurm_lease.ENV_TOKEN]
+
+        with mock.patch.object(zslurm_lease.time, "time", return_value=110.0):
+            named = controller.set_target(
+                "job-1", token, cores=24, mem_mb=64000, phase="work"
+            )
+        plain = controller.set_target(
+            "job-1", token, cores=24, mem_mb=64000
+        )
+
+        self.assertEqual(named["status"], "phase-changed")
+        self.assertEqual(named["epoch"], 0)
+        self.assertEqual(named["phase_index"], 1)
+        self.assertEqual(plain["status"], "unchanged")
+        self.assertEqual(plain["phase_index"], 1)
+        self.assertEqual(calls, [])
+
+    def test_parallel_releases_create_intervals_in_one_semantic_phase(self):
+        status, controller, _ = self.make_controller(cpu=16, mem_mb=64000)
+        env = self.start_job(status, controller, cpu=12, mem_mb=12000)
+        token = env[zslurm_lease.ENV_TOKEN]
+        controller.mark_phase("job-1", token, "qc")
+        controller.release_resources(
+            "job-1", token, cores=2, mem_mb=1000, release_id="task-a"
+        )
+        controller.release_resources(
+            "job-1", token, cores=2, mem_mb=1000, release_id="task-b"
+        )
+        report = controller.finish_job("job-1", 12, 12000)
+
+        self.assertEqual(
+            [phase["event"] for phase in report["phases"]],
+            ["initial", "phase", "release", "release"],
+        )
+        self.assertEqual(
+            [phase["phase_name"] for phase in report["phases"]],
+            ["initial", "qc", "qc", "qc"],
+        )
+        self.assertEqual(
+            [phase["transition_id"] for phase in report["phases"][-2:]],
+            ["task-a", "task-b"],
+        )
+
+    def test_relative_release_without_effective_change_has_no_new_interval(self):
+        status, controller, calls = self.make_controller(
+            cpu=1, mem_mb=1000, min_cpu=0.1
+        )
+        env = self.start_job(status, controller, cpu=0.1, mem_mb=100)
+        response = controller.release_resources(
+            "job-1",
+            env[zslurm_lease.ENV_TOKEN],
+            cores=1,
+            release_id="already-at-floor",
+        )
+        report = controller.finish_job("job-1", 0.1, 100)
+
+        self.assertEqual(response["status"], "unchanged")
+        self.assertEqual(response["released_cores"], 0.0)
+        self.assertEqual(calls, [])
+        self.assertEqual(report["phase_count"], 1)
+
     def test_absolute_target_retry_does_not_double_release(self):
         status, controller, calls = self.make_controller()
         env = self.start_job(status, controller)
@@ -105,9 +216,10 @@ class ChiefLeaseControllerTests(unittest.TestCase):
 
         self.assertTrue(first["ok"])
         self.assertTrue(second["ok"])
+        self.assertEqual(second["status"], "unchanged")
         self.assertEqual(status.current_cpu, 30)
         self.assertEqual(status.current_mem, 116000)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
 
     def test_parallel_relative_releases_are_atomic(self):
         status, controller, calls = self.make_controller(cpu=16, mem_mb=64000)
@@ -190,6 +302,49 @@ class ChiefLeaseControllerTests(unittest.TestCase):
         self.assertTrue(response["safety"]["adjusted"])
         self.assertEqual(response["held_mem_mb"], 10512)
         self.assertEqual(response["released_mem_mb"], 53488)
+
+    def test_retried_job_id_releases_each_process_attempt_once(self):
+        status, controller, _ = self.make_controller(cpu=16, mem_mb=64000)
+        running_processes = {}
+        first_process = object()
+        second_process = object()
+
+        self.start_job(
+            status, controller, job_id="retry-job", cpu=4, mem_mb=8000
+        )
+        running_processes["retry-job"] = first_process
+        self.assertTrue(
+            zslurm_lease.claim_finished_attempt(
+                running_processes, "retry-job", first_process
+            )
+        )
+        controller.finish_job("retry-job", 4, 8000)
+        self.assertEqual(status.current_cpu, 16)
+        self.assertEqual(status.current_mem, 64000)
+
+        self.start_job(
+            status, controller, job_id="retry-job", cpu=4, mem_mb=16000
+        )
+        running_processes["retry-job"] = second_process
+        self.assertFalse(
+            zslurm_lease.claim_finished_attempt(
+                running_processes, "retry-job", first_process
+            )
+        )
+        self.assertIs(running_processes["retry-job"], second_process)
+        self.assertTrue(
+            zslurm_lease.claim_finished_attempt(
+                running_processes, "retry-job", second_process
+            )
+        )
+        controller.finish_job("retry-job", 4, 16000)
+        self.assertEqual(status.current_cpu, 16)
+        self.assertEqual(status.current_mem, 64000)
+        self.assertFalse(
+            zslurm_lease.claim_finished_attempt(
+                running_processes, "retry-job", second_process
+            )
+        )
 
     def test_growth_waits_fifo_and_raises_admission_barrier(self):
         status, controller, _ = self.make_controller(cpu=16, mem_mb=64000)
@@ -320,6 +475,51 @@ class ChiefLeaseControllerTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["held_cores"], 24)
 
+    def test_unix_socket_backlog_handles_engine_start_bursts(self):
+        self.assertGreaterEqual(
+            zslurm_lease._ThreadingUnixServer.request_queue_size, 128
+        )
+
+    def test_client_retries_transient_connect_failure_before_sending(self):
+        class FakeSocket:
+            def __init__(self, connect_error=None, response=b""):
+                self.connect_error = connect_error
+                self.response = response
+                self.sent = []
+                self.closed = False
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _socket_path):
+                if self.connect_error is not None:
+                    raise self.connect_error
+
+            def sendall(self, payload):
+                self.sent.append(payload)
+
+            def recv(self, _size):
+                response, self.response = self.response, b""
+                return response
+
+            def close(self):
+                self.closed = True
+
+        first = FakeSocket(BlockingIOError(errno.EAGAIN, "backlog full"))
+        second = FakeSocket(response=b'{"ok": true}\n')
+        with mock.patch.object(
+            zslurm_lease.socket, "socket", side_effect=[first, second]
+        ), mock.patch.object(zslurm_lease.time, "sleep"):
+            response = zslurm_lease.send_request(
+                "/tmp/chief.sock", {"action": "status"}, timeout_s=1.0
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(first.closed)
+        self.assertEqual(first.sent, [])
+        self.assertTrue(second.closed)
+        self.assertEqual(len(second.sent), 1)
+
     def test_relative_release_cli_round_trip(self):
         status, controller, _ = self.make_controller()
         env = self.start_job(status, controller)
@@ -359,6 +559,38 @@ class ChiefLeaseControllerTests(unittest.TestCase):
         self.assertEqual(response["held_cores"], 22)
         self.assertEqual(response["held_mem_mb"], 63000)
 
+    def test_phase_cli_round_trip(self):
+        status, controller, _ = self.make_controller()
+        env = self.start_job(status, controller)
+        with tempfile.TemporaryDirectory() as tempdir:
+            socket_path = os.path.join(tempdir, "chief.sock")
+            server = zslurm_lease.LeaseServer(socket_path, controller).start()
+            try:
+                child_env = os.environ.copy()
+                child_env.update(env)
+                child_env[zslurm_lease.ENV_SOCKET] = socket_path
+                process = subprocess.run(
+                    [
+                        str(ROOT / "zslurm_lease"),
+                        "--json",
+                        "phase",
+                        "sort",
+                    ],
+                    cwd=ROOT,
+                    env=child_env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                server.close()
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        response = json.loads(process.stdout)
+        self.assertEqual(response["status"], "phase-changed")
+        self.assertEqual(response["phase_name"], "sort")
+        self.assertEqual(response["phase_index"], 1)
+
 
 class ManagerLeaseAccountingTests(unittest.TestCase):
     @classmethod
@@ -389,7 +621,7 @@ class ManagerLeaseAccountingTests(unittest.TestCase):
         self.jobs.archive_total = 100000
         z.jobs = self.jobs
 
-    def add_job(self, cpu=8, mem_mb=32000):
+    def add_job(self, cpu=8, mem_mb=32000, requeue=0):
         z = self.zslurm
         job = z.Job(
             "lease-job",
@@ -400,7 +632,7 @@ class ManagerLeaseAccountingTests(unittest.TestCase):
             cpu,
             mem_mb,
             3600,
-            0,
+            requeue,
             None,
             0,
             0,
@@ -459,9 +691,110 @@ class ManagerLeaseAccountingTests(unittest.TestCase):
 
         self.assertTrue(first["ok"])
         self.assertTrue(second["ok"])
+        self.assertTrue(first["changed"])
+        self.assertFalse(second["changed"])
+        self.assertEqual(first["epoch"], second["epoch"])
         self.assertFalse(too_large["ok"])
         self.assertEqual(self.engine.res_cpu_reserved, 2)
         self.assertEqual(self.engine.res_mem_reserved_mb, 8000)
+
+    def test_retry_transitions_clear_stale_live_usage(self):
+        job = self.add_job()
+        job.current_cpu_usage = 3.5
+        job.current_mem_usage = 12000
+
+        job.done(1, "failed", "REQUEUED")
+        self.assertEqual(job.current_cpu_usage, 0.0)
+        self.assertEqual(job.current_mem_usage, 0.0)
+
+        job.current_cpu_usage = 2.0
+        job.current_mem_usage = 4000
+        job.assigned("test-node")
+        self.assertEqual(job.current_cpu_usage, 0.0)
+        self.assertEqual(job.current_mem_usage, 0.0)
+
+        job.current_cpu_usage = 1.0
+        job.current_mem_usage = 2000
+        job.started("test-node")
+        self.assertEqual(job.current_cpu_usage, 0.0)
+        self.assertEqual(job.current_mem_usage, 0.0)
+
+    def test_phase_report_row_matches_declared_schema(self):
+        z = self.zslurm
+        phase = {
+            "phase_index": 1,
+            "phase_name": "tail",
+            "event": "set",
+            "transition_id": "request-1",
+            "lease_epoch": 1,
+            "started_at_epoch": 100.0,
+            "ended_at_epoch": 110.0,
+            "requested_cores": 2.0,
+            "requested_mem_mb": 12000.0,
+            "held_cores": 2.0,
+            "held_mem_mb": 12000.0,
+            "duration_s": 10.0,
+            "sample_count": 2,
+            "sampled_duration_s": 10.0,
+            "avg_cpu_cores": 1.0,
+            "avg_pss_mb": 2000.0,
+            "cpu_cores_percentiles": [1.0] * 7,
+            "pss_mb_percentiles": [2000.0] * 7,
+            "reserved_core_seconds": 20.0,
+            "sampled_reserved_core_seconds": 20.0,
+            "used_core_seconds": 10.0,
+            "reserved_mem_mb_seconds": 120000.0,
+            "sampled_reserved_mem_mb_seconds": 120000.0,
+            "pss_mb_seconds": 20000.0,
+            "cpu_efficiency": 0.5,
+            "memory_efficiency": 1.0 / 6.0,
+            "sample_coverage": 1.0,
+        }
+        row = z._phase_report_row("job", "sample", 0, "node", "42", phase)
+        parsed = dict(zip(z.LEASE_PHASE_REPORT_FIELDS, row))
+
+        self.assertEqual(len(row), len(z.LEASE_PHASE_REPORT_FIELDS))
+        self.assertEqual(parsed["phase_name"], "tail")
+        self.assertEqual(parsed["cores_reserved"], "2.0")
+        self.assertEqual(parsed["pss_95"], "2000.0")
+        self.assertEqual(parsed["lease_cpu_efficiency"], "0.5")
+
+    def test_report_files_include_dynamic_summary_and_phase_schema(self):
+        z = self.zslurm
+        with tempfile.TemporaryDirectory() as tempdir:
+            report_prefix = os.path.join(tempdir, "report")
+            phase_prefix = os.path.join(tempdir, "phases")
+            z._open_report_files(
+                {
+                    "reports_file_prefix": report_prefix,
+                    "lease_phase_reports_file_prefix": phase_prefix,
+                    "node_reports_enable": False,
+                }
+            )
+            try:
+                report_path = next(pathlib.Path(tempdir).glob("report-*.tsv"))
+                phase_path = next(pathlib.Path(tempdir).glob("phases-*.tsv"))
+                report_header = report_path.read_text().splitlines()[0].split("\t")
+                phase_header = phase_path.read_text().splitlines()[0].split("\t")
+            finally:
+                z.status.reports_file.close()
+                z.status.phase_reports_file.close()
+                z.status.reports_file = None
+                z.status.phase_reports_file = None
+
+        self.assertIn("lease_reserved_core_seconds", report_header)
+        self.assertIn("lease_memory_efficiency", report_header)
+        self.assertEqual(phase_header, z.LEASE_PHASE_REPORT_FIELDS)
+
+    def test_cancel_with_retry_left_is_removed_from_active_jobs(self):
+        job = self.add_job(requeue=1)
+
+        self.jobs.cancel_job(job.jobid, requeue=False)
+
+        self.assertNotIn(job.jobid, self.jobs.jobs_by_id)
+        self.assertEqual(job.state, "CANCELLED")
+        self.assertEqual(job.requeue, 0)
+        self.assertIn(job, self.jobs.finished_jobs_by_owner[None])
 
 
 class SchedulerPriorityTests(unittest.TestCase):
@@ -560,6 +893,20 @@ class SchedulerPriorityTests(unittest.TestCase):
         assigned = self.dispatch_one()
 
         self.assertEqual(assigned[0][0], low.jobid)
+
+    def test_active_views_exclude_lingering_terminal_jobs(self):
+        pending = self.add_job("1", "pending")
+        cancelled = self.add_job("2", "cancelled")
+        failed = self.add_job("3", "failed")
+        cancelled.state = "CANCELLED"
+        failed.state = "FAILED"
+
+        self.assertEqual(
+            [row[0] for row in self.jobs.list_jobs()], [pending.jobid]
+        )
+        stats = self.jobs.queue_stats()
+        self.assertEqual(stats["states"], {"PENDING": 1})
+        self.assertEqual(stats["total"]["pending"]["jobs"], 1)
 
     def test_priority_applies_to_archive_transfer_queue(self):
         self.engine.partition = "archive"

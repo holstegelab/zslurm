@@ -68,6 +68,41 @@ RC_ENGINE_TERMINATED = -1
 RC_SUCCESS = 0
 RC_TERMINATED = 15
 
+LEASE_JOB_REPORT_FIELDS = [
+    "lease_phase_count",
+    "lease_reserved_core_seconds",
+    "lease_sampled_reserved_core_seconds",
+    "lease_used_core_seconds",
+    "lease_reserved_mem_mb_seconds",
+    "lease_sampled_reserved_mem_mb_seconds",
+    "lease_pss_mb_seconds",
+    "lease_cpu_efficiency",
+    "lease_memory_efficiency",
+    "lease_sample_coverage",
+]
+
+LEASE_PHASE_REPORT_FIELDS = [
+    "jobname", "comment", "retcode", "machine", "jobid",
+    "starttime", "endtime", "phase_index", "phase_name", "event",
+    "transition_id", "lease_epoch", "requested_cores", "requested_mem_mb",
+    "cores_reserved", "mem_reserved_mb", "runtime", "sample_count",
+    "sampled_duration_s", "avg_cpu_percentage", "pss_avg_mb",
+]
+for _prefix in ("cpu_percentage", "pss"):
+    for _percentile in (0, 5, 25, 50, 75, 95, 100):
+        LEASE_PHASE_REPORT_FIELDS.append(f"{_prefix}_{_percentile}")
+LEASE_PHASE_REPORT_FIELDS.extend([
+    "lease_reserved_core_seconds",
+    "lease_sampled_reserved_core_seconds",
+    "lease_used_core_seconds",
+    "lease_reserved_mem_mb_seconds",
+    "lease_sampled_reserved_mem_mb_seconds",
+    "lease_pss_mb_seconds",
+    "lease_cpu_efficiency",
+    "lease_memory_efficiency",
+    "sample_coverage",
+])
+
 WHITE = 0
 RED = 1
 GREEN = 2
@@ -210,6 +245,8 @@ class Status(object):
         self.engine_drain_before_end_enable = True
         self.engine_drain_before_end_sec = 12 * 3600.0
         self.node_reports_file = None
+        self.reports_file = None
+        self.phase_reports_file = None
         self.reports_lock = threading.RLock()
         self.autogrow_plan = None
 
@@ -228,6 +265,68 @@ class Status(object):
 
 
 status = Status()
+
+
+def _tsv_value(value):
+    if value is None:
+        return ""
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _phase_report_row(name, comment, return_code, machine, jobid, phase):
+    cpu_percentiles = list(phase.get("cpu_cores_percentiles", []) or [])
+    pss_percentiles = list(phase.get("pss_mb_percentiles", []) or [])
+    cpu_percentiles += [None] * (7 - len(cpu_percentiles))
+    pss_percentiles += [None] * (7 - len(pss_percentiles))
+
+    def _local_time(epoch):
+        try:
+            return time.strftime(
+                '%b %d %Y %H:%M:%S', time.localtime(float(epoch))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return ""
+
+    values = {
+        "jobname": name,
+        "comment": comment,
+        "retcode": return_code,
+        "machine": machine,
+        "jobid": jobid,
+        "starttime": _local_time(phase.get("started_at_epoch")),
+        "endtime": _local_time(phase.get("ended_at_epoch")),
+        "phase_index": phase.get("phase_index"),
+        "phase_name": phase.get("phase_name"),
+        "event": phase.get("event"),
+        "transition_id": phase.get("transition_id"),
+        "lease_epoch": phase.get("lease_epoch"),
+        "requested_cores": phase.get("requested_cores"),
+        "requested_mem_mb": phase.get("requested_mem_mb"),
+        "cores_reserved": phase.get("held_cores"),
+        "mem_reserved_mb": phase.get("held_mem_mb"),
+        "runtime": phase.get("duration_s"),
+        "sample_count": phase.get("sample_count"),
+        "sampled_duration_s": phase.get("sampled_duration_s"),
+        "avg_cpu_percentage": phase.get("avg_cpu_cores"),
+        "pss_avg_mb": phase.get("avg_pss_mb"),
+        "lease_reserved_core_seconds": phase.get("reserved_core_seconds"),
+        "lease_sampled_reserved_core_seconds": phase.get(
+            "sampled_reserved_core_seconds"
+        ),
+        "lease_used_core_seconds": phase.get("used_core_seconds"),
+        "lease_reserved_mem_mb_seconds": phase.get("reserved_mem_mb_seconds"),
+        "lease_sampled_reserved_mem_mb_seconds": phase.get(
+            "sampled_reserved_mem_mb_seconds"
+        ),
+        "lease_pss_mb_seconds": phase.get("pss_mb_seconds"),
+        "lease_cpu_efficiency": phase.get("cpu_efficiency"),
+        "lease_memory_efficiency": phase.get("memory_efficiency"),
+        "sample_coverage": phase.get("sample_coverage"),
+    }
+    for index, percentile in enumerate((0, 5, 25, 50, 75, 95, 100)):
+        values[f"cpu_percentage_{percentile}"] = cpu_percentiles[index]
+        values[f"pss_{percentile}"] = pss_percentiles[index]
+    return [_tsv_value(values.get(field)) for field in LEASE_PHASE_REPORT_FIELDS]
 
 
 def _cfg_bool(value, default=False):
@@ -391,6 +490,7 @@ def parse_timeleft(time):
 
 
 queue_states = set(["PENDING", "REQUEUED"])
+active_job_states = queue_states | {"ASSIGNED", "RUNNING"}
 DEFAULT_JOB_PRIORITY = 100
 
 DEPENDENCY_ACTIVE_JOB_STATES = queue_states | {"ASSIGNED", "RUNNING"}
@@ -628,6 +728,8 @@ class Job(object):
         if self.first_starttime is None:
             self.first_starttime = self.starttime
         self.state = "RUNNING"
+        self.current_cpu_usage = 0.0
+        self.current_mem_usage = 0.0
         # A requeued job starts with its complete (possibly enlarged) request.
         self.max_ncpu = float(self.ncpu)
         self.max_mem = float(self.mem)
@@ -639,12 +741,17 @@ class Job(object):
     def assigned(self, nodeid):
         self.node_id = nodeid
         self.state = "ASSIGNED"
+        self.current_cpu_usage = 0.0
+        self.current_mem_usage = 0.0
 
     def done(self, return_code, reason, state):
         self.endtime = time.time()
         self.state = state
         self.reason = reason
         self.return_code = return_code
+        if state in queue_states:
+            self.current_cpu_usage = 0.0
+            self.current_mem_usage = 0.0
         if self.node_id:
             engines.job_stopped(self.node_id, self)
         self.node_id = None
@@ -1790,13 +1897,18 @@ class JobManager(object):
             job = None
             if jobid in self.jobs_by_id:
                 job = self.jobs_by_id[jobid]
+                # A normal cancel must be terminal in every state. Without this
+                # reset, PENDING/ASSIGNED jobs with retries left are requeued by
+                # job_done() and then merely relabelled CANCELLED while still
+                # present in jobs_by_id.
+                if not requeue:
+                    job.requeue = 0
                 if job.state == "RUNNING":
                     node_id = job.node_id
                     if requeue:
                         job.requeue = max(job.requeue, 1)
                         job.reason = "Cancelling for restart"
                     else:
-                        job.requeue = 0  # prevent restart
                         job.reason = "Awaiting cancellation at worker node"
 
                     try:
@@ -1818,7 +1930,6 @@ class JobManager(object):
                     except:
                         pass
                     self.job_done(job.jobid, RC_CANCELLED, "Cancelled by user")
-                    job.state = "CANCELLED"
                     
                 elif not requeue:
                     self.job_done(job.jobid, RC_CANCELLED, "Cancelled by user")
@@ -1827,7 +1938,6 @@ class JobManager(object):
                         "Job %s (id: %s) cancelled." % (job.job_name, job.jobid),
                         YELLOW,
                     )
-                    job.state = "CANCELLED"
                     
             else:
                 add_log_line(
@@ -1902,6 +2012,8 @@ class JobManager(object):
         for j in list(self.jobs_by_id.values()):
             part = str(getattr(j, 'partition', 'compute') or 'compute')
             st = str(getattr(j, 'state', ''))
+            if st not in active_job_states:
+                continue
             states[st] = states.get(st, 0) + 1
             try:
                 cores = float(getattr(j, 'ncpu', 0.0))
@@ -1956,6 +2068,8 @@ class JobManager(object):
     def list_jobs(self, owner=None, include_priority=False):
         jobs = []
         for job in list(self.jobs_by_id.values()):
+            if getattr(job, 'state', None) not in active_job_states:
+                continue
             if owner is not None and str(getattr(job, 'owner', None)) != str(owner):
                 continue
             if not job.starttime is None:
@@ -2560,6 +2674,21 @@ class JobManager(object):
 
             old_cpu = float(getattr(job, 'held_ncpu', job.ncpu))
             old_mem_mb = float(getattr(job, 'held_mem', job.mem))
+            if (
+                abs(old_cpu - target_cpu) <= 1e-9
+                and abs(old_mem_mb - target_mem_mb) <= 1e-9
+            ):
+                return {
+                    'ok': True,
+                    'code': 0,
+                    'jobid': key,
+                    'held_cores': old_cpu,
+                    'held_mem_mb': old_mem_mb,
+                    'max_cores': max_cpu,
+                    'max_mem_mb': max_mem_mb,
+                    'epoch': int(getattr(job, 'lease_epoch', 0) or 0),
+                    'changed': False,
+                }
             future_cpu = float(engine.res_cpu_reserved) - old_cpu + target_cpu
             future_mem_mb = (
                 float(engine.res_mem_reserved_mb) - old_mem_mb + target_mem_mb
@@ -2598,6 +2727,7 @@ class JobManager(object):
                 'max_cores': max_cpu,
                 'max_mem_mb': max_mem_mb,
                 'epoch': job.lease_epoch,
+                'changed': True,
             }
         finally:
             self.lock.release()
@@ -2821,8 +2951,33 @@ class JobManager(object):
             ]:
                 line.append(report.get(lab, ""))
             line.append(report.get('memory_over_time',''))
-            status.reports_file.write("\t".join([str(e) for e in line]) + "\n")
-            status.reports_file.flush()
+            for field in LEASE_JOB_REPORT_FIELDS:
+                line.append(report.get(field, ""))
+            phases = report.get("lease_phases", []) or []
+            with status.reports_lock:
+                if status.reports_file is not None:
+                    status.reports_file.write(
+                        "\t".join([_tsv_value(e) for e in line]) + "\n"
+                    )
+                    status.reports_file.flush()
+                if status.phase_reports_file is not None:
+                    for phase in phases:
+                        if not isinstance(phase, dict):
+                            continue
+                        status.phase_reports_file.write(
+                            "\t".join(
+                                _phase_report_row(
+                                    name,
+                                    comment,
+                                    report.get("retcode", return_code),
+                                    myid,
+                                    jobid,
+                                    phase,
+                                )
+                            )
+                            + "\n"
+                        )
+                    status.phase_reports_file.flush()
 
         if return_code == 0:
             runtime = zslurm_shared.format_time(report.get("runtime", 0.0))
@@ -6184,8 +6339,20 @@ def main(scr, *args, **kwds):
             "memory_over_time"
         ]
     )
+    fieldnames.extend(LEASE_JOB_REPORT_FIELDS)
     status.reports_file.write("\t".join(fieldnames) + "\n")
     status.reports_file.flush()
+
+    if bool(config.get("lease_phase_reports_enable", True)):
+        status.phase_reports_file = open(
+            config.get("lease_phase_reports_file_prefix", "lease_phases")
+            + f'-{current_date}.tsv',
+            "w",
+        )
+        status.phase_reports_file.write(
+            "\t".join(LEASE_PHASE_REPORT_FIELDS) + "\n"
+        )
+        status.phase_reports_file.flush()
 
     # Open node usage report file and write header
     try:
@@ -6519,8 +6686,20 @@ def _open_report_files(config):
         "user", "system", "maxrss", "mon_user", "mon_system", "iowait",
         "read_count", "write_count", "read_bytes", "write_bytes", "memory_over_time",
     ])
+    fieldnames.extend(LEASE_JOB_REPORT_FIELDS)
     status.reports_file.write("\t".join(fieldnames) + "\n")
     status.reports_file.flush()
+
+    if bool(config.get("lease_phase_reports_enable", True)):
+        status.phase_reports_file = open(
+            config.get("lease_phase_reports_file_prefix", "lease_phases")
+            + f'-{current_date}.tsv',
+            "w",
+        )
+        status.phase_reports_file.write(
+            "\t".join(LEASE_PHASE_REPORT_FIELDS) + "\n"
+        )
+        status.phase_reports_file.flush()
 
     if bool(config.get("node_reports_enable", True)):
         status.node_reports_file = open(config.get("node_reports_file_prefix", 'node_usage') + f'-{current_date}.tsv', "w")
