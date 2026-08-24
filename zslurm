@@ -61,6 +61,97 @@ DEFAULT_NODE_PROFILES = {
 }
 
 
+def _placement_profile_cost(job_cores, job_mem_mb, profile_cores, profile_mem_mb):
+    """Return the normalized CPU/memory imbalance left on an empty node.
+
+    A result of zero means that the job consumes CPU and memory in exactly the
+    node's native ratio.  ``None`` means that the job cannot fit on the profile.
+    All memory values are in MB; converting memory to core equivalents before
+    comparing it with CPU keeps the score dimensionally consistent.
+    """
+    job_cores = float(job_cores)
+    job_mem_mb = float(job_mem_mb)
+    profile_cores = float(profile_cores)
+    profile_mem_mb = float(profile_mem_mb)
+    if profile_cores <= 0.0 or profile_mem_mb <= 0.0:
+        return None
+    if job_cores > profile_cores or job_mem_mb > profile_mem_mb:
+        return None
+
+    mem_per_core = profile_mem_mb / profile_cores
+    remaining_cores = profile_cores - job_cores
+    remaining_mem_cores = (profile_mem_mb - job_mem_mb) / mem_per_core
+    return abs(remaining_cores - remaining_mem_cores) / profile_cores
+
+
+def _placement_profile_regret(
+        job_cores, job_mem_mb, current_profile_cores,
+        current_profile_mem_mb, eligible_profiles):
+    """Cost of using the current node rather than the best eligible node type."""
+    current_cost = _placement_profile_cost(
+        job_cores, job_mem_mb, current_profile_cores, current_profile_mem_mb)
+    if current_cost is None:
+        return 0.0
+
+    best_cost = current_cost
+    for profile_cores, profile_mem_mb in eligible_profiles:
+        cost = _placement_profile_cost(
+            job_cores, job_mem_mb, profile_cores, profile_mem_mb)
+        if cost is not None:
+            best_cost = min(best_cost, cost)
+    return max(0.0, current_cost - best_cost)
+
+
+def _placement_score(
+        priority, job_cores, job_mem_mb, free_cores, free_mem_mb,
+        node_cores, node_mem_mb, profile_regret=0.0,
+        prefer_local_ssd=False):
+    """Lexicographic score used by the greedy same-priority packer.
+
+    Lower is better.  The fields are: strict pipeline priority, fits the
+    currently free resources, overcommit in core equivalents, regret versus
+    another eligible node type, stranded resources in core equivalents, and a
+    final SSD tie-breaker.  Keeping these concerns as separate tuple fields
+    prevents an arbitrary scalar weight from overriding a more important rule.
+    """
+    job_cores = float(job_cores)
+    job_mem_mb = float(job_mem_mb)
+    free_cores = float(free_cores)
+    free_mem_mb = float(free_mem_mb)
+    node_cores = float(node_cores)
+    node_mem_mb = float(node_mem_mb)
+
+    mem_per_core = (
+        node_mem_mb / node_cores
+        if node_cores > 0.0 and node_mem_mb > 0.0
+        else 1.0
+    )
+    remaining_cores = free_cores - job_cores
+    remaining_mem_mb = free_mem_mb - job_mem_mb
+    epsilon = 1e-9
+    fits_now = (
+        remaining_cores >= -epsilon and remaining_mem_mb >= -epsilon)
+    deficit = (
+        max(-remaining_cores, 0.0)
+        + max(-remaining_mem_mb, 0.0) / mem_per_core
+    )
+    if deficit < epsilon:
+        deficit = 0.0
+    stranded = abs(
+        max(remaining_cores, 0.0)
+        - max(remaining_mem_mb, 0.0) / mem_per_core
+    )
+
+    return (
+        -int(priority),
+        0 if fits_now else 1,
+        deficit,
+        max(0.0, float(profile_regret)),
+        stranded,
+        -1 if prefer_local_ssd else 0,
+    )
+
+
 
 # return codes
 RC_CANCELLED = -255
@@ -201,8 +292,6 @@ class Status(object):
         self.consolidation_want = {}
         self.consolidation_last_action_ts = 0.0
         self.consolidation_last_action_ts_by_part = {}
-        self.ssd_prefer_bonus = 0.25
-        
         self.autogrow_enable = True
         self.autogrow_cooldown_sec = 500.0
         self.autogrow_runtime_default = "5-0:0:0"
@@ -2243,7 +2332,6 @@ class JobManager(object):
             jobs_view_iter = iter(jobs_view)
 
             allres = []
-            average_mem_core = float(totmem) / float(cores)
 
             def _to_float(value, default=0.0):
                 try:
@@ -2279,6 +2367,75 @@ class JobManager(object):
                         return False
                     return True
                 return True
+
+            # Compare a job's CPU/memory shape with the node types that are
+            # actually available to this manager.  This keeps fat nodes free for
+            # memory-heavy jobs without hard-coding hostnames or partitions into
+            # the job scheduler.  Per-candidate SSD filtering happens below.
+            placement_profiles = []
+            for profile_engine in list(engines.engine_by_id.values()):
+                if profile_engine is None:
+                    continue
+                if getattr(profile_engine, 'partition', None) != partition:
+                    continue
+                if getattr(profile_engine, 'stopping', False):
+                    continue
+                if getattr(profile_engine, 'status', None) == PHASING_OUT:
+                    continue
+                if (
+                    getattr(profile_engine, 'cluster_id', None) not in (None, False)
+                    and not getattr(profile_engine, 'managed', True)
+                ):
+                    continue
+                profile_cores = _to_float(
+                    getattr(profile_engine, 'cores', 0.0), 0.0)
+                profile_mem = _to_float(
+                    getattr(profile_engine, 'totmem', 0.0), 0.0)
+                if profile_cores <= 0.0 or profile_mem <= 0.0:
+                    continue
+                placement_profiles.append((
+                    profile_cores,
+                    profile_mem,
+                    bool(getattr(profile_engine, 'has_ssd', False)),
+                    _to_float(
+                        getattr(profile_engine, 'ssd_total_gb', 0.0), 0.0),
+                ))
+
+            current_profile = (
+                float(cores), float(totmem),
+                bool(e is not None and getattr(e, 'has_ssd', False)),
+                _to_float(getattr(e, 'ssd_total_gb', 0.0), 0.0),
+            )
+            if current_profile not in placement_profiles:
+                placement_profiles.append(current_profile)
+
+            profile_regret_cache = {}
+
+            def _profile_regret(job):
+                ssd_use = str(getattr(job, 'ssd_use', 'no') or 'no')
+                ssd_need = max(
+                    0.0, _to_float(getattr(job, 'ssd_gb', 0.0), 0.0))
+                cache_key = (
+                    float(job.ncpu), float(job.mem), ssd_use, ssd_need)
+                if cache_key in profile_regret_cache:
+                    return profile_regret_cache[cache_key]
+
+                eligible_profiles = []
+                for (
+                    profile_cores, profile_mem, profile_has_ssd,
+                    profile_ssd_total,
+                ) in placement_profiles:
+                    if ssd_use == 'required':
+                        if not profile_has_ssd:
+                            continue
+                        if ssd_need > 0.0 and profile_ssd_total < ssd_need:
+                            continue
+                    eligible_profiles.append((profile_cores, profile_mem))
+
+                regret = _placement_profile_regret(
+                    job.ncpu, job.mem, cores, totmem, eligible_profiles)
+                profile_regret_cache[cache_key] = regret
+                return regret
 
             def eligible(job):
                 if job.partition != partition:
@@ -2365,34 +2522,6 @@ class JobManager(object):
                             )
                             and self._dcache_transfer_fits_locked(job_candidate)
                         ) and _ssd_ok(job_candidate, e):
-                            remain_cores = (
-                                current_cpu - job_candidate.ncpu
-                            )  # remain cores after scheduling this job
-                            remain_mem = (
-                                current_mem - job_candidate.mem
-                            )  # remain mem after scheduling this job
-
-                            over_use_penalty = -(
-                                min(remain_cores, 0)
-                                + (
-                                    min(remain_mem / float(average_mem_core), 0)
-                                    / 1024.0
-                                )
-                            )  # penalty for over using cores (equal to n cores not yet available) or over using mem (too much used, in gb).
-                            memory_penalty = abs((max(remain_mem, 0) / max(remain_cores, 1)) - average_mem_core) / 1024.0
-                            # penalty for having memory/core > average after scheduling (in gb)
-                            ssd_bonus = 0.0
-                            try:
-                                if job_candidate.ssd_use == 'possible' and e is not None and getattr(e, 'has_ssd', False):
-                                    cap = _ssd_free_gb(e)
-                                    need = float(getattr(job_candidate, 'ssd_gb', 0.0))
-                                    if need <= 0.0 or cap >= need:
-                                        ssd_bonus = float(getattr(status, 'ssd_prefer_bonus', 0.25))
-                            except Exception:
-                                import traceback
-                                traceback.print_exc()
-                                ssd_bonus = 0.0
-
                             # Pipeline priority is strict. Memory/CPU packing
                             # optimizes only within the same priority band.
                             try:
@@ -2401,9 +2530,21 @@ class JobManager(object):
                                 )
                             except (TypeError, ValueError):
                                 candidate_priority = 0
-                            score = (
-                                -candidate_priority,
-                                memory_penalty + over_use_penalty - ssd_bonus,
+                            prefer_local_ssd = bool(
+                                job_candidate.ssd_use == 'possible'
+                                and e is not None
+                                and getattr(e, 'has_ssd', False)
+                            )
+                            score = _placement_score(
+                                candidate_priority,
+                                job_candidate.ncpu,
+                                job_candidate.mem,
+                                current_cpu,
+                                current_mem,
+                                cores,
+                                totmem,
+                                profile_regret=_profile_regret(job_candidate),
+                                prefer_local_ssd=prefer_local_ssd,
                             )
                             if (best_score is None) or (score < best_score):
                                 best_score = score
