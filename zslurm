@@ -4646,8 +4646,43 @@ def compute_autogrow_plan(all_engines, partition):
     free_ssd_mem_mb = sum(
         max(0.0, float(getattr(e, 'totmem', 0.0) or 0.0) - float(getattr(e, 'res_mem_reserved_mb', 0.0) or 0.0))
         for e in all_engines if e.partition == partition and getattr(e, 'has_ssd', False))
-    ssd_required_cpu = max(0.0, ssd_pend_cpu - free_ssd_cpu)
-    ssd_required_mem_mb = max(0.0, ssd_pend_mem_mb - free_ssd_mem_mb)
+
+    # A scratch-constrained Slurm engine that is already queued will become
+    # usable by ssd_use=required jobs once it starts.  The general residual
+    # below already deducts every queued engine, but the SSD-only residual used
+    # to look solely at running SSD engines.  That made the same scratch demand
+    # pull in fresh engines on every autogrow cycle while earlier allocations
+    # were still waiting in Slurm.  Count only non-held queued allocations whose
+    # recorded constraint really is scratch-node; plain queued engines cannot
+    # satisfy this demand.  Unknown profiles are ignored conservatively.
+    queued_ssd_cpu = 0.0
+    queued_ssd_mem_mb = 0.0
+    for detail in list(getattr(engines, 'queued_engines_detail', []) or []):
+        try:
+            _cid, queued_part, _age, is_scratch = detail
+        except (TypeError, ValueError):
+            continue
+        if not is_scratch:
+            continue
+        prof = status.node_profiles.get(str(queued_part)) or {}
+        if not prof:
+            continue
+        try:
+            queued_cpu = max(0.0, float(prof.get('cores', 0.0) or 0.0))
+            queued_mem_mb = max(
+                0.0, float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
+            )
+        except (TypeError, ValueError):
+            continue
+        queued_ssd_cpu += queued_cpu
+        queued_ssd_mem_mb += queued_mem_mb
+
+    ssd_required_cpu = max(
+        0.0, ssd_pend_cpu - free_ssd_cpu - queued_ssd_cpu
+    )
+    ssd_required_mem_mb = max(
+        0.0, ssd_pend_mem_mb - free_ssd_mem_mb - queued_ssd_mem_mb
+    )
 
     # Free cluster capacity across currently running engines after pending jobs
     free_cpu_total = max(0.0, tot_cpu_cap - res_cpu)
