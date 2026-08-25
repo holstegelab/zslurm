@@ -21,6 +21,7 @@ import json
 import re
 import hashlib
 import subprocess
+import tempfile
 
 
 DEFAULT_INSTANCE_NAME = "zslurm"
@@ -36,6 +37,7 @@ DIE = 2
 CANCEL = 3
 REREGISTER = 4
 DEASSIGN = 5
+MIGRATE_MANAGER = 6
 
 # MODES
 RUNNING = 1
@@ -49,9 +51,25 @@ def read_yaml_config(filename):
 
 
 def write_yaml_config(filename, config):
-    with open(filename, "w", encoding="utf-8") as file:
-        file.write(yaml.dump(config))
-    os.chmod(filename, 0o600)
+    # Instance records are live service-discovery pointers.  A handover changes
+    # their endpoint while clients and queued chiefs may read them, so never
+    # expose a partially-written YAML file.
+    directory = os.path.dirname(os.path.abspath(filename))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".instance-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(yaml.dump(config))
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, filename)
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except Exception:
+            pass
     return read_yaml_config(filename)
 
 
@@ -259,6 +277,21 @@ def remove_instance_from_disk(instance):
     except Exception:
         pass
     return {}
+
+
+def remove_instance_if_manager(instance, manager_uuid):
+    """Remove an instance only while it still belongs to this manager.
+
+    During handover the old instance name becomes an alias for the target.  The
+    source manager's atexit handler must not delete that newly-owned pointer.
+    """
+    if not instance or not manager_uuid:
+        return False
+    current = get_instance_config(instance) or {}
+    if str(current.get("manager_uuid") or "") != str(manager_uuid):
+        return False
+    remove_instance_from_disk(instance)
+    return True
 
 def update_instance_metadata(instance, updates):
     if not updates:

@@ -697,6 +697,27 @@ CLI tools auto-detect instances if there is only one running instance. If there 
 - **Per command**: use `--instance NAME`
 - **Session-wide**: set `ZSLURM_INSTANCE=NAME`
 
+### Explicit manager handover
+
+Handover is always initiated explicitly from a newly started, empty manager;
+ZSlurm does not elect a replacement automatically. Press **Shift-H**, enter the
+old instance name, and type `yes` to confirm. The new manager imports the queue,
+budgets, leases, dependencies, scheduler settings, and Slurm-engine records. The
+old instance name is atomically changed into an alias for the new endpoint, and
+running chiefs reconnect without stopping their child processes.
+
+The target must not contain jobs or engines, and a source with a local/unmanaged
+engine is rejected. Both managers must run a version that supports explicit
+handover. The equivalent gated control command is:
+
+```bash
+zscontrol --instance NEW handover-from OLD --yes
+```
+
+After a successful handover, queued chiefs resolve the alias when they start;
+already-running chiefs receive a migration command and also follow the alias if
+the old manager exits before that command arrives.
+
 ## Output files
 
 ZSlurm writes several useful files in the working directory of the manager or commands:
@@ -1113,8 +1134,9 @@ the interface design and phasing.
 
 - **Headless manager**: `zslurm --headless` runs the RPC servers + controller without the
   curses UI (for unattended/agent operation and testing). Flags: `--no-autogrow`,
-  `--no-autoconsolidate`, `--enable-control`, `--control-token TOKEN`. It prints a one-line
-  JSON banner with the instance endpoint, then runs until SIGTERM.
+  `--no-autoconsolidate`, `--enable-control`, `--control-token TOKEN`, and
+  `--instance-name NAME`. It prints a one-line JSON banner with the instance endpoint,
+  then runs until SIGTERM.
 - **`zsstatus`**: one JSON snapshot an agent polls — health, the three storage budgets,
   scheduler mode, queue, an engine summary, and derived **alarms** (`budget_stall`,
   `no_engines`, `oversized_pending`, `near_oom`).
@@ -1122,7 +1144,7 @@ the interface design and phasing.
   `whatif`, `match`, `forecast` (will a planned DAG fit the budgets?), `jobs`,
   `autogrow-plan`. Gated writes (require `enable_control_rpc` + `control_token`): `budget`,
   `transfer-slots`, `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`, `recompute-inuse`,
-  `grow`/`shrink`.
+  `grow`/`shrink`, and `handover-from OLD --yes`.
 - **`--json`** on `zsqueue` and `zsnodes` emits numeric, schema-versioned rows;
   `zsqueue_stats`/`zsoccupancy`/`zsstats` already have `--json`. Exit-code contract across
   the agent clients: `0` ok, `2` transport/instance failure (retryable), `3` logical

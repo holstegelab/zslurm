@@ -60,11 +60,16 @@ partition = 'compute'
 cluster_managed = True
 keep_logfiles = False
 mem = None
+explicit_instance = None
 
 ARCHIVE_MOUNT_PATH = '/archive'
 
 
-opts, args = getopt.getopt(sys.argv[1:],"a:p:c:m:t:uk",["address=","port=","cpu=","mem=","partition=","unmanaged","keep"])
+opts, args = getopt.getopt(
+    sys.argv[1:], "a:p:c:m:t:i:uk",
+    ["address=", "port=", "cpu=", "mem=", "partition=", "instance=",
+     "unmanaged", "keep"],
+)
 for o, a in opts:
     if o in ('-a', '--address'):
         address = a
@@ -79,6 +84,8 @@ for o, a in opts:
         mem = float(a)
     elif o in ('-t', '--partition'):
         partition = a.strip()
+    elif o in ('-i', '--instance'):
+        explicit_instance = a.strip()
     elif o in ('-u' ,'--unmanaged'):
         cluster_managed=False
     elif o in ('-k', '--keep'):
@@ -446,19 +453,55 @@ def _resolve_instance_for_chief(addr, port_override):
         pass
     return None
 
-inst_name = _resolve_instance_for_chief(address, port)
+inst_name = explicit_instance or _resolve_instance_for_chief(address, port)
 inst_cfg = zslurm_shared.get_instance_config(inst_name) if inst_name else None
 if not inst_cfg:
     sys.stderr.write("zslurm_chief: failed to resolve ZSlurm instance; set ZSLURM_INSTANCE or ensure a single instance exists, or pass -a/-p matching an instance.\n")
     sys.stderr.flush()
     sys.exit(2)
 
-host = address or inst_cfg.get("advertise_host") or inst_cfg.get("bind_host") or "127.0.0.1"
-base_port = int(port) if port is not None else int(inst_cfg.get("base_port", zslurm_shared.port))
+# An explicit logical instance is intentionally authoritative. A queued engine
+# may start after that instance has been handed over to another host/port.
+if explicit_instance:
+    host = inst_cfg.get("advertise_host") or inst_cfg.get("bind_host") or "127.0.0.1"
+    base_port = int(inst_cfg.get("base_port", zslurm_shared.port))
+else:
+    host = address or inst_cfg.get("advertise_host") or inst_cfg.get("bind_host") or "127.0.0.1"
+    base_port = int(port) if port is not None else int(inst_cfg.get("base_port", zslurm_shared.port))
 rpcpath = inst_cfg.get("rpcpath")
 uri = f"http://{host}:{base_port}/{rpcpath}"
 print(" Preparing to register on "+ uri)
 s = zslurm_shared.TimeoutServerProxy(uri, timeout = REQUEST_TIMEOUT, allow_none = True)
+
+
+def register_at_manager(manager_uri):
+    proxy = zslurm_shared.TimeoutServerProxy(
+        str(manager_uri), timeout=REQUEST_TIMEOUT, allow_none=True)
+    engine_id = proxy.register(
+        myip,
+        e_ncpu,
+        e_memtot_buffer,
+        partition,
+        clusterid,
+        ssd_total_gb,
+        ssd_used_gb,
+        inst_name,
+    )
+    if engine_id in (None, 'DENIED'):
+        raise RuntimeError(
+            f"manager registration returned {engine_id!r}")
+    return proxy, engine_id
+
+
+def current_instance_manager_uri(instance_name):
+    config = zslurm_shared.get_instance_config(instance_name) or {}
+    endpoint_host = (
+        config.get('advertise_host') or config.get('bind_host'))
+    endpoint_port = config.get('base_port')
+    endpoint_path = config.get('rpcpath')
+    if not endpoint_host or endpoint_port is None or not endpoint_path:
+        return None
+    return f"http://{endpoint_host}:{int(endpoint_port)}/{endpoint_path}"
 
 
 
@@ -481,7 +524,8 @@ while attempt > 0 :
                 partition,
                 clusterid,
                 ssd_total_gb,
-                ssd_used_gb
+                ssd_used_gb,
+                inst_name,
             )
     except (socket.error, httplib.HTTPException) as serror :
         attempt -= 1
@@ -1076,6 +1120,7 @@ try :
             idle_start = time.time()
         elif not idle:
             idle_start = 0
+        commands = []
         try:
             sys.stderr.write(f"{xtime()} - POLL; INFO: {myid} {cpu_usage:.2f} {e_memtot:.2f} {e_memtot_buffer:.2f} {get_memory_avl():.2f} {mem_usage:.2f} {load:.2f} {sys_cpu_busy:.2f} {sys_iowait:.2f} {mode} {status.current_cpu_usage} {status.current_mem_usage}\n")
             sys.stderr.flush()
@@ -1104,7 +1149,31 @@ try :
             last_seen = time.time()
         except (socket.error, httplib.HTTPException) as serror :
             print('%s - [%s] Caught a socket error for command poll !' % (xtime(), myid))
-            if time.time() - last_seen > PING_TIMEOUT:
+            reconnected = False
+            # The logical instance record is atomically redirected during a
+            # manager handover.  This fallback also covers an old manager that
+            # exits before this chief receives MIGRATE_MANAGER.
+            try:
+                redirected_uri = current_instance_manager_uri(inst_name)
+                if redirected_uri and redirected_uri != uri:
+                    new_proxy, new_id = register_at_manager(redirected_uri)
+                    status.assigned_jobs.clear()
+                    s = new_proxy
+                    myid = new_id
+                    uri = redirected_uri
+                    last_seen = time.time()
+                    reconnected = True
+                    print(
+                        f"[{myid}] Reconnected through instance {inst_name} "
+                        f"to {redirected_uri}."
+                    )
+            except Exception as reconnect_error:
+                sys.stderr.write(
+                    f"{xtime()} - [{myid}] Instance redirect reconnect failed: "
+                    f"{reconnect_error}\n"
+                )
+                sys.stderr.flush()
+            if not reconnected and time.time() - last_seen > PING_TIMEOUT:
                 print('[%s] Timeout triggered!' % myid)
                 mode=zslurm_shared.STOPPING
 
@@ -1139,13 +1208,51 @@ try :
                         partition,
                         clusterid,
                         ssd_total_gb,
-                        ssd_used_gb
+                        ssd_used_gb,
+                        inst_name,
                     )
                 except (socket.error, httplib.HTTPException) as serror :
                     pass
                 if myid == 'DENIED':
                     print(('[%s] Denied reregistration, stopping.' %myid))
                     mode = zslurm_shared.STOPPING
+
+            elif (cmd == zslurm_shared.MIGRATE_MANAGER):
+                target = param if isinstance(param, dict) else {}
+                target_uri = target.get('manager_url')
+                target_instance = target.get('instance')
+                if not target_uri:
+                    sys.stderr.write(
+                        f"{xtime()} - [{myid}] Invalid manager migration payload; "
+                        "remaining on source manager.\n"
+                    )
+                    sys.stderr.flush()
+                    continue
+                print(
+                    f"[{myid}] Migrating manager connection to "
+                    f"{target_instance or target_uri}."
+                )
+                try:
+                    new_proxy, new_id = register_at_manager(target_uri)
+                    # ASSIGNED jobs were deliberately requeued in the imported
+                    # manager snapshot. Running child processes and lease state
+                    # remain untouched and are reconciled by the next target poll.
+                    status.assigned_jobs.clear()
+                    s = new_proxy
+                    myid = new_id
+                    uri = str(target_uri)
+                    inst_name = target_instance or inst_name
+                    last_seen = time.time()
+                    print(
+                        f"[{myid}] Manager migration complete; existing child "
+                        "processes continue running."
+                    )
+                except Exception as migration_error:
+                    sys.stderr.write(
+                        f"{xtime()} - [{myid}] Manager migration failed: "
+                        f"{migration_error}; remaining on source manager.\n"
+                    )
+                    sys.stderr.flush()
 
             else :
                 print("[%s] UNKNOWN COMMAND RECEIVED, EXITING!" %myid)

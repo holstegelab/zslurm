@@ -25,6 +25,7 @@ Subcommands:
   match    PATTERN                                                       dry-run: list matching jobs (read)
   whatif   [--active GB --dcache GB --archive GB]                        budget what-if (read)
   status                                                                 get_status_json (read)
+  handover-from OLD --yes                                                explicitly take over OLD into this instance
 """
 import os
 import sys
@@ -145,6 +146,13 @@ def main():
     sp = sub.add_parser("shrink", help="stop N Slurm engines (prefers queued > idle > oldest)")
     sp.add_argument("n", type=int)
 
+    sp = sub.add_parser(
+        "handover-from",
+        help="explicitly take over an old instance into this empty target",
+    )
+    sp.add_argument("old_instance")
+    sp.add_argument("--yes", action="store_true", help="required confirmation")
+
     args = p.parse_args()
     token = args.token if args.token is not None else os.environ.get("ZSLURM_CONTROL_TOKEN")
     instance = _resolve_instance(args.instance)
@@ -198,6 +206,15 @@ def main():
 
         if args.cmd == "recompute-inuse":
             _finish(proxy.recompute_inuse_from_running(token))
+
+        if args.cmd == "handover-from":
+            if not args.yes:
+                sys.stderr.write(
+                    "zscontrol: handover changes manager ownership; re-run with --yes\n"
+                )
+                _finish({"ok": False, "code": 3,
+                         "error": "handover needs --yes"})
+            _finish(proxy.handover_from(token, args.old_instance))
 
         if args.cmd == "shrink":
             _finish(proxy.shrink(token, int(args.n)))

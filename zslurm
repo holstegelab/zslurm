@@ -40,6 +40,9 @@ except ImportError:
 import argparse
 import json
 import signal
+import copy
+import secrets
+import uuid
 
 mylocal_id = zslurm_shared.short_name(zslurm_shared.get_hostname())
 PHASING_OUT = "PHASING_OUT"
@@ -346,6 +349,20 @@ class Status(object):
         self.config = {}
         self.enable_control_rpc = False
         self.control_token = None
+
+        # Explicit manager-to-manager handover. Instances remain independent;
+        # no manager is ever auto-promoted merely because another exists.
+        self.manager_uuid = str(uuid.uuid4())
+        self.handover_secret = secrets.token_urlsafe(32)
+        self.handover_mode = "ACTIVE"
+        self.handover_source_instance = None
+        self.handover_target = None
+        self.handover_preserve_engines = False
+        self.handover_saved_autogrow = None
+        self.handover_saved_autoconsolidate = None
+        self.handover_expected_cluster_ids = set()
+        self.handover_registered_cluster_ids = set()
+        self.handover_owned_aliases = set()
 
 
     def set_address(self, address, port):
@@ -3201,15 +3218,94 @@ class JobManager(object):
 
 
 jobs = JobManager()
-submit_job = lambda *args: jobs.submit_job(*args)
-cancel_job = lambda *args: jobs.cancel_job(*args)
-list_jobs = lambda *args: jobs.list_jobs(*args)
-list_done_jobs = lambda *args: jobs.list_done_jobs(*args)
-queue_stats = lambda *args: jobs.queue_stats(*args)
-request_jobs = lambda *args: jobs.request_jobs(*args)
-job_finished = lambda *args: jobs.job_finished(*args)
-can_run_assigned_job = lambda *args: jobs.can_run_assigned_job(*args)
-resize_running_job = lambda *args: jobs.resize_running_job(*args)
+
+
+def _handover_committed_source():
+    return getattr(status, 'handover_mode', 'ACTIVE') == 'SOURCE_COMMITTED'
+
+
+def _wait_for_handover_prepare():
+    # A source snapshot is taken while holding jobs.lock. RPCs that entered
+    # after SOURCE_PREPARING must decide their destination only after commit or
+    # rollback; otherwise an in-flight completion could update the old copy.
+    if getattr(status, 'handover_mode', 'ACTIVE') == 'SOURCE_PREPARING':
+        jobs.lock.acquire()
+        jobs.lock.release()
+
+
+def _handover_proxy(worker=False):
+    target = getattr(status, 'handover_target', None) or {}
+    key = 'manager_url' if worker else 'job_url'
+    url = target.get(key)
+    if not url:
+        raise RuntimeError("handover target endpoint is unavailable")
+    return zslurm_shared.TimeoutServerProxy(
+        str(url), timeout=120, allow_none=True)
+
+
+def submit_job(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(False).submit_job(*args)
+    return jobs.submit_job(*args)
+
+
+def cancel_job(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(False).cancel_job(*args)
+    return jobs.cancel_job(*args)
+
+
+def list_jobs(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(False).list_jobs(*args)
+    return jobs.list_jobs(*args)
+
+
+def list_done_jobs(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(False).list_done_jobs(*args)
+    return jobs.list_done_jobs(*args)
+
+
+def queue_stats(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(False).queue_stats(*args)
+    return jobs.queue_stats(*args)
+
+
+def request_jobs(*args):
+    # A chief must process MIGRATE_MANAGER via poll before it may ask the target
+    # for more work. Never start another source-owned child after commit.
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return []
+    return jobs.request_jobs(*args)
+
+
+def job_finished(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(True).job_finished(*args)
+    return jobs.job_finished(*args)
+
+
+def can_run_assigned_job(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return False
+    return jobs.can_run_assigned_job(*args)
+
+
+def resize_running_job(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(True).resize_running_job(*args)
+    return jobs.resize_running_job(*args)
 
 
 # ===========================================================================
@@ -3256,6 +3352,9 @@ def ping():
         "job_dependencies": True,
         "job_dependency_types": sorted(SUPPORTED_DEPENDENCY_TYPES),
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
+        "explicit_handover": True,
+        "handover_mode": str(getattr(status, 'handover_mode', 'ACTIVE')),
+        "manager_uuid": str(getattr(status, 'manager_uuid', '')),
     }
 
 
@@ -3263,7 +3362,21 @@ health = ping  # alias
 
 
 def get_status_json():
-    return jobs.get_status_json()
+    if _handover_committed_source():
+        return _handover_proxy(False).get_status_json()
+    result = jobs.get_status_json()
+    result['handover'] = {
+        'supported': True,
+        'mode': str(getattr(status, 'handover_mode', 'ACTIVE')),
+        'source_instance': getattr(status, 'handover_source_instance', None),
+        'target_instance': (
+            (getattr(status, 'handover_target', None) or {}).get('instance')),
+        'expected_chiefs': len(getattr(
+            status, 'handover_expected_cluster_ids', set()) or set()),
+        'registered_chiefs': len(getattr(
+            status, 'handover_registered_cluster_ids', set()) or set()),
+    }
+    return result
 
 
 def match_jobs(pattern):
@@ -3441,6 +3554,13 @@ def shrink(token=None, n=1):
     return {"ok": True, "requested": n}
 
 
+def rpc_handover_from(token=None, old_instance=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    return initiate_handover(old_instance)
+
+
 class RequestHandler(SimpleXMLRPCRequestHandler):
     def __init__(self, rpc_path):
         rpc_paths = (f"/{rpc_path}",)
@@ -3480,6 +3600,12 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(recompute_inuse_from_running, "recompute_inuse_from_running")
         server.register_function(grow, "grow")
         server.register_function(shrink, "shrink")
+        server.register_function(rpc_handover_from, "handover_from")
+        # Source-side endpoint.  The target's public handover_from RPC calls
+        # this on the old manager.  Target-side callbacks live on the separate
+        # manager RPC server, so this single-threaded job server cannot
+        # deadlock while the source transfers the snapshot back.
+        server.register_function(handover_to, "handover_to")
         add_log_line(gb, f"[job] started on port {port} with rpc path {rpc_path}", GREEN)
         Servers.job_server = server
         server.serve_forever()
@@ -3728,9 +3854,21 @@ class EngineManager(object):
         return self.local_engine_process != None
 
     def _check_cluster_engines(self):
-        cmd = "squeue -h -r --user " + getpass.getuser() + " --name " + status.instance_name + " -O arrayjobid:|,arraytaskid:|,name:|,timeleft:|,statecompact:|,nodelist:|,partition:|,pendingtime:|,feature"
-
-        args = shlex.split(cmd)
+        # After an explicit handover, imported allocations retain the old
+        # Slurm job name.  Query all logical instance names represented by our
+        # placeholders, while still excluding the user's independent managers.
+        instance_names = {str(status.instance_name)}
+        for known_engine in self.engine_by_clusterid.values():
+            known_instance = getattr(known_engine, 'instance', None)
+            if known_instance:
+                instance_names.add(str(known_instance))
+        args = [
+            "squeue", "-h", "-r", "--user", getpass.getuser(),
+            "--name", ",".join(sorted(instance_names)),
+            "-O",
+            "arrayjobid:|,arraytaskid:|,name:|,timeleft:|,statecompact:|,"
+            "nodelist:|,partition:|,pendingtime:|,feature",
+        ]
         try:
             p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output = p.communicate()[0]
@@ -3984,7 +4122,8 @@ class EngineManager(object):
                 chief_path = "zslurm_chief"
                 cmd = (
                     chief_path
-                    + f" -a {status.address} -p {status.port} -c {ncpu} -m {mem} -u"
+                    + f" -a {status.address} -p {status.port} "
+                    + f"--instance {status.instance_name} -c {ncpu} -m {mem} -u"
                 )
                 add_log_line(gb, "Starting local engine using: " + cmd, GREEN)
                 args = shlex.split(cmd)
@@ -4097,6 +4236,7 @@ class EngineManager(object):
                     "slurm_to_zslurm",
                     "-a", str(status.address),
                     "-p", str(status.port),
+                    "--instance", str(status.instance_name),
                     "-t", str(lpartition),
                 ])
                 if cores > 0:
@@ -4350,7 +4490,8 @@ class EngineManager(object):
         partition,
         cluster_jobid,
         ssd_total_gb,
-        ssd_used_gb,      
+        ssd_used_gb,
+        logical_instance=None,
     ):
         self.lock.acquire()
         try:
@@ -4364,6 +4505,13 @@ class EngineManager(object):
             myid = myx
 
             prev = self.engine_by_clusterid.get(cluster_jobid, None) if cluster_jobid not in (None, "", False) else None
+            if (
+                prev is not None
+                and getattr(prev, 'engine_id', None) in self.engine_by_id
+                and self.engine_by_id.get(prev.engine_id) is prev
+            ):
+                # Idempotent re-registration after a lost migration response.
+                myid = prev.engine_id
             if prev is not None:
                 # Reuse placeholder to preserve managed/observed state
                 e = prev
@@ -4371,7 +4519,9 @@ class EngineManager(object):
                 e.cores = cores
                 e.totmem = totmem
                 e.partition = partition
-                e.status = ""
+                if getattr(status, 'handover_mode', '') not in (
+                        'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'):
+                    e.status = ""
             else:
                 e = Engine(myid, cores, totmem, partition)
                 # Capture pre-existing engines as managed on registration; squeue will demote if missing later
@@ -4386,11 +4536,19 @@ class EngineManager(object):
             else:
                 e.cluster_id = cluster_jobid
                 self.engine_by_clusterid[cluster_jobid] = e
+            e.instance = (
+                logical_instance or getattr(e, 'instance', None)
+                or status.instance_name)
 
+            preserve_handover_reservation = bool(
+                prev is not None
+                and getattr(status, 'handover_mode', '') in (
+                    'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'))
             e.has_ssd = False
             e.ssd_total_gb = float(ssd_total_gb)
             e.ssd_used_gb = float(ssd_used_gb)            
-            e.res_ssd_reserved_gb = 0.0
+            if not preserve_handover_reservation:
+                e.res_ssd_reserved_gb = 0.0
             e.has_ssd = e.ssd_total_gb > 0.0
 
             totalgb = totmem / 1024.0
@@ -4663,11 +4821,596 @@ class EngineManager(object):
 
 
 engines = EngineManager()
-unregister = lambda *args: engines.unregister(*args)
-poll = lambda *args: engines.poll(*args)
-register = lambda *args: engines.register(*args)
-list_nodes = lambda *args: engines.list_nodes(*args)
-failed_node = lambda *args: engines.failed_node(*args)
+
+
+def _migration_command_payload():
+    target = copy.deepcopy(getattr(status, 'handover_target', None) or {})
+    # The manager-to-manager secret authorizes state import only and must never
+    # be sent to a chief or exposed through health/status output.
+    target.pop('handover_secret', None)
+    return target
+
+
+def register(*args):
+    myid = engines.register(*args)
+    if getattr(status, 'handover_mode', '') in (
+            'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'):
+        try:
+            cluster_id = str(args[4])
+            status.handover_registered_cluster_ids.add(cluster_id)
+            _maybe_finish_chief_migration()
+        except Exception:
+            pass
+    if _handover_committed_source() and myid not in (None, 'DENIED'):
+        engines.send_command(
+            myid, zslurm_shared.MIGRATE_MANAGER,
+            _migration_command_payload())
+    return myid
+
+
+def unregister(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        return _handover_proxy(True).unregister(*args)
+    return engines.unregister(*args)
+
+
+def poll(*args):
+    _wait_for_handover_prepare()
+    if _handover_committed_source():
+        # Do not let the old controller leak STOP/DEASSIGN/lease commands after
+        # commit.  A chief retries this idempotent migration on every old-server
+        # poll until its target registration succeeds.
+        return [(zslurm_shared.MIGRATE_MANAGER,
+                 _migration_command_payload())]
+    return engines.poll(*args)
+
+
+def list_nodes(*args):
+    if _handover_committed_source():
+        return _handover_proxy(False).list_nodes(*args)
+    return engines.list_nodes(*args)
+
+
+def failed_node(*args):
+    if _handover_committed_source():
+        return _handover_proxy(True).failed_node(*args)
+    return engines.failed_node(*args)
+
+
+HANDOVER_SCHEMA_VERSION = 1
+
+
+def _rpc_safe(value):
+    """Convert manager state to XML-RPC-safe primitives."""
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _rpc_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, deque)):
+        return [_rpc_safe(item) for item in value]
+    try:
+        scalar = value.item()
+        if isinstance(scalar, (bool, int, float, str)):
+            return scalar
+    except Exception:
+        pass
+    return str(value)
+
+
+def _manager_descriptor(instance_name=None, include_secret=False):
+    name = str(instance_name or status.instance_name or "")
+    cfg = zslurm_shared.get_instance_config(name) or {}
+    host = cfg.get('advertise_host') or cfg.get('bind_host') or status.address
+    port = int(cfg.get('base_port', status.port))
+    rpcpath = cfg.get('rpcpath') or (getattr(status, 'config', {}) or {}).get('rpcpath')
+    descriptor = {
+        'instance': name,
+        'manager_uuid': str(cfg.get('manager_uuid') or status.manager_uuid),
+        'advertise_host': str(host),
+        'base_port': port,
+        'rpcpath': str(rpcpath),
+        'manager_url': f"http://{host}:{port}/{rpcpath}",
+        'job_url': f"http://{host}:{port + 1}/{rpcpath}",
+    }
+    if include_secret:
+        descriptor['handover_secret'] = str(
+            cfg.get('handover_secret') or status.handover_secret)
+    return descriptor
+
+
+def _instance_names_owned_by(manager_uuid):
+    owned = []
+    for name in zslurm_shared.get_instance_names():
+        cfg = zslurm_shared.get_instance_config(name) or {}
+        if str(cfg.get('manager_uuid') or '') == str(manager_uuid or ''):
+            owned.append(str(name))
+    return sorted(set(owned))
+
+
+def _snapshot_job(job, requeue_assigned=False):
+    data = copy.deepcopy(getattr(job, '__dict__', {}))
+    if requeue_assigned and data.get('state') == 'ASSIGNED':
+        data['state'] = 'PENDING'
+        data['node_id'] = None
+        data['current_cpu_usage'] = 0.0
+        data['current_mem_usage'] = 0.0
+        data['ssd_alloc_gb'] = 0.0
+    return _rpc_safe(data)
+
+
+def _build_handover_snapshot(
+        handover_id, target_descriptor, autogrow_enable=None,
+        autoconsolidate_enable=None):
+    """Build a consistent source snapshot while caller holds both manager locks."""
+    assigned_jobs = [
+        job for job in jobs.jobs_by_id.values()
+        if getattr(job, 'state', None) == 'ASSIGNED'
+    ]
+    active_inuse = float(jobs.active_inuse)
+    dcache_inuse = float(jobs.dcache_inuse)
+    archive_inuse = float(jobs.archive_inuse)
+    download_inuse = float(jobs.dcache_download_inuse)
+    upload_inuse = float(jobs.dcache_upload_inuse)
+    s3_inuse = float(jobs.s3_download_inuse)
+    for job in assigned_jobs:
+        active_inuse -= float(getattr(job, 'active_start_use_add', 0.0) or 0.0)
+        dcache_inuse -= float(getattr(job, 'dcache_start_use_add', 0.0) or 0.0)
+        archive_inuse -= float(getattr(job, 'archive_start_use_add', 0.0) or 0.0)
+        down, up = jobs._dcache_slot_needs(job)
+        download_inuse -= down
+        upload_inuse -= up
+        s3_inuse -= jobs._s3_download_slot_need(job)
+
+    engine_records = []
+    for cluster_id, engine in engines.engine_by_clusterid.items():
+        if engine is None:
+            continue
+        record = copy.deepcopy(getattr(engine, '__dict__', {}))
+        record['cluster_id'] = cluster_id
+        record['jobs'] = list(getattr(engine, 'jobs', set()) or set())
+        record['pending_commands'] = list(
+            getattr(engine, 'pending_commands', []) or [])
+        engine_records.append(_rpc_safe(record))
+
+    manager_values = {
+        'jobid_counter': int(jobs.jobid_counter),
+        'active_total': float(jobs.active_total),
+        'active_inuse': max(0.0, active_inuse),
+        'dcache_total': float(jobs.dcache_total),
+        'dcache_inuse': max(0.0, dcache_inuse),
+        'archive_total': float(jobs.archive_total),
+        'archive_inuse': max(0.0, archive_inuse),
+        'dcache_download_total': float(jobs.dcache_download_total),
+        'dcache_download_inuse': max(0.0, download_inuse),
+        'dcache_upload_total': float(jobs.dcache_upload_total),
+        'dcache_upload_inuse': max(0.0, upload_inuse),
+        's3_download_total': float(jobs.s3_download_total),
+        's3_download_inuse': max(0.0, s3_inuse),
+        'total_jobs': jobs.total_jobs,
+        'running_jobs': jobs.running_jobs,
+        'failed_jobs': jobs.failed_jobs,
+        'done_jobs': jobs.done_jobs,
+    }
+    scheduler_values = {
+        'lastin_first': bool(status.lastin_first),
+        'prio_fillmem_context': int(status.prio_fillmem_context),
+        'autogrow_enable': bool(
+            status.autogrow_enable
+            if autogrow_enable is None else autogrow_enable),
+        'autoconsolidate_enable': bool(
+            status.autoconsolidate_enable
+            if autoconsolidate_enable is None else autoconsolidate_enable),
+        'autogrow_max_compute_nodes': int(
+            (getattr(status, 'config', {}) or {}).get(
+                'autogrow_max_compute_nodes', 0) or 0),
+    }
+    finished = []
+    for owner, owner_jobs in jobs.finished_jobs_by_owner.items():
+        finished.append({
+            'owner': owner,
+            'jobs': [_snapshot_job(job) for job in owner_jobs],
+        })
+
+    return _rpc_safe({
+        'schema_version': HANDOVER_SCHEMA_VERSION,
+        'handover_id': str(handover_id),
+        'source': _manager_descriptor(status.instance_name, include_secret=False),
+        'source_instance_names': _instance_names_owned_by(status.manager_uuid),
+        'target_manager_uuid': target_descriptor.get('manager_uuid'),
+        'created_at': time.time(),
+        'jobs': [
+            _snapshot_job(job, requeue_assigned=True)
+            for job in jobs.jobs_by_id.values()
+        ],
+        'finished_jobs': finished,
+        'seen_tokens': jobs.seen_tokens,
+        'dependency_history': list(jobs.dependency_history.items()),
+        'manager': manager_values,
+        'scheduler': scheduler_values,
+        'engines': engine_records,
+        'archive_failed_nodes': list(engines.archive_failed_nodes),
+        'held_engine_cids': list(engines.held_engine_cids),
+        'registered_cluster_ids': [
+            str(engine.cluster_id)
+            for engine in engines.engine_by_id.values()
+            if getattr(engine, 'cluster_id', None) not in (None, False, '')
+        ],
+    })
+
+
+def _job_from_handover(data):
+    job = Job.__new__(Job)
+    job.__dict__.update(copy.deepcopy(data or {}))
+    return job
+
+
+def _apply_handover_snapshot(snapshot):
+    """Import a source snapshot into an already-validated empty target."""
+    manager = snapshot.get('manager', {}) or {}
+    scheduler = snapshot.get('scheduler', {}) or {}
+
+    jobs.jobs_by_id = OrderedDict()
+    for data in snapshot.get('jobs', []) or []:
+        job = _job_from_handover(data)
+        jobs.jobs_by_id[str(job.jobid)] = job
+    jobs.finished_jobs_by_owner = {}
+    for owner_record in snapshot.get('finished_jobs', []) or []:
+        owner = owner_record.get('owner')
+        jobs.finished_jobs_by_owner[owner] = [
+            _job_from_handover(data)
+            for data in owner_record.get('jobs', []) or []
+        ]
+    jobs.seen_tokens = dict(snapshot.get('seen_tokens', {}) or {})
+    jobs.dependency_history = OrderedDict(
+        (str(key), value)
+        for key, value in (snapshot.get('dependency_history', []) or [])
+    )
+    jobs.jobid_counter = int(manager.get('jobid_counter', jobs.jobid_counter))
+    for name in (
+        'active_total', 'active_inuse', 'dcache_total', 'dcache_inuse',
+        'archive_total', 'archive_inuse', 'dcache_download_total',
+        'dcache_download_inuse', 'dcache_upload_total',
+        'dcache_upload_inuse', 's3_download_total', 's3_download_inuse',
+    ):
+        if name in manager:
+            setattr(jobs, name, float(manager[name]))
+    for name in ('total_jobs', 'running_jobs', 'failed_jobs', 'done_jobs'):
+        setattr(jobs, name, dict(manager.get(name, {}) or {}))
+    jobs._eligible_cache_ts = 0.0
+
+    engines.engine_by_id = {}
+    engines.engine_by_clusterid = {}
+    for data in snapshot.get('engines', []) or []:
+        record = copy.deepcopy(data or {})
+        cluster_id = record.get('cluster_id')
+        engine = Engine()
+        engine.__dict__.update(record)
+        engine.cluster_id = cluster_id
+        # Keep the Slurm job name under which this allocation was submitted.
+        # The target's own logical instance name differs after handover.
+        engine.instance = (
+            record.get('instance')
+            or (snapshot.get('source', {}) or {}).get('instance')
+            or status.handover_source_instance)
+        engine.jobs = set(record.get('jobs', []) or [])
+        engine.pending_commands = [
+            tuple(command) for command in record.get('pending_commands', []) or []
+        ]
+        engines.engine_by_clusterid[str(cluster_id)] = engine
+    engines.archive_failed_nodes = set(
+        snapshot.get('archive_failed_nodes', []) or [])
+    engines.held_engine_cids = set(snapshot.get('held_engine_cids', []) or [])
+
+    status.lastin_first = bool(scheduler.get(
+        'lastin_first', status.lastin_first))
+    status.prio_fillmem_context = max(1, int(scheduler.get(
+        'prio_fillmem_context', status.prio_fillmem_context)))
+    status.handover_saved_autogrow = bool(scheduler.get(
+        'autogrow_enable', False))
+    status.handover_saved_autoconsolidate = bool(scheduler.get(
+        'autoconsolidate_enable', False))
+    status.handover_expected_cluster_ids = set(
+        str(value)
+        for value in snapshot.get('registered_cluster_ids', []) or [])
+    status.handover_registered_cluster_ids = set()
+    status.handover_owned_aliases = set(
+        str(value)
+        for value in snapshot.get('source_instance_names', []) or [])
+    status.autogrow_enable = False
+    status.autoconsolidate_enable = False
+    if isinstance(getattr(status, 'config', None), dict):
+        status.config['autogrow_max_compute_nodes'] = int(scheduler.get(
+            'autogrow_max_compute_nodes',
+            status.config.get('autogrow_max_compute_nodes', 0)) or 0)
+
+
+def receive_handover(secret, handover_id, snapshot):
+    """Target-side import called by the explicitly selected source manager."""
+    if not secrets.compare_digest(
+            str(secret or ''), str(status.handover_secret or '')):
+        return {'ok': False, 'code': 3, 'error': 'invalid handover secret'}
+    if int(snapshot.get('schema_version', -1)) != HANDOVER_SCHEMA_VERSION:
+        return {'ok': False, 'code': 3, 'error': 'incompatible handover schema'}
+    if str(snapshot.get('target_manager_uuid') or '') != str(status.manager_uuid):
+        return {'ok': False, 'code': 3, 'error': 'snapshot targets another manager'}
+    if getattr(status, 'handover_mode', 'ACTIVE') != 'ACTIVE':
+        return {'ok': False, 'code': 3,
+                'error': f"target is in handover state {status.handover_mode}"}
+
+    jobs.lock.acquire()
+    engines.lock.acquire()
+    try:
+        if (jobs.jobs_by_id or jobs.finished_jobs_by_owner
+                or engines.engine_by_id or engines.engine_by_clusterid):
+            return {'ok': False, 'code': 3,
+                    'error': 'target manager is not empty'}
+        status.handover_mode = 'TARGET_IMPORTED'
+        status.handover_source_instance = (
+            snapshot.get('source', {}) or {}).get('instance')
+        _apply_handover_snapshot(snapshot)
+    finally:
+        engines.lock.release()
+        jobs.lock.release()
+    add_log_line(
+        gb,
+        f"Handover {handover_id}: imported {len(jobs.jobs_by_id)} active jobs "
+        f"from {status.handover_source_instance}.",
+        CYAN,
+    )
+    return {
+        'ok': True,
+        'handover_id': str(handover_id),
+        'jobs': len(jobs.jobs_by_id),
+        'engines': len(engines.engine_by_clusterid),
+    }
+
+
+def activate_received_handover(secret, handover_id):
+    if not secrets.compare_digest(
+            str(secret or ''), str(status.handover_secret or '')):
+        return {'ok': False, 'code': 3, 'error': 'invalid handover secret'}
+    if getattr(status, 'handover_mode', '') not in (
+            'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'):
+        return {'ok': False, 'code': 3,
+                'error': f"target is in handover state {status.handover_mode}"}
+    if status.handover_mode != 'TARGET_ACTIVE':
+        status.handover_mode = 'TARGET_MIGRATING'
+    # Source ownership is committed before this call. Scheduling controls may
+    # resume now; chief registration completion is tracked independently and
+    # must not leave throughput disabled when a chief disappears mid-handover.
+    status.autogrow_enable = bool(status.handover_saved_autogrow)
+    status.autoconsolidate_enable = bool(
+        status.handover_saved_autoconsolidate)
+    _maybe_finish_chief_migration()
+    remaining = sorted(
+        status.handover_expected_cluster_ids
+        - status.handover_registered_cluster_ids)
+    add_log_line(
+        gb,
+        f"Handover {handover_id}: target imported; waiting for "
+        f"{len(remaining)} chief migration(s).",
+        GREEN if not remaining else YELLOW,
+    )
+    return {
+        'ok': True,
+        'handover_id': str(handover_id),
+        'remaining_chiefs': len(remaining),
+    }
+
+
+def _maybe_finish_chief_migration():
+    expected = set(getattr(status, 'handover_expected_cluster_ids', set()) or set())
+    registered = set(
+        getattr(status, 'handover_registered_cluster_ids', set()) or set())
+    if expected - registered:
+        return False
+    if getattr(status, 'handover_mode', '') in (
+            'TARGET_IMPORTED', 'TARGET_MIGRATING'):
+        status.handover_mode = 'TARGET_ACTIVE'
+        status.autogrow_enable = bool(status.handover_saved_autogrow)
+        status.autoconsolidate_enable = bool(
+            status.handover_saved_autoconsolidate)
+    return True
+
+
+def abort_received_handover(secret, handover_id):
+    global jobs, engines
+    if not secrets.compare_digest(
+            str(secret or ''), str(status.handover_secret or '')):
+        return {'ok': False, 'code': 3, 'error': 'invalid handover secret'}
+    if getattr(status, 'handover_mode', '') != 'TARGET_IMPORTED':
+        return {'ok': False, 'code': 3,
+                'error': f"target is in handover state {status.handover_mode}"}
+    jobs = JobManager()
+    jobs.configure_transfer_limits(getattr(status, 'config', {}) or {})
+    engines = EngineManager()
+    status.handover_mode = 'ACTIVE'
+    status.handover_source_instance = None
+    status.handover_owned_aliases = set()
+    status.handover_expected_cluster_ids = set()
+    status.handover_registered_cluster_ids = set()
+    status.autogrow_enable = False
+    status.autoconsolidate_enable = False
+    add_log_line(gb, f"Handover {handover_id}: target import rolled back.", YELLOW)
+    return {'ok': True, 'handover_id': str(handover_id)}
+
+
+def handover_to(secret, target_descriptor):
+    """Source-side transaction requested by a specifically named new manager."""
+    if not secrets.compare_digest(
+            str(secret or ''), str(status.handover_secret or '')):
+        return {'ok': False, 'code': 3, 'error': 'invalid handover secret'}
+    previous_mode = getattr(status, 'handover_mode', 'ACTIVE')
+    if previous_mode not in ('ACTIVE', 'TARGET_ACTIVE', 'TARGET_MIGRATING'):
+        return {'ok': False, 'code': 3,
+                'error': f"source is in handover state {status.handover_mode}"}
+    if str(target_descriptor.get('manager_uuid') or '') == str(status.manager_uuid):
+        return {'ok': False, 'code': 3, 'error': 'cannot hand over to self'}
+    required = ('instance', 'manager_uuid', 'manager_url', 'job_url',
+                'advertise_host', 'base_port', 'rpcpath', 'handover_secret')
+    missing = [key for key in required if not target_descriptor.get(key)]
+    if missing:
+        return {'ok': False, 'code': 3,
+                'error': 'target descriptor misses ' + ', '.join(missing)}
+
+    local_engines = [
+        engine.engine_id for engine in engines.engine_by_id.values()
+        if getattr(engine, 'cluster_id', None) in (None, False, '')
+    ]
+    if local_engines:
+        return {'ok': False, 'code': 3,
+                'error': 'local/unmanaged engines cannot be handed over: '
+                         + ', '.join(local_engines)}
+
+    handover_id = str(uuid.uuid4())
+    previous_autogrow = bool(status.autogrow_enable)
+    previous_consolidate = bool(status.autoconsolidate_enable)
+    status.handover_mode = 'SOURCE_PREPARING'
+    status.autogrow_enable = False
+    status.autoconsolidate_enable = False
+
+    # handover_to itself runs on the source job RPC.  Call back on the target's
+    # manager RPC, not its job RPC: handover may have been initiated through
+    # the latter and SimpleXMLRPCServer handles one request at a time.
+    target_proxy = zslurm_shared.TimeoutServerProxy(
+        str(target_descriptor['manager_url']), timeout=300, allow_none=True)
+    imported = False
+    replaced_instance_configs = {}
+    jobs.lock.acquire()
+    engines.lock.acquire()
+    try:
+        snapshot = _build_handover_snapshot(
+            handover_id,
+            target_descriptor,
+            autogrow_enable=previous_autogrow,
+            autoconsolidate_enable=previous_consolidate,
+        )
+        result = target_proxy.receive_handover(
+            str(target_descriptor['handover_secret']), handover_id, snapshot)
+        if not isinstance(result, dict) or not result.get('ok'):
+            error = (result or {}).get('error', 'target rejected snapshot') \
+                if isinstance(result, dict) else 'invalid target response'
+            raise RuntimeError(str(error))
+        imported = True
+
+        # Redirect the source's primary name and any aliases inherited through
+        # an earlier handover. Keep originals so a filesystem error can roll
+        # the records back together with the target snapshot.
+        source_names = list(snapshot.get('source_instance_names', []) or [])
+        if status.instance_name not in source_names:
+            source_names.append(status.instance_name)
+        for source_name in source_names:
+            current = zslurm_shared.get_instance_config(source_name) or {}
+            if str(current.get('manager_uuid') or '') != str(status.manager_uuid):
+                continue
+            replaced_instance_configs[source_name] = current
+            alias_config = {
+                'name': str(source_name),
+                'bind_host': str(target_descriptor['advertise_host']),
+                'advertise_host': str(target_descriptor['advertise_host']),
+                'base_port': int(target_descriptor['base_port']),
+                'rpcpath': str(target_descriptor['rpcpath']),
+                'manager_uuid': str(target_descriptor['manager_uuid']),
+                'handover_secret': str(target_descriptor['handover_secret']),
+                'handover_state': 'ALIAS',
+                'alias_of': str(target_descriptor['instance']),
+            }
+            zslurm_shared.set_instance_config(source_name, alias_config)
+        if status.instance_name not in replaced_instance_configs:
+            raise RuntimeError('source instance ownership changed during handover')
+
+        status.handover_target = copy.deepcopy(target_descriptor)
+        status.handover_mode = 'SOURCE_COMMITTED'
+        status.handover_preserve_engines = True
+        payload = _migration_command_payload()
+        for engine in engines.engine_by_id.values():
+            # Existing commands were imported with the engine placeholder and
+            # will be delivered by the target after registration. The source
+            # may now issue only the migration itself.
+            engine.pending_commands = [
+                (zslurm_shared.MIGRATE_MANAGER, copy.deepcopy(payload))]
+    except Exception as error:
+        for source_name, original in replaced_instance_configs.items():
+            try:
+                zslurm_shared.set_instance_config(source_name, original)
+            except Exception:
+                pass
+        status.handover_mode = previous_mode
+        status.autogrow_enable = previous_autogrow
+        status.autoconsolidate_enable = previous_consolidate
+        if imported:
+            try:
+                target_proxy.abort_received_handover(
+                    str(target_descriptor['handover_secret']), handover_id)
+            except Exception:
+                pass
+        add_log_line(gb, f"Handover {handover_id} failed: {error}", RED)
+        return {'ok': False, 'code': 3, 'error': str(error),
+                'handover_id': handover_id}
+    finally:
+        engines.lock.release()
+        jobs.lock.release()
+
+    try:
+        activation = target_proxy.activate_received_handover(
+            str(target_descriptor['handover_secret']), handover_id)
+    except Exception as error:
+        activation = {
+            'ok': False,
+            'code': 2,
+            'error': f'target activation response was lost: {error}',
+        }
+    if not isinstance(activation, dict) or not activation.get('ok'):
+        add_log_line(
+            gb,
+            f"Handover {handover_id}: state transferred, but target activation "
+            f"needs attention: {activation}",
+            RED,
+        )
+    add_log_line(
+        gb,
+        f"Handover {handover_id}: transferred to "
+        f"{target_descriptor['instance']}; {len(engines.engine_by_id)} chiefs "
+        f"have been instructed to migrate.",
+        GREEN,
+    )
+    return {
+        'ok': True,
+        'handover_id': handover_id,
+        'source_instance': status.instance_name,
+        'target_instance': target_descriptor['instance'],
+        'jobs': len(jobs.jobs_by_id),
+        'chiefs': len(engines.engine_by_id),
+        'target_activation': activation,
+    }
+
+
+def initiate_handover(old_instance):
+    """Target-side entry point used by Shift-H and the control RPC."""
+    old_name = str(old_instance or '').strip()
+    if not old_name:
+        return {'ok': False, 'code': 3, 'error': 'old instance name is empty'}
+    if old_name == str(status.instance_name):
+        return {'ok': False, 'code': 3, 'error': 'cannot hand over from self'}
+    if jobs.jobs_by_id or jobs.finished_jobs_by_owner \
+            or engines.engine_by_id or engines.engine_by_clusterid:
+        return {'ok': False, 'code': 3, 'error': 'new target manager is not empty'}
+    old_cfg = zslurm_shared.get_instance_config(old_name) or {}
+    old_secret = old_cfg.get('handover_secret')
+    if not old_secret:
+        return {'ok': False, 'code': 3,
+                'error': 'old instance does not support explicit handover'}
+    try:
+        source_proxy = zslurm_shared.TimeoutServerProxy(
+            zslurm_shared.get_job_url(instance=old_name),
+            timeout=300, allow_none=True)
+        return source_proxy.handover_to(
+            str(old_secret), _manager_descriptor(
+                status.instance_name, include_secret=True))
+    except Exception as error:
+        return {'ok': False, 'code': 2,
+                'error': f"could not contact old instance {old_name}: {error}"}
 
 
 def compute_autogrow_plan(all_engines, partition):    
@@ -5123,6 +5866,12 @@ def thread_check_commands():
     
 
     while 1:
+        if _handover_committed_source():
+            # Ownership has moved. Keep only the RPC forwarding shell alive;
+            # timeout/consolidation/autogrow actions here could otherwise
+            # cancel allocations that are already managed by the target.
+            time.sleep(5)
+            continue
         engines.lock.acquire()
         try:
             engines._check_cluster_engines()
@@ -5597,6 +6346,13 @@ def thread_start_manager_server(port, rpc_path):
     server.register_function(job_finished, "job_finished")
     server.register_function(can_run_assigned_job, "can_run_assigned_job")
     server.register_function(resize_running_job, "resize_running_job")
+    # Target-side manager-to-manager handover callbacks.  These authenticate
+    # with the per-instance secret stored in the mode-0600 instance record.
+    server.register_function(receive_handover, "receive_handover")
+    server.register_function(
+        activate_received_handover, "activate_received_handover")
+    server.register_function(
+        abort_received_handover, "abort_received_handover")
 
     Servers.manager_server = server
     add_log_line(gb, f"[manager] started on port {port} with rpc path {rpc_path}", GREEN)
@@ -6323,6 +7079,7 @@ def init_commands(gb):
             gb.wcom.addstr(10, 1, "Set memory optimization job search window: m")
             gb.wcom.addstr(11, 1, "Toggle autogrow: g")
             gb.wcom.addstr(12, 1, "Shutdown: q")
+            gb.wcom.addstr(13, 1, "Take over old instance: Shift-H")
             gb.wcom.addstr(inst_row, 1, "Instance:")
             gb.wcom.refresh()
     except Exception as e:
@@ -6362,6 +7119,12 @@ def render_control_status(gb, status):
             draw_right(10, str(val), GREEN)
             col = GREEN if getattr(status, 'autogrow_enable', True) else YELLOW
             draw_right(11, ("ON" if status.autogrow_enable else "OFF"), col)
+            handover_mode = str(getattr(status, 'handover_mode', 'ACTIVE'))
+            draw_right(
+                13,
+                handover_mode,
+                GREEN if handover_mode in ('ACTIVE', 'TARGET_ACTIVE') else YELLOW,
+            )
             try:
                 inst_row = max(1, min(rows - 2, 18))
                 inst_name = str(getattr(status, 'instance_name', '') or '-')
@@ -6506,14 +7269,20 @@ def _cleanup_unreachable_instances():
             traceback.print_exc()
 
 
-def _ensure_unique_instance(address):
+def _ensure_unique_instance(address, requested_name=None):
     #ensure instance name does not exist yet
-    instance_name = f'zslurm_{address}'
+    instance_name = str(requested_name or f'zslurm_{address}').strip()
+    if not instance_name:
+        instance_name = f'zslurm_{address}'
+    if not re.match(r'^[A-Za-z0-9_.-]+$', instance_name):
+        raise ValueError(
+            "instance name may contain only letters, digits, '.', '_' and '-'")
+    base_instance_name = instance_name
     pos = 0
     active = zslurm_shared.get_instance_names()
     while instance_name in active:
         pos += 1
-        instance_name = f"zslurm_{address}_{pos}"
+        instance_name = f"{base_instance_name}_{pos}"
         
     base_port = zslurm_shared.port
 
@@ -6522,9 +7291,20 @@ def _ensure_unique_instance(address):
         "bind_host": address,
         "advertise_host": address,
         "base_port": free_port,
+        "manager_uuid": status.manager_uuid,
+        "handover_secret": status.handover_secret,
+        "handover_state": "ACTIVE",
     })
 
     return instance_name
+
+
+def _remove_owned_instance_records():
+    names = set(getattr(status, 'handover_owned_aliases', set()) or set())
+    if status.instance_name:
+        names.add(str(status.instance_name))
+    for name in names:
+        zslurm_shared.remove_instance_if_manager(name, status.manager_uuid)
 
 
 def main(scr, *args, **kwds):
@@ -6544,8 +7324,7 @@ def main(scr, *args, **kwds):
 
     def _remove_own_instance():
         try:
-            if status.instance_name:
-                zslurm_shared.remove_instance(status.instance_name)
+            _remove_owned_instance_records()
         except Exception as ex:
             try:
                 sys.stderr.write(f"Failed to remove instance file for '{instance_name}' on exit: {ex}\n")
@@ -6697,7 +7476,14 @@ def main(scr, *args, **kwds):
                 except Exception:
                     pass
             elif c == ord("q"):  # QUIT
-                if engines.check_local_engine() or engines.count_cluster_engines() > 0:
+                preserve = bool(getattr(
+                    status, 'handover_preserve_engines', False))
+                if preserve:
+                    ans = enter_command(
+                        gb,
+                        "Handover complete; quit without stopping engines? (yes/no): ",
+                    )
+                elif engines.check_local_engine() or engines.count_cluster_engines() > 0:
                     ans = enter_command(
                         gb, "Are you SURE? Engines are STOPPED! (yes/no): "
                     )
@@ -6705,8 +7491,10 @@ def main(scr, *args, **kwds):
                     ans = enter_command(gb, "Are you sure? (yes/no): ")
                 if ans == "yes":
                     if (
-                        engines.check_local_engine()
+                        not preserve
+                        and (engines.check_local_engine()
                         or engines.count_cluster_engines() > 0
+                        )
                     ):
                         engines.stop_all()
                     stop_status_display(status, t)
@@ -6922,6 +7710,43 @@ def main(scr, *args, **kwds):
                     render_control_status(gb, status)
                 except Exception:
                     pass
+            elif c == ord("H"):
+                old_instance = enter_command(
+                    gb, "Old ZSlurm instance to take over: ")
+                old_instance = str(old_instance or '').strip()
+                if old_instance:
+                    confirm = enter_command(
+                        gb,
+                        f"Take over {old_instance} into "
+                        f"{status.instance_name}? Type yes: ",
+                    )
+                    if str(confirm or '').strip().lower() == 'yes':
+                        set_status_message(
+                            gb, f"Taking over {old_instance}...", YELLOW)
+                        result = initiate_handover(old_instance)
+                        if result.get('ok'):
+                            add_log_line(
+                                gb,
+                                f"Handover complete: {old_instance} -> "
+                                f"{status.instance_name}; jobs={result.get('jobs', 0)}, "
+                                f"chiefs={result.get('chiefs', 0)}.",
+                                GREEN,
+                            )
+                            set_status_message(
+                                gb, f"Took over {old_instance}", GREEN)
+                        else:
+                            add_log_line(
+                                gb,
+                                f"Handover from {old_instance} rejected: "
+                                f"{result.get('error', 'unknown error')}",
+                                RED,
+                            )
+                            set_status_message(
+                                gb, "Handover failed; see log", RED)
+                        try:
+                            render_control_status(gb, status)
+                        except Exception:
+                            pass
             elif c == ord("o"):
                 cmd = enter_command(gb, "Enter name or [archive|compute] +/-nr:")
                 r = engines.toggle_phasing_out(cmd)
@@ -6932,7 +7757,8 @@ def main(scr, *args, **kwds):
     except Exception:
         add_log_line(gb, "EXCEPTION!!! EMERGENCY SHUTDOWN IN PROGRESS!", RED)
         try:
-            engines.stop_all()
+            if not getattr(status, 'handover_preserve_engines', False):
+                engines.stop_all()
             stop_status_display(status, t)
         except Exception:
             pass
@@ -6995,7 +7821,8 @@ def main_headless(args):
     its window writes when gb.wlog is None, so logging goes to cluster.log only."""
     _cleanup_unreachable_instances()
     address = zslurm_shared.get_hostname()
-    instance_name = _ensure_unique_instance(address)
+    instance_name = _ensure_unique_instance(
+        address, getattr(args, 'instance_name', None))
     config = zslurm_shared.get_config(instance=instance_name)
 
     status.instance_name = instance_name
@@ -7019,8 +7846,7 @@ def main_headless(args):
 
     def _remove_own_instance():
         try:
-            if status.instance_name:
-                zslurm_shared.remove_instance(status.instance_name)
+            _remove_owned_instance_records()
         except Exception:
             pass
     atexit.register(_remove_own_instance)
@@ -7077,7 +7903,8 @@ def main_headless(args):
             pass
     finally:
         try:
-            engines.stop_all()
+            if not getattr(status, 'handover_preserve_engines', False):
+                engines.stop_all()
         except Exception:
             pass
         add_log_line(gb, "[manager] headless shutdown complete", YELLOW)
@@ -7099,6 +7926,9 @@ def _cli_main():
                              "(set_budgets / set_scheduler_mode / set_autogrow / prioritize)")
     parser.add_argument("--control-token", default=None,
                         help="(headless) require this token for control RPCs (implies --enable-control)")
+    parser.add_argument("--instance-name", default=None,
+                        help="(headless) requested logical instance name; a numeric "
+                             "suffix is added if it already exists")
     args, _unknown = parser.parse_known_args()
     if args.headless:
         main_headless(args)
