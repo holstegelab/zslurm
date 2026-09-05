@@ -9,7 +9,6 @@ else:
 
 import copy
 import socket
-from dns import resolver, reversename
 import time
 import yaml
 import socket
