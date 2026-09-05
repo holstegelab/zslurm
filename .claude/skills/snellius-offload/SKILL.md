@@ -57,7 +57,10 @@ zsoffload submit -J align -c 8 --mem 16000 -t 2:0:0 --key align-sampleA \
     -- /path/to/align_sampleA.sh
 
 # 2. POLL — one JSON blob: manager health, your leases, pending/running, alarms.
-#    Poll no faster than every ~15s.
+#    Poll no faster than every ~15s. NEVER block synchronously: return control
+#    between polls, emit a heartbeat, and bail after a sane max-wait. A job stuck
+#    "running" implausibly long, or a status that stops changing, is a FAILURE to
+#    report — not something to wait on (a silent multi-poll stall is the bug).
 zsoffload status
 
 # 3. RELEASE — drop your lease when your jobs are terminal (frees the manager to
@@ -176,9 +179,46 @@ work in flight, so crashed-agent leases and finished self-managers get cleaned u
   `zsstatus`/`zscontrol`): the **`snellius-zslurm`** skill.
 - Worked transcripts: [`examples.md`](examples.md).
 
+## Get pinged when a job finishes/fails — `zswatch` (fire-and-forget)
+
+Instead of re-polling `zsoffload status` yourself turn after turn, arm the background watchdog
+[`scripts/zswatch.sh`](scripts/zswatch.sh) once, right after submitting. Run it under the harness
+`Bash(run_in_background: true)` so it does NOT block you — when the job reaches a terminal state the
+script EXITS, which re-invokes you with a single notification. It watches TWO signals so it never goes
+silent on a death the log never records:
+- the LOG, every ~15s, for a success marker OR a crash signature (Traceback / Killed / OOM / Error / …);
+- the JOB STATE via `zsqueue`, every ~2 min — the authoritative catch for SIGKILL / OOM / node-fail /
+  cancelled-while-pending (fires on a terminal state, or once the job leaves the queue after being seen).
+
+```
+scripts/zswatch.sh <jobid> <logfile> ["success_regex"] [max_minutes]
+# e.g. zswatch.sh 248444 /scratch-shared/.../run.log "PART-I TOTAL|DONE" 90
+```
+
+It runs `zsqueue` via its SOURCE script under the clustersnake python
+(`$CS ~/projects/cluster_manager/zsqueue`) because the `zsqueue` console-script shebang points at a dead
+conda (override with `$ZSWATCH_PY` / `$ZSWATCH_ZSQUEUE`). Always pass a `success_regex` matching YOUR
+job's done-line, and keep the crash alternation wide — a watchdog that greps only for success stays
+silent through a crashloop (silence != success).
+
+## Failure modes (learned — see `LESSONS.md`)
+
+- **Silent hang (the big one):** never block synchronously on an offloaded job. Poll +
+  return + heartbeat + bail after a max-wait; a multi-poll stall with no failure signal
+  is a bug, not progress (a build offload once hung ~3¼ h this way while the job itself
+  finished fine).
+- **Offloading a conda env build:** verify against the TARGET env's package versions and
+  install lab/legacy packages from their maintained source (e.g. ibidas →
+  `pip install git+https://github.com/mhulsman/ibidas3`, NumPy-2.0 compatible) — do NOT
+  blind-copy an egg from another env across a NumPy major (`np.unicode_` is gone in
+  NumPy 2.0). For rpy2/R envs, add `etc/conda/activate.d/zz_r_home.sh` exporting
+  `R_HOME=$PREFIX/lib/R`, else rpy2 can't find R on a bare `$env/bin/python` call.
+
 ## SAFETY RAILS (MUST / NEVER)
 
 - **NEVER** run heavy/long work directly on the login node — offload it.
+- **NEVER block synchronously on a job** — poll, return between polls, heartbeat, and
+  bail after a sane max-wait. Report a stalled job; never wait on it indefinitely.
 - **NEVER** stop, kill, or `down` a manager you did not provision (the human's
   especially). Releasing your lease is how you "let go".
 - **`up --provision node/login` is the ONLY command that spends SBU.** `submit`,
