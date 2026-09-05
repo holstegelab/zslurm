@@ -17,7 +17,9 @@ login node at the same time. They must:
 
 Design (pure stdlib; no third-party deps so it imports anywhere)
 ----------------------------------------------------------------
-State lives under ~/.zslurm/ (shared home, visible from every login/compute node):
+State normally lives under ~/.zslurm/ (shared home, visible from every
+login/compute node).  On legacy installations where ~/.zslurm is a YAML file,
+runtime state lives under ~/.zslurm.d/ instead:
 
   manager.lock        flock mutex, held only for the short start/stop/scale
                       critical sections (cluster-coherent on GPFS).
@@ -54,10 +56,14 @@ import time
 # --------------------------------------------------------------------------- #
 # Paths
 # --------------------------------------------------------------------------- #
-# Fixed at ~/.zslurm to MATCH zslurm_shared (which hardcodes it and ignores any
-# env override). Honoring a $ZSLURM_HOME here but not there would make a node
-# manager register its instance YAML where the coordinator never looks.
-STATE_DIR   = os.path.expanduser("~/.zslurm")
+# Match zslurm_shared's compatibility layout without importing it here (this
+# coordination module intentionally remains usable with only the stdlib).
+LEGACY_CONFIG_PATH = os.path.expanduser("~/.zslurm")
+STATE_DIR = (
+    LEGACY_CONFIG_PATH + ".d"
+    if os.path.isfile(LEGACY_CONFIG_PATH)
+    else LEGACY_CONFIG_PATH
+)
 INSTANCES   = os.path.join(STATE_DIR, "instances")
 LEASE_DIR   = os.path.join(STATE_DIR, "leases")
 SUBMIT_DIR  = os.path.join(STATE_DIR, "submits")

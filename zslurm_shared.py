@@ -24,9 +24,38 @@ import tempfile
 
 
 DEFAULT_INSTANCE_NAME = "zslurm"
-CONFIG_HOME = os.path.expanduser("~/.zslurm")
-INSTANCE_DIR = os.path.join(CONFIG_HOME, "instances")
-USER_CONFIG_FILENAME = os.path.join(CONFIG_HOME, "config.yaml")
+
+
+def default_storage_layout(home=None):
+    """Resolve new directory and legacy single-file configuration layouts.
+
+    Early ZSlurm installations stored YAML directly in ``~/.zslurm``.  Newer
+    releases need a directory there for per-instance discovery.  A shared
+    installation must not overwrite or rename that legacy file, so keep
+    reading it and place mutable runtime state in ``~/.zslurm.d`` instead.
+    """
+
+    base_home = os.path.expanduser("~") if home is None else os.fspath(home)
+    legacy_path = os.path.join(base_home, ".zslurm")
+    if os.path.isfile(legacy_path):
+        config_home = legacy_path + ".d"
+        config_file = legacy_path
+    else:
+        config_home = legacy_path
+        config_file = os.path.join(config_home, "config.yaml")
+    return {
+        "config_home": config_home,
+        "instance_dir": os.path.join(config_home, "instances"),
+        "config_file": config_file,
+        "legacy_file": legacy_path,
+    }
+
+
+_STORAGE_LAYOUT = default_storage_layout()
+CONFIG_HOME = _STORAGE_LAYOUT["config_home"]
+INSTANCE_DIR = _STORAGE_LAYOUT["instance_dir"]
+USER_CONFIG_FILENAME = _STORAGE_LAYOUT["config_file"]
+LEGACY_USER_CONFIG_FILENAME = _STORAGE_LAYOUT["legacy_file"]
 
 
 # COMMANDS

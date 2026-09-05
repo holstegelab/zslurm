@@ -42,6 +42,12 @@ cp config/sites/spider.yaml ~/.zslurm/config.yaml    # on Spider
 Review autogrow and storage limits before starting the manager. The Spider
 template deliberately leaves autogrow disabled.
 
+ZSlurm also supports the original Spider layout where `~/.zslurm` itself is
+a YAML configuration file. In that case the legacy file remains the active
+configuration and per-instance/runtime state is written to `~/.zslurm.d/`.
+Merge the relevant values from `config/sites/spider.yaml` into the existing
+file; do not replace it with a directory.
+
 The environment file includes the base runtime dependencies for ZSlurm, including `pyyaml` and `tabulate`.
 
 `ipyparallel` is optional. If you want the manager UI to query and display IPython parallel queue statistics, install it separately:
