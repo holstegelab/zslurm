@@ -748,8 +748,8 @@ def provision_node(partition="genoa", cores=24, walltime="1-00:00:00",
 #SBATCH -t {walltime}
 {time_min_directive}#SBATCH -o {logdir}/manager_node-%j.out
 set -uo pipefail
-# Normalize env so the manager writes its instance YAML to ~/.zslurm/instances
-# (zslurm_shared hardcodes that and the coordinator reads it there).
+# Normalize env so manager and coordinator use the same instance directory
+# (~/.zslurm/instances, or ~/.zslurm.d/instances with a legacy config file).
 unset ZSLURM_HOME 2>/dev/null || true
 # Make the clustersnake env binaries available without relying on `conda activate`
 # (absolute PATH is authoritative; conda.sh is best-effort for runtime libs).

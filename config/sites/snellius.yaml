@@ -36,4 +36,3 @@ node_profiles:
   fat_rome:
     cores: 128
     mem_gb: 960
-

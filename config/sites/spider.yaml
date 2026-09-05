@@ -24,4 +24,3 @@ autogrow_fat_partitions: []
 autogrow_enable: false
 autogrow_max_compute_nodes: 0
 maintenance_window_enable: false
-
