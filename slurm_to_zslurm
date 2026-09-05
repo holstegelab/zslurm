@@ -1,15 +1,24 @@
-#!/bin/bash
-# Engine launcher for zslurm. Self-sufficient activation of the clustersnake env:
-# the relocated base's conda.sh still hardcodes the DEAD old base
-# (/home/hulsmanm/miniconda3/bin/conda), so we do NOT source it. Instead put the
-# clustersnake env on PATH directly and export the conda vars.
-CONDA_BASE="/home/hulsmanm/all_data/research/conda/marc/miniconda3"
-CONDA_PREFIX_ENV="${CONDA_BASE}/envs/clustersnake"
-export CONDA_EXE="${CONDA_BASE}/bin/conda"
-export CONDA_PYTHON_EXE="${CONDA_BASE}/bin/python3.9"
-export CONDA_PREFIX="${CONDA_PREFIX_ENV}"
-export CONDA_DEFAULT_ENV="clustersnake"
-export PATH="${CONDA_PREFIX_ENV}/bin:${CONDA_BASE}/condabin:${PATH}"
-python -V
-zslurm_chief "$@"
+#!/usr/bin/env bash
+set -euo pipefail
 
+# Keep an engine in the same installation as the submitting manager. This is
+# portable across conda, venv and system installs and avoids embedding a
+# cluster- or user-specific environment path in the shared repository.
+launcher_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# A relocated environment can provide its bin directory explicitly when the
+# inherited Slurm PATH is not sufficient.
+if [[ -n "${ZSLURM_ENGINE_ENV_BIN:-}" ]]; then
+    export PATH="${ZSLURM_ENGINE_ENV_BIN}:${PATH}"
+fi
+
+if [[ -n "${ZSLURM_CHIEF_PATH:-}" ]]; then
+    exec "${ZSLURM_CHIEF_PATH}" "$@"
+elif [[ -x "${launcher_dir}/zslurm_chief" ]]; then
+    exec "${launcher_dir}/zslurm_chief" "$@"
+elif command -v zslurm_chief >/dev/null 2>&1; then
+    exec zslurm_chief "$@"
+fi
+
+echo "slurm_to_zslurm: zslurm_chief is not installed next to the launcher or on PATH" >&2
+exit 127

@@ -1,0 +1,39 @@
+# Snellius pilot defaults. Copy to ~/.zslurm/config.yaml and add project storage
+# budgets and transfer limits as appropriate.
+cluster_site: snellius
+default_partition: genoa
+staging_partition: staging
+enable_ssd_prompt: true
+ssd_feature_name: scratch-node
+default_engine_cores: 0
+autogrow_engine_cores: 0
+
+autogrow_enable: true
+autogrow_max_compute_nodes: 40
+autogrow_fallback_partition: genoa
+maintenance_window_enable: true
+maintenance_time_min_sec: 43200
+autogrow_fat_partitions:
+  - fat_genoa
+  - fat_rome
+autogrow_prefer_partitions:
+  - [genoa, true]
+  - [genoa, false]
+  - [rome, true]
+  - [rome, false]
+  - [fat_genoa, true]
+  - [fat_rome, true]
+node_profiles:
+  genoa:
+    cores: 192
+    mem_gb: 336
+  rome:
+    cores: 128
+    mem_gb: 224
+  fat_genoa:
+    cores: 192
+    mem_gb: 1440
+  fat_rome:
+    cores: 128
+    mem_gb: 960
+

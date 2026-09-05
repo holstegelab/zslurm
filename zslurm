@@ -348,10 +348,13 @@ class Status(object):
         self.autogrow_debug = True
         
         self.node_profiles = dict(DEFAULT_NODE_PROFILES)
+        self.cluster_site = "generic"
         self.default_partition = "normal"
         self.staging_partition = "staging"
         self.enable_ssd_prompt = False
         self.ssd_feature_name = "scratch-node"
+        self.default_engine_cores = 0
+        self.autogrow_engine_cores = 0
         self.archive_job_partitions = ["archive", "staging"]
         self.autogrow_fallback_partition = "genoa"
         self.autogrow_fat_partitions = ["fat_genoa", "fat_rome"]
@@ -519,9 +522,11 @@ def _cfg_string_list(value, default=None):
     return list(default)
 
 
-def _cfg_autogrow_prefer_partitions(value):
+def _cfg_autogrow_prefer_partitions(value, default=None):
+    if default is None:
+        default = DEFAULT_AUTOGROW_PREFER_PARTITIONS
     if value is None:
-        return list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
+        return list(default)
     out = []
     try:
         for item in value:
@@ -539,13 +544,15 @@ def _cfg_autogrow_prefer_partitions(value):
             if part:
                 out.append((part, scratch))
     except Exception:
-        return list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
-    return out or list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
+        return list(default)
+    return out or list(default)
 
 
-def _cfg_node_profiles(value):
+def _cfg_node_profiles(value, default=None):
+    if default is None:
+        default = DEFAULT_NODE_PROFILES
     if not isinstance(value, dict):
-        return dict(DEFAULT_NODE_PROFILES)
+        return copy.deepcopy(default)
     out = {}
     for name, prof in value.items():
         if not isinstance(prof, dict):
@@ -557,31 +564,94 @@ def _cfg_node_profiles(value):
             "cores": _cfg_int(prof.get("cores"), 0),
             "mem_gb": _cfg_float(prof.get("mem_gb"), 0.0),
         }
-    return out or dict(DEFAULT_NODE_PROFILES)
+    return out or copy.deepcopy(default)
 
 
-def _cluster_defaults():
-    on_snellius = "snellius" in zslurm_shared.get_full_hostname().lower()
-    default_partition = "genoa" if on_snellius else "normal"
-    enable_ssd_prompt = on_snellius
-    return {
-        "default_partition": default_partition,
+def _cluster_defaults(config=None):
+    """Return safe site defaults without requiring a site-specific fork.
+
+    ``cluster_site`` is an explicit override for tests, login aliases and
+    manager hosts whose FQDN does not contain the Slurm cluster name. Unknown
+    clusters deliberately get no automatic growth policy: an incorrect node
+    profile can otherwise submit real allocations that can never satisfy the
+    queued workload.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    site = str(cfg.get("cluster_site", "") or "").strip().lower()
+    if not site:
+        hostname = zslurm_shared.get_full_hostname().lower()
+        if "snellius" in hostname:
+            site = "snellius"
+        elif "spider" in hostname:
+            site = "spider"
+        else:
+            site = "generic"
+
+    defaults = {
+        "cluster_site": site,
+        "default_partition": "normal",
         "staging_partition": "staging",
-        "enable_ssd_prompt": enable_ssd_prompt,
+        "enable_ssd_prompt": False,
         "ssd_feature_name": "scratch-node",
+        "autogrow_prefer_partitions": [("normal", False)],
+        "node_profiles": {},
+        "autogrow_fallback_partition": "normal",
+        "autogrow_fat_partitions": [],
+        "maintenance_window_enable": False,
+        "default_engine_cores": 0,
+        "autogrow_engine_cores": 0,
+        "autogrow_enable": False,
+        "autogrow_max_compute_nodes": 0,
     }
+    if site == "snellius":
+        defaults.update({
+            "default_partition": "genoa",
+            "enable_ssd_prompt": True,
+            "autogrow_prefer_partitions": list(
+                DEFAULT_AUTOGROW_PREFER_PARTITIONS
+            ),
+            "node_profiles": copy.deepcopy(DEFAULT_NODE_PROFILES),
+            "autogrow_fallback_partition": "genoa",
+            "autogrow_fat_partitions": ["fat_genoa", "fat_rome"],
+            "maintenance_window_enable": True,
+            "autogrow_enable": True,
+            "autogrow_max_compute_nodes": 40,
+        })
+    elif site == "spider":
+        # Spider grants 8 GB per allocated core (DefMemPerCPU=8000). A
+        # half-node-sized pilot is large enough for mixed workflow packing but
+        # can share both 60-core Rome and 120-core Bergamo nodes. The profile
+        # describes the allocation, not the physical RAM installed in a node.
+        defaults.update({
+            "default_partition": "normal",
+            "ssd_feature_name": "ssd",
+            "autogrow_prefer_partitions": [("normal", False)],
+            "node_profiles": {
+                "normal": {"cores": 30, "mem_gb": 240},
+            },
+            "autogrow_fallback_partition": "normal",
+            "default_engine_cores": 30,
+            "autogrow_engine_cores": 30,
+        })
+    return defaults
 
 
 def _apply_cluster_config(config):
     cfg = config if isinstance(config, dict) else {}
-    defaults = _cluster_defaults()
+    defaults = _cluster_defaults(cfg)
 
+    status.cluster_site = defaults["cluster_site"]
     status.default_partition = str(cfg.get("default_partition", defaults["default_partition"]) or defaults["default_partition"])
     status.staging_partition = str(cfg.get("staging_partition", defaults["staging_partition"]) or defaults["staging_partition"])
     status.enable_ssd_prompt = _cfg_bool(cfg.get("enable_ssd_prompt"), defaults["enable_ssd_prompt"])
     status.ssd_feature_name = str(cfg.get("ssd_feature_name", defaults["ssd_feature_name"]) or "")
-    status.autogrow_prefer_partitions = _cfg_autogrow_prefer_partitions(cfg.get("autogrow_prefer_partitions"))
-    status.node_profiles = _cfg_node_profiles(cfg.get("node_profiles"))
+    status.autogrow_prefer_partitions = _cfg_autogrow_prefer_partitions(
+        cfg.get("autogrow_prefer_partitions"),
+        defaults["autogrow_prefer_partitions"],
+    )
+    status.node_profiles = _cfg_node_profiles(
+        cfg.get("node_profiles"), defaults["node_profiles"]
+    )
     default_archive_jobs = ["archive", "staging"]
     status.archive_job_partitions = _cfg_string_list(cfg.get("archive_job_partitions"), default_archive_jobs)
     default_fallback_partition = status.autogrow_prefer_partitions[0][0] if status.autogrow_prefer_partitions else status.default_partition
@@ -591,8 +661,32 @@ def _apply_cluster_config(config):
     status.staging_autogrow_burst_threshold = _cfg_int(cfg.get("staging_autogrow_burst_threshold"), 50)
     status.staging_autogrow_base_nodes = max(0, _cfg_int(cfg.get("staging_autogrow_base_nodes"), 1))
     status.staging_autogrow_burst_nodes = max(status.staging_autogrow_base_nodes, _cfg_int(cfg.get("staging_autogrow_burst_nodes"), 4))
-    status.maintenance_window_enable = _cfg_bool(cfg.get("maintenance_window_enable"), True)
+    status.maintenance_window_enable = _cfg_bool(
+        cfg.get("maintenance_window_enable"),
+        defaults["maintenance_window_enable"],
+    )
     status.maintenance_time_min_sec = max(0, _cfg_int(cfg.get("maintenance_time_min_sec"), 12 * 3600))
+    status.default_engine_cores = max(
+        0,
+        _cfg_int(
+            cfg.get("default_engine_cores"),
+            defaults["default_engine_cores"],
+        ),
+    )
+    status.autogrow_engine_cores = max(
+        0,
+        _cfg_int(
+            cfg.get("autogrow_engine_cores"),
+            defaults["autogrow_engine_cores"],
+        ),
+    )
+    status.autogrow_enable = _cfg_bool(
+        cfg.get("autogrow_enable"), defaults["autogrow_enable"]
+    )
+    if "autogrow_max_compute_nodes" not in cfg:
+        cfg["autogrow_max_compute_nodes"] = defaults[
+            "autogrow_max_compute_nodes"
+        ]
 
     # Agent control interface (mutating RPCs gated, see docs/agent-interface-plan.md)
     status.enable_control_rpc = _cfg_bool(cfg.get("enable_control_rpc"), False)
@@ -6497,7 +6591,14 @@ def thread_check_commands():
                                 # scratch class (plan_use_scratch), not only when a job
                                 # hard-requires SSD -- scratch is equal-cost and preferred.
                                 constraint = ssd_feature_name if (ssd_feature_name and bool(plan.get('plan_use_scratch', False))) else None
-                                started = engines.start_slurm(gb, to_start, status.autogrow_runtime_default, plan.get('best_part'), constraint, 0)
+                                started = engines.start_slurm(
+                                    gb,
+                                    to_start,
+                                    status.autogrow_runtime_default,
+                                    plan.get('best_part'),
+                                    constraint,
+                                    getattr(status, 'autogrow_engine_cores', 0),
+                                )
                                 status.autogrow_last_action_compute_ts = now
                                 if started:
                                     plan_compute = f"grew: {len(started)} @ {plan.get('best_part', 'compute')}"
@@ -7844,8 +7945,16 @@ def main(scr, *args, **kwds):
                             constraint = ""
                     else:
                         constraint = enter_command(gb, "Enter feature (default=): ")
+                    default_cores = int(
+                        getattr(status, 'default_engine_cores', 0) or 0
+                    )
+                    default_cores_label = (
+                        str(default_cores) if default_cores > 0 else "exclusive"
+                    )
                     cores = get_number(
-                        gb, "Enter number of cores (default=exclusive): ", 0
+                        gb,
+                        f"Enter number of cores (default={default_cores_label}): ",
+                        default_cores,
                     )
 
                 runtime = enter_command(gb, "Enter time (default=5-0:0:0): ")

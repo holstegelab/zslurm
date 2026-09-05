@@ -24,6 +24,24 @@ conda activate clustersnake
 python -m pip install .
 ```
 
+Install the manager and worker entry points into the same environment. The
+Slurm engine launcher resolves `zslurm_chief` next to itself, so the same
+installation works on Snellius and Spider without a hardcoded conda path. For
+a relocated environment whose `bin` directory is not inherited by `sbatch`,
+export `ZSLURM_ENGINE_ENV_BIN=/path/to/environment/bin` before starting the
+manager.
+
+Site templates are available under `config/sites/`:
+
+```bash
+mkdir -p ~/.zslurm
+cp config/sites/spider.yaml ~/.zslurm/config.yaml    # on Spider
+# or: cp config/sites/snellius.yaml ~/.zslurm/config.yaml
+```
+
+Review autogrow and storage limits before starting the manager. The Spider
+template deliberately leaves autogrow disabled.
+
 The environment file includes the base runtime dependencies for ZSlurm, including `pyyaml` and `tabulate`.
 
 `ipyparallel` is optional. If you want the manager UI to query and display IPython parallel queue statistics, install it separately:
@@ -335,6 +353,9 @@ So the code is still friendly to Snellius out of the box, but these are no longe
 
 The manager now reads the following cluster-policy keys from `~/.zslurm/config.yaml`:
 
+- **`cluster_site`**
+  - explicit `snellius`, `spider`, or `generic` site selection; otherwise the
+    manager detects Snellius/Spider from its FQDN
 - **`default_partition`**
   - default partition shown in the interactive `d` prompt
 - **`staging_partition`**
@@ -347,6 +368,13 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - ordered partition preference list for compute autogrow
 - **`node_profiles`**
   - per-partition `cores` and `mem_gb` used by autogrow planning
+- **`default_engine_cores`**
+  - default CPU count for manually started pilots; `0` requests an exclusive
+    node
+- **`autogrow_engine_cores`**
+  - CPU count for automatically started pilots; `0` requests an exclusive node
+- **`autogrow_enable`** / **`autogrow_max_compute_nodes`**
+  - whether automatic allocation is initially enabled and its hard fleet cap
 - **`autogrow_fallback_partition`**
   - partition to fall back to if no preferred autogrow partition scores better
 - **`autogrow_fat_partitions`**
@@ -441,6 +469,31 @@ staging_autogrow_base_nodes: 1
 staging_autogrow_burst_threshold: 50
 staging_autogrow_burst_nodes: 4
 ```
+
+### Spider example
+
+Spider grants schedulable memory through allocated cores
+(`DefMemPerCPU=8000`). The supplied `config/sites/spider.yaml` therefore uses
+30-core/240-GB partial pilots. This is deliberately an allocation profile, not
+the physical 960-GB or 1440-GB node size:
+
+```yaml
+cluster_site: spider
+default_partition: normal
+default_engine_cores: 30
+autogrow_engine_cores: 30
+node_profiles:
+  normal:
+    cores: 30
+    mem_gb: 240
+autogrow_enable: false
+autogrow_max_compute_nodes: 0
+maintenance_window_enable: false
+```
+
+The chief derives its final schedulable memory from the Slurm environment and
+cgroup, so a site or partition with a different memory-per-core grant is never
+allowed to advertise the physical node's complete RAM accidentally.
 
 ## Storage quotas as a global resource monitor
 

@@ -1,0 +1,27 @@
+# Spider pilot defaults. Copy to ~/.zslurm/config.yaml and review the engine
+# cap before enabling autogrow.
+cluster_site: spider
+default_partition: normal
+staging_partition: staging
+enable_ssd_prompt: false
+ssd_feature_name: ssd
+
+# Spider's Slurm policy grants 8 GB per allocated core. These values describe
+# a 30-core partial pilot allocation, not all physical resources on the node.
+default_engine_cores: 30
+autogrow_engine_cores: 30
+node_profiles:
+  normal:
+    cores: 30
+    mem_gb: 240
+autogrow_prefer_partitions:
+  - [normal, false]
+autogrow_fallback_partition: normal
+autogrow_fat_partitions: []
+
+# Start capacity deliberately with `d` or `zscontrol grow`; only enable this
+# after choosing a project-appropriate node cap.
+autogrow_enable: false
+autogrow_max_compute_nodes: 0
+maintenance_window_enable: false
+
