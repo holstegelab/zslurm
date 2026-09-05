@@ -48,7 +48,11 @@ configuration and per-instance/runtime state is written to `~/.zslurm.d/`.
 Merge the relevant values from `config/sites/spider.yaml` into the existing
 file; do not replace it with a directory.
 
-The environment file includes the base runtime dependencies for ZSlurm, including `pyyaml` and `tabulate`.
+The environment file includes the base runtime dependencies for ZSlurm,
+including `pyyaml` and `tabulate`, plus `setuptools` as an explicit build
+dependency. Prefer `python -m pip install .`; the `pyproject.toml` build-system
+declaration also lets pip create an isolated build environment when the active
+environment does not already contain setuptools.
 
 `ipyparallel` is optional. If you want the manager UI to query and display IPython parallel queue statistics, install it separately:
 
