@@ -99,7 +99,12 @@ class ChiefLeaseControllerTests(unittest.TestCase):
             env = self.start_job(status, controller)
         token = env[zslurm_lease.ENV_TOKEN]
 
-        controller.record_usage("job-1", 4.0, 8000.0, sampled_at=105.0)
+        controller.record_usage(
+            "job-1", 4.0, 8000.0, sampled_at=105.0, rss_mb=9000.0
+        )
+        controller.record_usage(
+            "job-1", 4.0, 8000.0, sampled_at=108.0, rss_mb=12000.0
+        )
         with mock.patch.object(zslurm_lease.time, "time", return_value=110.0):
             response = controller.set_target(
                 "job-1",
@@ -109,7 +114,9 @@ class ChiefLeaseControllerTests(unittest.TestCase):
                 phase="tail",
             )
         self.assertEqual(response["phase_name"], "tail")
-        controller.record_usage("job-1", 1.0, 2000.0, sampled_at=115.0)
+        controller.record_usage(
+            "job-1", 1.0, 2000.0, sampled_at=115.0, rss_mb=2500.0
+        )
         with mock.patch.object(zslurm_lease.time, "time", return_value=120.0):
             report = controller.finish_job("job-1", 24, 64000)
 
@@ -121,6 +128,10 @@ class ChiefLeaseControllerTests(unittest.TestCase):
         self.assertEqual(initial["duration_s"], 10.0)
         self.assertEqual(initial["avg_cpu_cores"], 4.0)
         self.assertEqual(initial["avg_pss_mb"], 8000.0)
+        self.assertEqual(initial["avg_rss_mb"], 9600.0)
+        self.assertEqual(initial["rss_max_mb"], 12000.0)
+        self.assertEqual(initial["rss_mb_percentiles"][-1], 12000.0)
+        self.assertEqual(initial["rss_sample_coverage"], 1.0)
         self.assertEqual(initial["reserved_core_seconds"], 240.0)
         self.assertEqual(initial["used_core_seconds"], 40.0)
 
@@ -132,6 +143,8 @@ class ChiefLeaseControllerTests(unittest.TestCase):
         self.assertEqual(tail["held_mem_mb"], 12000.0)
         self.assertEqual(tail["avg_cpu_cores"], 1.0)
         self.assertEqual(tail["avg_pss_mb"], 2000.0)
+        self.assertEqual(tail["avg_rss_mb"], 2500.0)
+        self.assertEqual(tail["rss_max_mb"], 2500.0)
         self.assertAlmostEqual(tail["cpu_efficiency"], 0.5)
         self.assertAlmostEqual(tail["memory_efficiency"], 1.0 / 6.0)
         self.assertEqual(report["reserved_core_seconds"], 260.0)
@@ -738,17 +751,24 @@ class ManagerLeaseAccountingTests(unittest.TestCase):
             "sampled_duration_s": 10.0,
             "avg_cpu_cores": 1.0,
             "avg_pss_mb": 2000.0,
+            "rss_sample_count": 2,
+            "rss_sampled_duration_s": 10.0,
+            "avg_rss_mb": 2500.0,
+            "rss_max_mb": 3000.0,
             "cpu_cores_percentiles": [1.0] * 7,
             "pss_mb_percentiles": [2000.0] * 7,
+            "rss_mb_percentiles": [2500.0] * 6 + [3000.0],
             "reserved_core_seconds": 20.0,
             "sampled_reserved_core_seconds": 20.0,
             "used_core_seconds": 10.0,
             "reserved_mem_mb_seconds": 120000.0,
             "sampled_reserved_mem_mb_seconds": 120000.0,
             "pss_mb_seconds": 20000.0,
+            "rss_mb_seconds": 25000.0,
             "cpu_efficiency": 0.5,
             "memory_efficiency": 1.0 / 6.0,
             "sample_coverage": 1.0,
+            "rss_sample_coverage": 1.0,
         }
         row = z._phase_report_row("job", "sample", 0, "node", "42", phase)
         parsed = dict(zip(z.LEASE_PHASE_REPORT_FIELDS, row))
@@ -757,6 +777,9 @@ class ManagerLeaseAccountingTests(unittest.TestCase):
         self.assertEqual(parsed["phase_name"], "tail")
         self.assertEqual(parsed["cores_reserved"], "2.0")
         self.assertEqual(parsed["pss_95"], "2000.0")
+        self.assertEqual(parsed["rss_avg_mb"], "2500.0")
+        self.assertEqual(parsed["rss_max_mb"], "3000.0")
+        self.assertEqual(parsed["rss_100"], "3000.0")
         self.assertEqual(parsed["lease_cpu_efficiency"], "0.5")
 
     def test_report_files_include_dynamic_summary_and_phase_schema(self):

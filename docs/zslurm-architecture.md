@@ -229,7 +229,12 @@ oversubscribing a fractionally-reserved node.
 
 **Monitoring & failure handling (engine side, `zslurm_chief:553-784`).** Each job runs in
 its own process group; a `job_monitor` thread samples cpu/mem (PSS)/io via psutil over the
-whole tree plus cgroup v1/v2. Two notable behaviours an operator/agent must know:
+whole tree plus cgroup v1/v2. Notable behaviours an operator/agent must know:
+- **Node memory pressure excludes ordinary page cache**: the engine subtracts
+  `memory.stat[file] - memory.stat[shmem]` from `memory.current`. It retains
+  anonymous, shared, and kernel memory and uses the same value for node reporting,
+  normal job admission, and dynamic lease growth. Missing counters fall back to
+  the full cgroup charge.
 - **Stuck-job watchdog** (compute only): if cpu < 0.05 core and io-delta ≤ 4096 B for
   `stuck_stop_threshold=60` consecutive monitor intervals, the tree is killed with
   `RC_STUCK=-254` (`zslurm_chief:670-698`).

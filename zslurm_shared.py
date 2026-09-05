@@ -162,6 +162,60 @@ def format_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{sec:02d}"
 
 
+def parse_cgroup_memory_stat(lines):
+    """Parse cgroup ``memory.stat`` content into non-negative byte counts."""
+    values = {}
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    for line in lines:
+        parts = str(line).strip().split()
+        if len(parts) != 2:
+            continue
+        try:
+            values[parts[0]] = max(0.0, float(parts[1]))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def cgroup_memory_without_page_cache(current, memory_stat):
+    """Return cgroup memory charge excluding file cache but retaining shmem.
+
+    In cgroup v2, ``file`` includes ordinary filesystem page cache as well as
+    tmpfs/shared-memory pages, while ``shmem`` is the shared-memory subset.
+    Subtracting ``file - shmem`` therefore drops ordinary page cache and keeps
+    anonymous, shared, and kernel memory. Values are unit-agnostic as long as
+    ``current`` and the supplied stats use the same unit (normally bytes).
+
+    If the needed counters are unavailable, retain the complete charge. This
+    is deliberately conservative for older cgroup implementations where
+    shared memory cannot be separated safely from cache.
+    """
+    current = max(0.0, float(current))
+    stats = memory_stat or {}
+    if "file" in stats and "shmem" in stats:
+        file_charge = stats["file"]
+        shmem_charge = stats["shmem"]
+    elif "total_cache" in stats and "total_shmem" in stats:
+        file_charge = stats["total_cache"]
+        shmem_charge = stats["total_shmem"]
+    elif "cache" in stats and "shmem" in stats:
+        file_charge = stats["cache"]
+        shmem_charge = stats["shmem"]
+    else:
+        return current
+
+    page_cache = max(0.0, float(file_charge) - float(shmem_charge))
+    return max(0.0, current - min(current, page_cache))
+
+
+def cgroup_memory_available_without_page_cache(limit, current, memory_stat):
+    """Return scheduler-available cgroup memory excluding ordinary cache."""
+    limit = max(0.0, float(limit))
+    effective = cgroup_memory_without_page_cache(current, memory_stat)
+    return max(0.0, limit - min(limit, effective))
+
+
 def _resolve_config_path(config_path=None):
     if config_path is not None:
         return os.path.expanduser(config_path)

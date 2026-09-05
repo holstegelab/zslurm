@@ -44,7 +44,7 @@ gated behind `enable_control_rpc` (default off) + a `control_token`**.
 |---|---|---|
 | `ping()` / `health()` | `{schema_version, uptime_s, job_thread_alive, engine_thread_alive, instance, lastin_first, prio_fillmem_context}` | new, ~15 lines |
 | `get_status_json()` | budgets `{active,dcache,archive: {total, inuse, pending_add}}` + scheduler mode | the only read data missing from `queue_stats` (`zslurm:469-474`, sum `*_start_use_add` over PENDING) |
-| `--json` on `zsqueue` / `zsnodes` | priority-aware 15-field job rows / 20-field node rows as keyed objects, **numeric** (no unit suffixes) | legacy job RPC rows remain 14 fields unless priority is requested |
+| `--json` on `zsqueue` / `zsnodes` | priority-aware 15-field job rows / 24-field node rows as keyed objects, **numeric** (no unit suffixes) | legacy job RPC rows remain 14 fields unless priority is requested; older managers are padded with unavailable GPFS metrics |
 | `zsstatus --json` (new client) | one schema-versioned blob: queue (`queue_stats`) + engines (`list_nodes`) + budgets (`get_status_json`) + scheduler + Snellius free nodes (`scontrol`) **+ derived alarms** | fans out existing RPCs |
 | `whatif_budget(active,dcache,archive)` | `{eligible_delta_by_partition}` — how many pending jobs become (in)eligible at those totals | reuse `_is_job_eligible_locked` |
 | `match_jobs(pattern)` | `[jobids]` matching a substring (dry-run before any pattern write) | walk `jobs_by_id` |

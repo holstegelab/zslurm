@@ -10,6 +10,7 @@ import random
 import threading
 import traceback
 import getpass
+import math
 import zslurm_shared
 import zslurm_lease
 import socket
@@ -18,6 +19,18 @@ try:
     import http.client as httplib
 except:
     import httplib
+
+try:
+    import xmlrpc.client as xmlrpclib
+except ImportError:
+    import xmlrpclib
+
+
+MANAGER_RPC_ERRORS = (
+    socket.error,
+    httplib.HTTPException,
+    xmlrpclib.ProtocolError,
+)
 
 #os.environ["OMP_NUM_THREADS"] = "1" 
 #os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -128,15 +141,17 @@ def get_memory_avl():
 
 CGROUP_MEM_LIMIT_FILE = None
 CGROUP_MEM_CURRENT_FILE = None
+CGROUP_MEM_STAT_FILE = None
 CGROUP_CPU_STAT_FILE = None
 CGROUP_CPU_USAGE_FILE = None
 CGROUP_CPUSET_FILE = None
 CGROUP_V2 = False
 
 def detect_cgroup_files():
-    global CGROUP_MEM_LIMIT_FILE, CGROUP_MEM_CURRENT_FILE, CGROUP_CPU_STAT_FILE, CGROUP_CPU_USAGE_FILE, CGROUP_CPUSET_FILE, CGROUP_V2
+    global CGROUP_MEM_LIMIT_FILE, CGROUP_MEM_CURRENT_FILE, CGROUP_MEM_STAT_FILE, CGROUP_CPU_STAT_FILE, CGROUP_CPU_USAGE_FILE, CGROUP_CPUSET_FILE, CGROUP_V2
     CGROUP_MEM_LIMIT_FILE = None
     CGROUP_MEM_CURRENT_FILE = None
+    CGROUP_MEM_STAT_FILE = None
     CGROUP_CPU_STAT_FILE = None
     CGROUP_CPU_USAGE_FILE = None
     CGROUP_CPUSET_FILE = None
@@ -162,6 +177,7 @@ def detect_cgroup_files():
         base = '/sys/fs/cgroup' + (v2_path if v2_path != '/' else '')
         limit = os.path.join(base, 'memory.max')
         current = os.path.join(base, 'memory.current')
+        memory_stat = os.path.join(base, 'memory.stat')
         cpu_stat = os.path.join(base, 'cpu.stat')
         cpuset_candidates = [
             os.path.join(base, 'cpuset.cpus.effective'),
@@ -170,6 +186,8 @@ def detect_cgroup_files():
         if os.path.exists(limit) and os.path.exists(current):
             CGROUP_MEM_LIMIT_FILE = limit
             CGROUP_MEM_CURRENT_FILE = current
+            if os.path.exists(memory_stat):
+                CGROUP_MEM_STAT_FILE = memory_stat
         if os.path.exists(cpu_stat):
             CGROUP_CPU_STAT_FILE = cpu_stat
         for candidate in cpuset_candidates:
@@ -186,9 +204,12 @@ def detect_cgroup_files():
         base = '/sys/fs/cgroup/memory' + (v1_mem_path if v1_mem_path != '/' else '')
         limit = os.path.join(base, 'memory.limit_in_bytes')
         current = os.path.join(base, 'memory.usage_in_bytes')
+        memory_stat = os.path.join(base, 'memory.stat')
         if os.path.exists(limit) and os.path.exists(current):
             CGROUP_MEM_LIMIT_FILE = limit
             CGROUP_MEM_CURRENT_FILE = current
+            if os.path.exists(memory_stat):
+                CGROUP_MEM_STAT_FILE = memory_stat
             found = True
     v1_cpuacct_path = controller_paths.get('cpuacct')
     if v1_cpuacct_path is not None:
@@ -206,15 +227,41 @@ def detect_cgroup_files():
     return found
 
 
-def get_cgroup_memory_current_mb():
+def get_cgroup_memory_current_bytes():
     try:
         if CGROUP_MEM_CURRENT_FILE is None:
             return None
         with open(CGROUP_MEM_CURRENT_FILE,'r') as f:
             current_s = f.read().strip()
-        return max(0.0, float(current_s) / (1024.0 ** 2))
+        return max(0.0, float(current_s))
     except Exception:
         return None
+
+
+def get_cgroup_memory_current_mb():
+    current = get_cgroup_memory_current_bytes()
+    return None if current is None else current / (1024.0 ** 2)
+
+
+def get_cgroup_memory_stat():
+    try:
+        if CGROUP_MEM_STAT_FILE is None:
+            return None
+        with open(CGROUP_MEM_STAT_FILE, 'r') as f:
+            return zslurm_shared.parse_cgroup_memory_stat(f)
+    except Exception:
+        return None
+
+
+def get_cgroup_memory_without_page_cache_mb():
+    """Return cgroup usage excluding file cache, but including shmem/kernel."""
+    current = get_cgroup_memory_current_bytes()
+    if current is None:
+        return None
+    effective = zslurm_shared.cgroup_memory_without_page_cache(
+        current, get_cgroup_memory_stat()
+    )
+    return effective / (1024.0 ** 2)
 
 
 def get_cgroup_memory_limit_mb():
@@ -231,6 +278,112 @@ def get_cgroup_memory_limit_mb():
         return max(0.0, limit / (1024.0 ** 2))
     except Exception:
         return None
+
+
+def parse_slurm_memory_mb(value):
+    """Parse a Slurm memory value into MiB.
+
+    Slurm's ``SLURM_MEM_PER_*`` variables normally contain an integer MiB
+    value.  Accept unit suffixes too so the fallback remains useful with
+    wrappers that preserve the submitted value.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if not text or text in ('N/A', 'NONE', 'UNLIMITED'):
+        return None
+    if text.endswith('B') and len(text) > 1 and text[-2] in 'KMGTPE':
+        text = text[:-1]
+    factors = {
+        'K': 1.0 / 1024.0,
+        'M': 1.0,
+        'G': 1024.0,
+        'T': 1024.0 ** 2,
+        'P': 1024.0 ** 3,
+        'E': 1024.0 ** 4,
+    }
+    factor = 1.0
+    if text and text[-1] in factors:
+        factor = factors[text[-1]]
+        text = text[:-1].strip()
+    try:
+        result = float(text) * factor
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result) or result <= 0.0:
+        return None
+    return result
+
+
+def get_slurm_memory_limit_mb(cpu_count, environ=None):
+    """Return the memory granted to this Slurm allocation, when advertised."""
+    env = os.environ if environ is None else environ
+    per_node = parse_slurm_memory_mb(env.get('SLURM_MEM_PER_NODE'))
+    if per_node is not None:
+        return per_node
+    per_cpu = parse_slurm_memory_mb(env.get('SLURM_MEM_PER_CPU'))
+    if per_cpu is None:
+        return None
+    try:
+        advertised_cpu = max(0.0, float(cpu_count))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(advertised_cpu) or advertised_cpu <= 0.0:
+        return None
+    return per_cpu * advertised_cpu
+
+
+def compute_engine_memory_capacity_mb(
+    physical_memory_mb,
+    explicit_memory_mb=None,
+    cgroup_limit_mb=None,
+    slurm_limit_mb=None,
+    static_reserve_mb=100.0,
+    headroom_fraction=0.08,
+    cap_fraction=0.99,
+):
+    """Return (total, schedulable, hard_limit) memory for chief registration.
+
+    Every finite allocation boundary is authoritative.  Applying headroom to
+    their minimum prevents a chief from advertising physical node RAM that is
+    outside its Slurm cgroup.
+    """
+    limits = []
+    for value in (
+        physical_memory_mb,
+        explicit_memory_mb,
+        cgroup_limit_mb,
+        slurm_limit_mb,
+    ):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0.0:
+            limits.append(value)
+    if not limits:
+        return 0.0, 0.0, 0.0
+
+    hard_limit_mb = min(limits)
+    try:
+        static_reserve_mb = max(0.0, float(static_reserve_mb))
+    except (TypeError, ValueError):
+        static_reserve_mb = 0.0
+    try:
+        headroom_fraction = min(0.99, max(0.0, float(headroom_fraction)))
+    except (TypeError, ValueError):
+        headroom_fraction = 0.0
+    try:
+        cap_fraction = min(1.0, max(0.0, float(cap_fraction)))
+    except (TypeError, ValueError):
+        cap_fraction = 1.0
+
+    total_mb = max(0.0, hard_limit_mb - static_reserve_mb)
+    schedulable_mb = min(
+        cap_fraction * hard_limit_mb,
+        (1.0 - headroom_fraction) * total_mb,
+    )
+    return total_mb, max(0.0, schedulable_mb), hard_limit_mb
 
 
 def get_cgroup_cpu_time_sec():
@@ -280,10 +433,14 @@ def get_cgroup_cpu_capacity():
 def get_cgroup_remaining_mb():
     try:
         limit_mb = get_cgroup_memory_limit_mb()
-        current_mb = get_cgroup_memory_current_mb()
-        if limit_mb is None or current_mb is None:
+        current = get_cgroup_memory_current_bytes()
+        if limit_mb is None or current is None:
             return None
-        return max(0.0, limit_mb - current_mb)
+        # File cache is reclaimable and must not reduce scheduler admission.
+        # Shared memory remains charged via memory.stat's shmem subset.
+        return zslurm_shared.cgroup_memory_available_without_page_cache(
+            limit_mb * (1024.0 ** 2), current, get_cgroup_memory_stat()
+        ) / (1024.0 ** 2)
     except Exception as ex:
         sys.stderr.write('cgroup memory read failed: ' + str(ex) + '\n')
         sys.stderr.write(traceback.format_exc())
@@ -366,23 +523,204 @@ def read_scratch_usage(path):
         return 0.0, 0.0
 
 
-memory_mb_available = get_memory_avl()
-memory_core_mb = memory_mb_available / e_ncpu
+def parse_link_rate_bps(value):
+    """Parse an RDMA sysfs link rate such as ``100 Gb/sec (2X HDR)``."""
+    text = str(value or "").strip().split("(", 1)[0].strip()
+    parts = text.split()
+    if len(parts) < 2:
+        return None
+    try:
+        number = float(parts[0])
+    except (TypeError, ValueError):
+        return None
+    unit = parts[1].lower()
+    factors = {
+        "bit/sec": 1.0,
+        "kbit/sec": 1e3,
+        "mbit/sec": 1e6,
+        "gbit/sec": 1e9,
+        "tbit/sec": 1e12,
+        "kb/sec": 1e3,
+        "mb/sec": 1e6,
+        "gb/sec": 1e9,
+        "tb/sec": 1e12,
+    }
+    factor = factors.get(unit)
+    if factor is None or not math.isfinite(number) or number <= 0.0:
+        return None
+    return number * factor
 
-if mem is not None:
-    memory_core_mb = min(mem / float(e_ncpu), memory_core_mb)
 
-e_memtot = max(0.0, memory_core_mb * e_ncpu - float(config.get('mem_static_reserve_mb', 100.0)))
-headroom_fraction = float(config.get('mem_headroom_fraction', 0.08))
-cap_fraction = float(config.get('mem_cap_fraction_of_total', 0.99))
-e_memtot_buffer = min(cap_fraction * memory_mb_available, (1.0 - headroom_fraction) * e_memtot)
-print(f'Buffer space {e_memtot} - {e_memtot_buffer}')
+def gpfs_rdma_port_path(port_spec, sysfs_root="/sys/class/infiniband"):
+    """Resolve ``DEVICE/PORT`` to its sysfs port directory."""
+    text = str(port_spec or "").strip().strip("/")
+    if text.count(":") == 1 and "/" not in text:
+        text = text.replace(":", "/")
+    parts = [part for part in text.split("/") if part]
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    return os.path.join(sysfs_root, parts[0], "ports", parts[1])
+
+
+def detect_gpfs_rdma_port(
+        partition_name, config_obj=None,
+        sysfs_root="/sys/class/infiniband"):
+    """Find the readable active RDMA port used by GPFS on Snellius.
+
+    Snellius currently configures compute/fat clients on ``mlx5_2/1`` and
+    archive/server clients on ``mlx5_0/1``.  The setting remains overridable
+    because device numbering is a site property rather than a ZSlurm contract.
+    """
+    cfg = config_obj or {}
+    if cfg.get("gpfs_io_enable", True) is False:
+        return None
+
+    configured = cfg.get("gpfs_rdma_port")
+    if isinstance(configured, (list, tuple)):
+        candidates = list(configured)
+    elif configured:
+        candidates = [configured]
+    elif str(partition_name or "").strip().lower() == "archive":
+        candidates = ["mlx5_0/1", "mlx5_2/1"]
+    else:
+        candidates = ["mlx5_2/1", "mlx5_0/1"]
+
+    for candidate in candidates:
+        port_path = gpfs_rdma_port_path(candidate, sysfs_root=sysfs_root)
+        if not port_path:
+            continue
+        state_path = os.path.join(port_path, "state")
+        rate_path = os.path.join(port_path, "rate")
+        receive_path = os.path.join(
+            port_path, "counters", "port_rcv_data")
+        transmit_path = os.path.join(
+            port_path, "counters", "port_xmit_data")
+        try:
+            with open(state_path, "r") as handle:
+                state = handle.read().strip()
+            with open(rate_path, "r") as handle:
+                rate_bps = parse_link_rate_bps(handle.read())
+            if not state.startswith("4:") or rate_bps is None:
+                continue
+            with open(receive_path, "r") as handle:
+                int(handle.read().strip())
+            with open(transmit_path, "r") as handle:
+                int(handle.read().strip())
+            return port_path
+        except (OSError, TypeError, ValueError):
+            continue
+    return None
+
+
+class GpfsIoMonitor(object):
+    """Measure GPFS RDMA receive/transmit throughput and link utilization."""
+
+    def __init__(self, port_path, counter_unit_bytes=4.0, clock=None):
+        self.port_path = port_path
+        self.counter_unit_bytes = max(0.0, float(counter_unit_bytes))
+        self.clock = clock or time.monotonic
+        self.last_sample = None
+        self.rate_bps = None
+        if port_path:
+            try:
+                with open(os.path.join(port_path, "rate"), "r") as handle:
+                    self.rate_bps = parse_link_rate_bps(handle.read())
+            except OSError:
+                self.rate_bps = None
+
+    def _read(self):
+        if not self.port_path or self.rate_bps is None:
+            return None
+        try:
+            with open(os.path.join(
+                    self.port_path, "counters", "port_rcv_data"), "r") as handle:
+                received = int(handle.read().strip())
+            with open(os.path.join(
+                    self.port_path, "counters", "port_xmit_data"), "r") as handle:
+                transmitted = int(handle.read().strip())
+            return self.clock(), received, transmitted
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def sample(self):
+        current = self._read()
+        if current is None:
+            return {
+                "available": False,
+                "rx_mib_s": 0.0,
+                "tx_mib_s": 0.0,
+                "io_pct": 0.0,
+            }
+        previous = self.last_sample
+        self.last_sample = current
+        if previous is None:
+            return {
+                "available": True,
+                "rx_mib_s": 0.0,
+                "tx_mib_s": 0.0,
+                "io_pct": 0.0,
+            }
+
+        elapsed = current[0] - previous[0]
+        received_delta = current[1] - previous[1]
+        transmitted_delta = current[2] - previous[2]
+        if elapsed <= 0.0 or received_delta < 0 or transmitted_delta < 0:
+            return {
+                "available": True,
+                "rx_mib_s": 0.0,
+                "tx_mib_s": 0.0,
+                "io_pct": 0.0,
+            }
+
+        rx_bytes_s = received_delta * self.counter_unit_bytes / elapsed
+        tx_bytes_s = transmitted_delta * self.counter_unit_bytes / elapsed
+        capacity_bytes_s = self.rate_bps / 8.0
+        io_pct = 100.0 * max(rx_bytes_s, tx_bytes_s) / capacity_bytes_s
+        return {
+            "available": True,
+            "rx_mib_s": max(0.0, rx_bytes_s / (1024.0 ** 2)),
+            "tx_mib_s": max(0.0, tx_bytes_s / (1024.0 ** 2)),
+            "io_pct": min(100.0, max(0.0, io_pct)),
+        }
+
+
 try:
     detect_cgroup_files()
 except Exception as ex:
     sys.stderr.write('cgroup detection failed: ' + str(ex) + '\n')
     sys.stderr.write(traceback.format_exc())
     sys.stderr.flush()
+
+physical_memory_mb = get_memory_avl()
+cgroup_memory_limit_mb = get_cgroup_memory_limit_mb()
+slurm_memory_limit_mb = get_slurm_memory_limit_mb(e_ncpu)
+headroom_fraction = float(config.get('mem_headroom_fraction', 0.08))
+cap_fraction = float(config.get('mem_cap_fraction_of_total', 0.99))
+e_memtot, e_memtot_buffer, engine_memory_limit_mb = (
+    compute_engine_memory_capacity_mb(
+        physical_memory_mb,
+        explicit_memory_mb=mem,
+        cgroup_limit_mb=cgroup_memory_limit_mb,
+        slurm_limit_mb=slurm_memory_limit_mb,
+        static_reserve_mb=config.get('mem_static_reserve_mb', 100.0),
+        headroom_fraction=headroom_fraction,
+        cap_fraction=cap_fraction,
+    )
+)
+print(
+    'Memory capacity: physical=%.2f explicit=%s cgroup=%s slurm=%s '
+    'effective=%.2f schedulable=%.2f MiB'
+    % (
+        physical_memory_mb,
+        'none' if mem is None else ('%.2f' % float(mem)),
+        'none' if cgroup_memory_limit_mb is None else (
+            '%.2f' % cgroup_memory_limit_mb),
+        'none' if slurm_memory_limit_mb is None else (
+            '%.2f' % slurm_memory_limit_mb),
+        engine_memory_limit_mb,
+        e_memtot_buffer,
+    )
+)
 
 
 if 'SLURM_ARRAY_JOB_ID' in os.environ:
@@ -418,6 +756,27 @@ if scratch_path and os.path.isdir(scratch_path):
     ssd_total_gb = total
     ssd_used_gb = used
     ssd_last_refresh = time.time()
+
+gpfs_rdma_port = detect_gpfs_rdma_port(partition, config)
+try:
+    gpfs_counter_unit_bytes = float(
+        config.get("gpfs_rdma_counter_unit_bytes", 4.0))
+except (TypeError, ValueError):
+    gpfs_counter_unit_bytes = 4.0
+gpfs_io_monitor = GpfsIoMonitor(
+    gpfs_rdma_port,
+    counter_unit_bytes=gpfs_counter_unit_bytes,
+)
+gpfs_io_metrics = gpfs_io_monitor.sample()
+if gpfs_rdma_port:
+    sys.stderr.write(
+        "GPFS I/O telemetry: RDMA port %s at %.1f Gb/s\n"
+        % (gpfs_rdma_port, float(gpfs_io_monitor.rate_bps or 0.0) / 1e9)
+    )
+else:
+    sys.stderr.write(
+        "GPFS I/O telemetry unavailable; interface will report n/a\n")
+sys.stderr.flush()
 
 
 #self register
@@ -474,6 +833,14 @@ print(" Preparing to register on "+ uri)
 s = zslurm_shared.TimeoutServerProxy(uri, timeout = REQUEST_TIMEOUT, allow_none = True)
 
 
+def manager_supports_method(proxy, method_name):
+    """Use XML-RPC introspection for rolling protocol compatibility."""
+    try:
+        return str(method_name) in set(proxy.system.listMethods())
+    except (MANAGER_RPC_ERRORS, xmlrpclib.Fault, AttributeError, TypeError):
+        return False
+
+
 def register_at_manager(manager_uri):
     proxy = zslurm_shared.TimeoutServerProxy(
         str(manager_uri), timeout=REQUEST_TIMEOUT, allow_none=True)
@@ -504,6 +871,29 @@ def current_instance_manager_uri(instance_name):
     return f"http://{endpoint_host}:{int(endpoint_port)}/{endpoint_path}"
 
 
+def reconnect_to_instance(instance_name, manager_uri):
+    """Reconnect when the logical instance now points at another manager."""
+    redirected_uri = current_instance_manager_uri(instance_name)
+    if not redirected_uri or redirected_uri == manager_uri:
+        return None
+    new_proxy, new_id = register_at_manager(redirected_uri)
+    return new_proxy, new_id, redirected_uri
+
+
+def safe_unregister(proxy, engine_id):
+    """Best-effort unregister without masking the chief's original error."""
+    if proxy is None or engine_id in (None, 'DENIED'):
+        return
+    try:
+        proxy.unregister(engine_id)
+    except MANAGER_RPC_ERRORS as rpc_error:
+        sys.stderr.write(
+            f"{xtime()} - [{engine_id}] Manager unavailable during unregister: "
+            f"{rpc_error}\n"
+        )
+        sys.stderr.flush()
+
+
 
 #check if hte node has the archive mount
 failed_node = not ensure_archive_mount_if_needed(partition)
@@ -527,7 +917,18 @@ while attempt > 0 :
                 ssd_used_gb,
                 inst_name,
             )
-    except (socket.error, httplib.HTTPException) as serror :
+    except MANAGER_RPC_ERRORS as serror :
+        try:
+            reconnected = reconnect_to_instance(inst_name, uri)
+            if reconnected is not None:
+                s, myid, uri = reconnected
+                break
+        except Exception as reconnect_error:
+            sys.stderr.write(
+                f"{xtime()} - Initial instance redirect reconnect failed: "
+                f"{reconnect_error}\n"
+            )
+            sys.stderr.flush()
         attempt -= 1
         sleep_time = random.randint(REGISTRATION_SLEEP, REGISTRATION_SLEEP + REGISTRATION_SLEEP_RANDOM)
         print('[-] Failed registration, %d attempts left, sleeping for %d seconds' % (attempt, sleep_time))
@@ -546,6 +947,13 @@ if myid == "DENIED":
     sys.exit()
 else:
     print(("[%s] Registered with controller, got id: " % myip) + myid)
+
+manager_supports_gpfs_io = manager_supports_method(s, "poll_with_gpfs")
+sys.stderr.write(
+    "GPFS I/O manager protocol: %s\n"
+    % ("enabled" if manager_supports_gpfs_io else "legacy fallback")
+)
+sys.stderr.flush()
  
 def handler(signum, frame) :
     print(("[%s] CATCH SYSTEM EXIT" % myid))
@@ -693,6 +1101,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
                     status.lock.acquire()
                     status.current_cpu_usage[jobid] = cpu_percentage
                     pss_mb = r['pss'] / (1024.0 * 1024.0)
+                    rss_mb = r['rss'] / (1024.0 * 1024.0)
                     status.current_mem_usage[jobid] = pss_mb
                     status.lock.release()
 
@@ -700,6 +1109,7 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
                         jobid,
                         cpu_cores=cpu_percentage,
                         pss_mb=pss_mb,
+                        rss_mb=rss_mb,
                         sampled_at=cur_time,
                     )
 
@@ -961,8 +1371,40 @@ try :
                     #print('%s - Reported that job %s finished with rcode %s' % (xtime(), str(jobid), str(rcode)))
 
                     status.reports.pop(jobid,None)
-                except (socket.error, httplib.HTTPException) as serror :
-                    print('%s - [%s] Caught a socket error  for jobid %s!' % (xtime(), myid,  str(jobid)))
+                except MANAGER_RPC_ERRORS as rpc_error :
+                    print(
+                        '%s - [%s] Manager RPC failed while reporting jobid %s: %s'
+                        % (xtime(), myid, str(jobid), rpc_error)
+                    )
+                    try:
+                        reconnected = reconnect_to_instance(inst_name, uri)
+                        if reconnected is not None:
+                            s, myid, uri = reconnected
+                            manager_supports_gpfs_io = manager_supports_method(
+                                s, "poll_with_gpfs")
+                            status.assigned_jobs.clear()
+                            last_seen = time.time()
+                            s.job_finished(
+                                myid,
+                                jobid,
+                                rcode,
+                                status.reports.get(
+                                    jobid,
+                                    {'no_job_report': True, 'jobid': jobid},
+                                ),
+                            )
+                            status.reports.pop(jobid, None)
+                            print(
+                                f"[{myid}] Reconnected through instance "
+                                f"{inst_name} to {uri}; completion reported."
+                            )
+                            continue
+                    except Exception as reconnect_error:
+                        sys.stderr.write(
+                            f"{xtime()} - [{myid}] Completion reconnect failed: "
+                            f"{reconnect_error}\n"
+                        )
+                        sys.stderr.flush()
                     nretcodes[jobid] = rcode
             status.return_codes = nretcodes
             status.lock.release()
@@ -995,7 +1437,7 @@ try :
                     overcommit = float(config.get('mem_overcommit_fraction', 1.0))
                     jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available) * overcommit, partition)
                     #print('%s - REQUEST RESULT' % xtime(), len(jobs))
-                except (socket.error, httplib.HTTPException) as serror :
+                except MANAGER_RPC_ERRORS as serror :
                     print ("%s - REQUEST HTTP Error" % xtime())
                     jobs = []
             for job in jobs:
@@ -1005,7 +1447,7 @@ try :
                         status.assigned_jobs.pop(jobid,None)
                         try :
                             permission = s.can_run_assigned_job(myid, jobid)
-                        except (socket.error, httplib.HTTPException) as serror :
+                        except MANAGER_RPC_ERRORS as serror :
                             continue
                         if not permission: #drop
                             continue
@@ -1110,7 +1552,7 @@ try :
             last_cgroup_cpu_time = cgroup_cpu_time
             last_cgroup_sample_time = now
 
-        cgroup_memory_mb = get_cgroup_memory_current_mb()
+        cgroup_memory_mb = get_cgroup_memory_without_page_cache_mb()
         if not cgroup_memory_mb is None:
             cgroup_limit_mb = get_cgroup_memory_limit_mb()
             mem_capacity = e_memtot_buffer if cgroup_limit_mb is None else min(e_memtot_buffer, cgroup_limit_mb)
@@ -1122,7 +1564,17 @@ try :
             idle_start = 0
         commands = []
         try:
-            sys.stderr.write(f"{xtime()} - POLL; INFO: {myid} {cpu_usage:.2f} {e_memtot:.2f} {e_memtot_buffer:.2f} {get_memory_avl():.2f} {mem_usage:.2f} {load:.2f} {sys_cpu_busy:.2f} {sys_iowait:.2f} {mode} {status.current_cpu_usage} {status.current_mem_usage}\n")
+            gpfs_io_metrics = gpfs_io_monitor.sample()
+            sys.stderr.write(
+                f"{xtime()} - POLL; INFO: {myid} {cpu_usage:.2f} "
+                f"{e_memtot:.2f} {e_memtot_buffer:.2f} "
+                f"{get_memory_avl():.2f} {mem_usage:.2f} {load:.2f} "
+                f"{sys_cpu_busy:.2f} {sys_iowait:.2f} "
+                f"gpfs_rx={gpfs_io_metrics['rx_mib_s']:.2f}MiB/s "
+                f"gpfs_tx={gpfs_io_metrics['tx_mib_s']:.2f}MiB/s "
+                f"gpfs={gpfs_io_metrics['io_pct']:.2f}% {mode} "
+                f"{status.current_cpu_usage} {status.current_mem_usage}\n"
+            )
             sys.stderr.flush()
 
             if now - ssd_last_refresh >= ssd_refresh_interval:
@@ -1132,33 +1584,38 @@ try :
                 ssd_last_refresh = now
 
             idle_duration = 0.0 if idle_start == 0 else (now - idle_start)
-            commands = s.poll(
-                myid,
-                cpu_usage,
-                mem_usage,
-                load,
-                mode,
-                idle_duration,
+            poll_args = (
+                myid, cpu_usage, mem_usage, load, mode, idle_duration,
                 status.current_cpu_usage.copy(),
                 status.current_mem_usage.copy(),
-                sys_cpu_busy,
-                sys_iowait,
-                ssd_total_gb,
-                ssd_used_gb,
+                sys_cpu_busy, sys_iowait, ssd_total_gb, ssd_used_gb,
             )
+            if manager_supports_gpfs_io:
+                commands = s.poll_with_gpfs(
+                    *(poll_args + (
+                        gpfs_io_metrics["rx_mib_s"],
+                        gpfs_io_metrics["tx_mib_s"],
+                        gpfs_io_metrics["io_pct"],
+                        gpfs_io_metrics["available"],
+                    ))
+                )
+            else:
+                commands = s.poll(*poll_args)
             last_seen = time.time()
-        except (socket.error, httplib.HTTPException) as serror :
+        except MANAGER_RPC_ERRORS as serror :
             print('%s - [%s] Caught a socket error for command poll !' % (xtime(), myid))
             reconnected = False
             # The logical instance record is atomically redirected during a
             # manager handover.  This fallback also covers an old manager that
             # exits before this chief receives MIGRATE_MANAGER.
             try:
-                redirected_uri = current_instance_manager_uri(inst_name)
-                if redirected_uri and redirected_uri != uri:
-                    new_proxy, new_id = register_at_manager(redirected_uri)
+                reconnected = reconnect_to_instance(inst_name, uri)
+                if reconnected is not None:
+                    new_proxy, new_id, redirected_uri = reconnected
                     status.assigned_jobs.clear()
                     s = new_proxy
+                    manager_supports_gpfs_io = manager_supports_method(
+                        s, "poll_with_gpfs")
                     myid = new_id
                     uri = redirected_uri
                     last_seen = time.time()
@@ -1211,7 +1668,7 @@ try :
                         ssd_used_gb,
                         inst_name,
                     )
-                except (socket.error, httplib.HTTPException) as serror :
+                except MANAGER_RPC_ERRORS as serror :
                     pass
                 if myid == 'DENIED':
                     print(('[%s] Denied reregistration, stopping.' %myid))
@@ -1239,6 +1696,8 @@ try :
                     # remain untouched and are reconciled by the next target poll.
                     status.assigned_jobs.clear()
                     s = new_proxy
+                    manager_supports_gpfs_io = manager_supports_method(
+                        s, "poll_with_gpfs")
                     myid = new_id
                     uri = str(target_uri)
                     inst_name = target_instance or inst_name
@@ -1290,12 +1749,12 @@ try :
     sys.stdout.flush()
     sys.stderr.flush()
 
-    s.unregister(myid)
+    safe_unregister(s, myid)
 
 
 except (Exception, KeyboardInterrupt, SystemExit) :
     sys.stdout.flush()
     sys.stderr.flush()
 
-    s.unregister(myid)
+    safe_unregister(s, myid)
     raise

@@ -85,6 +85,14 @@ class HandoverSnapshotTests(unittest.TestCase):
         z.jobs.jobs_by_id[jobid] = job
         return job
 
+    def test_handover_display_marks_unstarted_state_idle(self):
+        z = self.zslurm
+
+        self.assertEqual(z.handover_display_label("ACTIVE"), "IDLE")
+        self.assertEqual(
+            z.handover_display_label("TARGET_ACTIVE"), "TAKEOVER DONE"
+        )
+
     def test_snapshot_requeues_assigned_and_preserves_running_lease(self):
         z = self.zslurm
         running = self.add_job("1", "RUNNING", 20)
@@ -158,6 +166,30 @@ class HandoverSnapshotTests(unittest.TestCase):
         self.assertEqual(commands[0][0], z.zslurm_shared.MIGRATE_MANAGER)
         self.assertEqual(commands[0][1]["instance"], "target")
         self.assertNotIn("handover_secret", commands[0][1])
+
+    def test_extended_poll_exposes_gpfs_metrics_without_replacing_iowait(self):
+        z = self.zslurm
+        engine = z.Engine(
+            "node1", 192, 344064, "compute",
+            cluster_id="12345", managed=True,
+        )
+        z.engines.engine_by_id[engine.engine_id] = engine
+        z.engines.engine_by_clusterid[engine.cluster_id] = engine
+
+        commands = z.poll_with_gpfs(
+            "node1", 75.0, 50.0, 0.8, z.zslurm_shared.RUNNING, 0.0,
+            {}, {}, 80.0, 1.5, 0.0, 0.0,
+            1200.0, 300.0, 9.6, True,
+        )
+
+        self.assertEqual(commands, [])
+        self.assertEqual(engine.sys_iowait, 1.5)
+        self.assertEqual(engine.gpfs_rx_mib_s, 1200.0)
+        self.assertEqual(engine.gpfs_tx_mib_s, 300.0)
+        self.assertEqual(engine.gpfs_io_pct, 9.6)
+        self.assertTrue(engine.gpfs_io_available)
+        node = z.engines.list_nodes()[0]
+        self.assertEqual(node[20:24], (1200.0, 300.0, 9.6, True))
 
     def test_receive_rejects_nonempty_target(self):
         z = self.zslurm

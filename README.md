@@ -648,6 +648,13 @@ The chief monitors the complete process tree's proportional set size (PSS). It
 will not shrink a lease below observed memory plus configurable headroom. The
 response reports when this safety floor adjusted the requested target.
 
+For node-wide cgroup pressure, the chief subtracts ordinary filesystem page
+cache from `memory.current` using `memory.stat` (`file - shmem`). Shared memory,
+anonymous memory, and kernel memory remain charged. The resulting value drives
+both the reported node memory usage and the physical-memory gate used for new
+job admission and lease growth. If the required cgroup counters are missing,
+the complete charge is retained conservatively.
+
 Relevant manager/chief configuration keys are:
 
 ```yaml
@@ -800,6 +807,8 @@ The file contains columns such as:
 - **Manager state**: `managed`, `stopping`
 - **Capacity and usage**: `cores`, `totmem_mb`, `cpu_pct`, `mem_pct`, `load`
 - **System metrics**: `sys_cpu_busy_pct`, `sys_iowait_pct`
+- **GPFS fabric metrics**: `gpfs_rx_mib_s`, `gpfs_tx_mib_s`,
+  `gpfs_io_pct`, `gpfs_io_available`
 - **Reserved resources**: `res_cores_reserved`, `res_mem_reserved_mb`
 - **Job count**: `jobs_running`
 - **SSD state**: `has_ssd`, `ssd_total_gb`, `ssd_used_gb`, `res_ssd_reserved_gb`
@@ -983,11 +992,34 @@ Useful options:
 - **Runtime and remaining time**
 - **Number of jobs on the engine**
 - **CPU usage, memory usage, load, system CPU busy, IO wait**
+- **GPFS RDMA receive/transmit MiB/s and link utilization**
 - **Reserved CPU and reserved memory**
 - **SSD availability, total SSD, used SSD, reserved SSD**
 - **Engine status**
 
 This makes `zsnodes` the best tool for checking whether engines are full, idle, unmanaged, stopping, or carrying SSD-constrained work.
+
+The curses status row uses `CPU/GPFS (%)`: the first value is host CPU busy;
+the second is the mean GPFS fabric utilization across reporting compute
+engines. GPFS traffic is measured from the byte counters on the RDMA port that
+Spectrum Scale is configured to use. `GPFS%` is
+`max(receive_rate, transmit_rate) / link_rate`, because the fabric is full
+duplex. It is throughput utilization, not Linux IO-wait time. The old
+`sys_iowait_pct` metric remains available through `zsnodes` and node reports.
+
+On the current Snellius node classes the defaults are `mlx5_2/1` for
+compute/fat engines and `mlx5_0/1` for archive engines. They can be controlled
+through the chief configuration:
+
+```yaml
+gpfs_io_enable: true
+gpfs_rdma_port: mlx5_2/1       # optional override
+gpfs_rdma_counter_unit_bytes: 4
+```
+
+The counters cover all GPFS traffic over that client port, not one individual
+GPFS filesystem such as `work3`. Per-filesystem GPFS counters require site
+monitoring privileges that ordinary pilot jobs do not have.
 
 ### `zscancel`
 

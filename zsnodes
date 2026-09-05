@@ -10,14 +10,16 @@ import sys
 import traceback
 import json
 
-SCHEMA_VERSION = 1
-# Stable, numeric field order for the 20-field list_nodes tuple
+SCHEMA_VERSION = 2
+# Stable, numeric field order for the list_nodes tuple
 # (see docs/agent-interface-plan.md). Units: *_mb MB, *_gb GB, *_s seconds.
 NODE_FIELDS = ["partition", "engine_id", "cluster_id", "cores", "totmem_mb",
                "runtime_s", "timeleft_s", "njobs", "cpu_usage", "mem_usage_pct",
                "load", "status", "sys_cpu_busy_pct", "sys_iowait_pct",
                "res_cpu_reserved", "res_mem_reserved_mb", "has_ssd",
-               "ssd_total_gb", "ssd_used_gb", "res_ssd_reserved_gb"]
+               "ssd_total_gb", "ssd_used_gb", "res_ssd_reserved_gb",
+               "gpfs_rx_mib_s", "gpfs_tx_mib_s", "gpfs_io_pct",
+               "gpfs_io_available"]
 
 parser = argparse.ArgumentParser(description='ZSlurm node listing')
 parser.add_argument('--all', action='store_true', help='Show also queued nodes.')
@@ -70,7 +72,7 @@ if args.as_json:
     for instance in instances:
         rows = []
         for node in _fetch_nodes(instance):
-            n = list(node) + [0.0] * (20 - len(node))  # pad for older managers
+            n = list(node) + [0.0] * (24 - len(node))  # pad for older managers
             rows.append({
                 "partition": n[0], "engine_id": n[1], "cluster_id": n[2],
                 "cores": float(n[3]), "totmem_mb": float(n[4]),
@@ -82,6 +84,10 @@ if args.as_json:
                 "res_mem_reserved_mb": float(n[15]), "has_ssd": bool(n[16]),
                 "ssd_total_gb": float(n[17]), "ssd_used_gb": float(n[18]),
                 "res_ssd_reserved_gb": float(n[19]),
+                "gpfs_rx_mib_s": float(n[20]),
+                "gpfs_tx_mib_s": float(n[21]),
+                "gpfs_io_pct": float(n[22]),
+                "gpfs_io_available": bool(n[23]),
             })
         out["instances"][instance] = rows
     print(json.dumps(out, indent=2, sort_keys=True))
@@ -100,7 +106,8 @@ if use_pretty:
 if args.parseable:
     header = [
         "INSTANCE","ID","SLURM","PARTITION","CORES","MEM","TIME","REMAINING","NJOBS",
-        "CPU","MEM","HOSTLOAD","HOSTCPU","HOSTIO","RESCPU","RESMEM","SSD","SSD_TOTAL","SSD_USED","SSD_RSVD","STATUS"
+        "CPU","MEM","HOSTLOAD","HOSTCPU","HOSTIO","RESCPU","RESMEM","SSD","SSD_TOTAL","SSD_USED","SSD_RSVD",
+        "GPFS_RX_MIB_S","GPFS_TX_MIB_S","GPFS_IO","STATUS"
     ]
     print("\t".join(header))
 
@@ -118,6 +125,10 @@ for instance in instances:
             ssd_total_gb = node[17] if len(node) > 17 else 0.0
             ssd_used_gb = node[18] if len(node) > 18 else 0.0
             res_ssd_reserved_gb = node[19] if len(node) > 19 else 0.0
+            gpfs_rx_mib_s = node[20] if len(node) > 20 else 0.0
+            gpfs_tx_mib_s = node[21] if len(node) > 21 else 0.0
+            gpfs_io_pct = node[22] if len(node) > 22 else 0.0
+            gpfs_io_available = bool(node[23]) if len(node) > 23 else False
             runtime_fmt = zslurm_shared.format_time(runtime)
             timeleft_fmt = zslurm_shared.format_time(timeleft)
             row = [
@@ -141,6 +152,9 @@ for instance in instances:
                 f"{ssd_total_gb:.1f}Gb",
                 f"{ssd_used_gb:.1f}Gb",
                 f"{res_ssd_reserved_gb:.1f}Gb",
+                f"{gpfs_rx_mib_s:.1f}",
+                f"{gpfs_tx_mib_s:.1f}",
+                (f"{gpfs_io_pct:.1f}" if gpfs_io_available else "n/a"),
                 status,
             ]
             print("\t".join(row))
@@ -158,6 +172,10 @@ for instance in instances:
             ssd_total_gb = node[17] if len(node) > 17 else 0.0
             ssd_used_gb = node[18] if len(node) > 18 else 0.0
             res_ssd_reserved_gb = node[19] if len(node) > 19 else 0.0
+            gpfs_rx_mib_s = node[20] if len(node) > 20 else 0.0
+            gpfs_tx_mib_s = node[21] if len(node) > 21 else 0.0
+            gpfs_io_pct = node[22] if len(node) > 22 else 0.0
+            gpfs_io_available = bool(node[23]) if len(node) > 23 else False
             runtime_fmt = zslurm_shared.format_time(runtime)
             timeleft_fmt = zslurm_shared.format_time(timeleft)
             table.append([
@@ -168,19 +186,21 @@ for instance in instances:
                 f"{sys_cpu_busy:.1f}", f"{sys_iowait:.1f}",
                 f"{res_cpu:.1f}", f"{res_mem_mb/1024.0:.1f}Gb",
                 'Y' if has_ssd else 'N', f"{ssd_total_gb:.1f}Gb", f"{ssd_used_gb:.1f}Gb", f"{res_ssd_reserved_gb:.1f}Gb",
+                f"{gpfs_rx_mib_s:.1f}", f"{gpfs_tx_mib_s:.1f}",
+                (f"{gpfs_io_pct:.1f}" if gpfs_io_available else "n/a"),
                 status
             ])
         if len(instances) > 1:
             print(f"Instance: {instance}")
         
-        print(tabulate_module.tabulate(table, headers=['ID','SLURM','PARTITION','CORES','MEM','TIME','REMAINING','NJOBS','CPU','MEM','HOSTLOAD','HOSTCPU','HOSTIO','RESCPU','RESMEM','SSD','SSD_TOTAL','SSD_USED','SSD_RSVD','STATUS']))
+        print(tabulate_module.tabulate(table, headers=['ID','SLURM','PARTITION','CORES','MEM','TIME','REMAINING','NJOBS','CPU','MEM','HOSTLOAD','HOSTCPU','HOSTIO','RESCPU','RESMEM','SSD','SSD_TOTAL','SSD_USED','SSD_RSVD','GPFS_RX','GPFS_TX','GPFS_IO','STATUS']))
         
         if len(instances) > 1:
             print()
     else:
         if len(instances) > 1:
             print(f"Instance: {instance}")
-        print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tHOSTLOAD\tHOSTCPU\tHOSTIO\tRESCPU\tRESMEM\tSSD\tSSD_TOTAL\tSSD_USED\tSSD_RSVD\tSTATUS")
+        print("ID\tSLURM\tPARTITION\tCORES\tMEM\tTIME\tREMAINING\tNJOBS\tCPU\tMEM\tHOSTLOAD\tHOSTCPU\tHOSTIO\tRESCPU\tRESMEM\tSSD\tSSD_TOTAL\tSSD_USED\tSSD_RSVD\tGPFS_RX\tGPFS_TX\tGPFS_IO\tSTATUS")
         for node in nodes:
             partition, engine_id, cluster_id, cores, totmem, runtime, timeleft, njobs, cpu_usage, mem_usage, load, status = node[:12]
             sys_cpu_busy = node[12] if len(node) > 12 else 0.0
@@ -191,12 +211,18 @@ for instance in instances:
             ssd_total_gb = node[17] if len(node) > 17 else 0.0
             ssd_used_gb = node[18] if len(node) > 18 else 0.0
             res_ssd_reserved_gb = node[19] if len(node) > 19 else 0.0
+            gpfs_rx_mib_s = node[20] if len(node) > 20 else 0.0
+            gpfs_tx_mib_s = node[21] if len(node) > 21 else 0.0
+            gpfs_io_pct = node[22] if len(node) > 22 else 0.0
+            gpfs_io_available = bool(node[23]) if len(node) > 23 else False
             runtime_fmt = zslurm_shared.format_time(runtime)
             timeleft_fmt = zslurm_shared.format_time(timeleft)
-            print('%s\t%s\t%s\t%.2g\t%.1fGb\t%s\t%s\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1fGb\t%s\t%.1fGb\t%.1fGb\t%.1fGb\t%s' % (
+            print('%s\t%s\t%s\t%.2g\t%.1fGb\t%s\t%s\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1fGb\t%s\t%.1fGb\t%.1fGb\t%.1fGb\t%.1f\t%.1f\t%s\t%s' % (
                 engine_id, cluster_id, partition, cores, totmem/1024.0, runtime_fmt, timeleft_fmt, njobs,
                 cpu_usage, mem_usage, load, sys_cpu_busy, sys_iowait, res_cpu, res_mem_mb/1024.0,
-                ('Y' if has_ssd else 'N'), ssd_total_gb, ssd_used_gb, res_ssd_reserved_gb, status))
+                ('Y' if has_ssd else 'N'), ssd_total_gb, ssd_used_gb, res_ssd_reserved_gb,
+                gpfs_rx_mib_s, gpfs_tx_mib_s,
+                ('%.1f' % gpfs_io_pct if gpfs_io_available else 'n/a'), status))
         if len(instances) > 1:
             print()
 

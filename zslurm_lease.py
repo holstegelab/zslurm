@@ -189,9 +189,14 @@ class ChiefLeaseController:
             "sampled_duration_s": 0.0,
             "used_core_seconds": 0.0,
             "pss_mb_seconds": 0.0,
+            "rss_sampled_duration_s": 0.0,
+            "rss_mb_seconds": 0.0,
+            "rss_max_mb": None,
             "cpu_samples": [],
             "pss_mb_samples": [],
+            "rss_mb_samples": [],
             "samples_seen": 0,
+            "rss_samples_seen": 0,
         }
         record["phases"].append(phase)
         record["phase_name"] = name
@@ -218,22 +223,40 @@ class ChiefLeaseController:
             phase["sampled_duration_s"] += duration
             phase["used_core_seconds"] += float(sample["cpu_cores"]) * duration
             phase["pss_mb_seconds"] += float(sample["pss_mb"]) * duration
+            rss_mb = sample.get("rss_mb")
+            if rss_mb is not None:
+                phase["rss_sampled_duration_s"] += duration
+                phase["rss_mb_seconds"] += float(rss_mb) * duration
         sample["sampled_at_epoch"] = float(now)
 
     @staticmethod
-    def _add_sample_locked(phase, cpu_cores, pss_mb):
-        """Keep bounded paired reservoirs for phase quantiles."""
+    def _add_sample_locked(phase, cpu_cores, pss_mb, rss_mb=None):
+        """Keep bounded reservoirs for phase quantiles and exact peak RSS."""
 
         phase["samples_seen"] += 1
         seen = int(phase["samples_seen"])
         if len(phase["cpu_samples"]) < PHASE_SAMPLE_RESERVOIR_SIZE:
             phase["cpu_samples"].append(cpu_cores)
             phase["pss_mb_samples"].append(pss_mb)
+        else:
+            replace = random.randrange(seen)
+            if replace < PHASE_SAMPLE_RESERVOIR_SIZE:
+                phase["cpu_samples"][replace] = cpu_cores
+                phase["pss_mb_samples"][replace] = pss_mb
+
+        if rss_mb is None:
             return
-        replace = random.randrange(seen)
+        phase["rss_samples_seen"] += 1
+        rss_seen = int(phase["rss_samples_seen"])
+        current_max = phase.get("rss_max_mb")
+        if current_max is None or rss_mb > float(current_max):
+            phase["rss_max_mb"] = float(rss_mb)
+        if len(phase["rss_mb_samples"]) < PHASE_SAMPLE_RESERVOIR_SIZE:
+            phase["rss_mb_samples"].append(rss_mb)
+            return
+        replace = random.randrange(rss_seen)
         if replace < PHASE_SAMPLE_RESERVOIR_SIZE:
-            phase["cpu_samples"][replace] = cpu_cores
-            phase["pss_mb_samples"][replace] = pss_mb
+            phase["rss_mb_samples"][replace] = rss_mb
 
     @classmethod
     def _close_phase_locked(cls, record, now):
@@ -278,11 +301,19 @@ class ChiefLeaseController:
         held_mem_mb = float(phase["held_mem_mb"])
         cpu_samples = phase["cpu_samples"]
         pss_samples = phase["pss_mb_samples"]
+        rss_samples = phase.get("rss_mb_samples", [])
+        rss_sampled = max(
+            0.0, float(phase.get("rss_sampled_duration_s", 0.0))
+        )
         avg_cpu = (
             float(phase["used_core_seconds"]) / sampled if sampled > 0.0 else None
         )
         avg_pss_mb = (
             float(phase["pss_mb_seconds"]) / sampled if sampled > 0.0 else None
+        )
+        avg_rss_mb = (
+            float(phase.get("rss_mb_seconds", 0.0)) / rss_sampled
+            if rss_sampled > 0.0 else None
         )
         used_core_seconds = (
             float(phase["used_core_seconds"]) if sampled > 0.0 else None
@@ -307,16 +338,25 @@ class ChiefLeaseController:
             "requested_mem_mb": float(phase["requested_mem_mb"]),
             "sample_count": int(phase["samples_seen"]),
             "sampled_duration_s": sampled,
+            "rss_sample_count": int(phase.get("rss_samples_seen", 0)),
+            "rss_sampled_duration_s": rss_sampled,
             "avg_cpu_cores": avg_cpu,
             "avg_pss_mb": avg_pss_mb,
+            "avg_rss_mb": avg_rss_mb,
+            "rss_max_mb": phase.get("rss_max_mb"),
             "cpu_cores_percentiles": _percentiles(cpu_samples),
             "pss_mb_percentiles": _percentiles(pss_samples),
+            "rss_mb_percentiles": _percentiles(rss_samples),
             "reserved_core_seconds": held_cpu * duration,
             "sampled_reserved_core_seconds": sampled_reserved_core_seconds,
             "used_core_seconds": used_core_seconds,
             "reserved_mem_mb_seconds": held_mem_mb * duration,
             "sampled_reserved_mem_mb_seconds": sampled_reserved_mem_mb_seconds,
             "pss_mb_seconds": pss_mb_seconds,
+            "rss_mb_seconds": (
+                float(phase.get("rss_mb_seconds", 0.0))
+                if rss_sampled > 0.0 else None
+            ),
             "cpu_efficiency": (
                 used_core_seconds / sampled_reserved_core_seconds
                 if sampled_reserved_core_seconds > 0.0
@@ -328,6 +368,9 @@ class ChiefLeaseController:
                 else None
             ),
             "sample_coverage": sampled / duration if duration > 0.0 else 0.0,
+            "rss_sample_coverage": (
+                rss_sampled / duration if duration > 0.0 else 0.0
+            ),
         }
 
     @staticmethod
@@ -471,13 +514,22 @@ class ChiefLeaseController:
             result.update(summary)
             return result
 
-    def record_usage(self, job_id, cpu_cores, pss_mb, sampled_at=None):
-        """Attach one chief process-tree sample to the current lease phase."""
+    def record_usage(
+        self, job_id, cpu_cores, pss_mb, sampled_at=None, rss_mb=None
+    ):
+        """Attach one chief process-tree sample to the current lease phase.
+
+        ``rss_mb`` is optional to keep older callers and tests compatible.
+        New chiefs provide it so each phase gets time-weighted RSS statistics
+        and an exact maximum over all live process-tree samples.
+        """
 
         key = self._key(job_id)
         try:
             cpu_cores = max(0.0, _finite_float(cpu_cores, "cpu_cores"))
             pss_mb = max(0.0, _finite_float(pss_mb, "pss_mb"))
+            if rss_mb is not None:
+                rss_mb = max(0.0, _finite_float(rss_mb, "rss_mb"))
             now = time.time() if sampled_at is None else _finite_float(
                 sampled_at, "sampled_at"
             )
@@ -494,13 +546,17 @@ class ChiefLeaseController:
                 phase["sampled_duration_s"] += duration
                 phase["used_core_seconds"] += cpu_cores * duration
                 phase["pss_mb_seconds"] += pss_mb * duration
+                if rss_mb is not None:
+                    phase["rss_sampled_duration_s"] += duration
+                    phase["rss_mb_seconds"] += rss_mb * duration
             else:
                 self._account_usage_until_locked(record, now)
-            self._add_sample_locked(phase, cpu_cores, pss_mb)
+            self._add_sample_locked(phase, cpu_cores, pss_mb, rss_mb)
             record["last_usage_sample"] = {
                 "sampled_at_epoch": now,
                 "cpu_cores": cpu_cores,
                 "pss_mb": pss_mb,
+                "rss_mb": rss_mb,
             }
             return True
 

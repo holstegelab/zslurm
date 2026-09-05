@@ -112,6 +112,44 @@ class JobDependencyTests(unittest.TestCase):
         self.assertEqual(self.jobs.total_jobs, before_total)
         self.assertEqual(len(self.jobs.jobs_by_id), 0)
 
+    def test_targeted_status_survives_finished_history_trimming(self):
+        completed = self.submit("completed", owner="alice")
+        pending = self.submit("pending", owner="alice")
+        other_owner = self.submit("other-owner", owner="bob")
+
+        self.jobs.job_done(completed.jobid, self.zslurm.RC_SUCCESS)
+        self.jobs.job_done(other_owner.jobid, self.zslurm.RC_SUCCESS)
+        # The UI/report history is intentionally bounded and may no longer
+        # contain this job after a slow or blocked executor poll.
+        self.jobs.finished_jobs_by_owner["alice"] = []
+
+        result = self.jobs.get_job_states(
+            [completed.jobid, pending.jobid, other_owner.jobid, "unknown"],
+            owner="alice",
+        )
+
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["states"], {
+            completed.jobid: "COMPLETED",
+            pending.jobid: "PENDING",
+        })
+        self.assertEqual(result["terminal"], [completed.jobid])
+        self.assertEqual(result["unknown"], [other_owner.jobid, "unknown"])
+        self.assertEqual(
+            self.jobs.dependency_history[completed.jobid]["owner"], "alice"
+        )
+
+        # A handover from a pre-RPC manager carries otherwise useful compact
+        # outcomes without an owner field. Manager-global exact ids keep those
+        # recoverable during a rolling upgrade.
+        del self.jobs.dependency_history[completed.jobid]["owner"]
+        legacy_result = self.jobs.get_job_states(
+            [completed.jobid], owner="alice"
+        )
+        self.assertEqual(
+            legacy_result["states"], {completed.jobid: "COMPLETED"}
+        )
+
     def test_afterok_waits_for_success_and_then_dispatches(self):
         parent = self.submit("parent")
         child = self.submit("child", "afterok:%s" % parent.jobid)
