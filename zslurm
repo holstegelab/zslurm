@@ -6053,7 +6053,8 @@ def compute_autogrow_plan(all_engines, partition):
     # when no scratch is idle, cap plain engines at autogrow_max_nonssd_fraction of
     # the fleet, so a transient scratch shortage cannot drift us onto a mostly-plain
     # cluster. Scratch growth is never capped here (equal cost, always preferred).
-    if best_part is not None and not best_use_scratch:
+    if (best_part is not None and not best_use_scratch
+            and any(scratch for _, scratch in status.autogrow_prefer_partitions)):
         max_nonssd_frac = float(status.config.get(
             "autogrow_max_nonssd_fraction",
             getattr(status, 'autogrow_max_nonssd_fraction', 0.5)))
@@ -6077,10 +6078,10 @@ def compute_autogrow_plan(all_engines, partition):
                 'plan_reason': 'ssd-preferred: non-SSD engine cap reached, waiting for scratch capacity',
             }
 
-    # Don't queue an engine that has nowhere to start right now: parking a PENDING
-    # engine allocation while the whole cluster is full is wasteful and contradicts
-    # any concurrent phase-out. Wait for a node to free instead.
-    if best_idle <= 0:
+    # Normally queue demand-backed pilots even when the cluster is busy: Slurm
+    # owns admission, and queued capacity above already prevents repeat growth.
+    # Retain an explicit opt-in for sites that prohibit queued pilot allocations.
+    if best_idle <= 0 and status.config.get('autogrow_require_idle_nodes', False):
         return {
             'has_eligible': len(eligible) > 0,
             'eligible_n': len(eligible),
@@ -6558,7 +6559,7 @@ def thread_check_commands():
                 if plan.get('best_nodes', 0) > 0:
                     plan_compute = f"grow: {plan.get('best_nodes', 0)} @ {plan.get('best_part', 'compute')}, cooldown {int(cooldown_remaining_compute)}s left"                                            
                 else:
-                    plan_compute = f"no nodes needed"
+                    plan_compute = plan.get('plan_reason', 'no nodes needed')
 
                 if cooldown_remaining_compute <= 0: # Autogrow cooldown expired, lets see if we need to start some engines
                     if plan.get('best_part',None) is not None:

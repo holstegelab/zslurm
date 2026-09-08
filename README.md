@@ -385,6 +385,13 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - CPU count for automatically started pilots; `0` requests an exclusive node
 - **`autogrow_enable`** / **`autogrow_max_compute_nodes`**
   - whether automatic allocation is initially enabled and its hard fleet cap
+- **`autogrow_require_idle_nodes`**
+  - optional, defaults to `false`: let Slurm queue demand-backed pilots even
+    when no completely idle nodes are reported; idle capacity still influences
+    partition preference. Queued pilots count against residual demand and the
+    fleet cap. Set `true` only for a site policy requiring immediately idle nodes.
+    A plain-only site such as Spider is not subject to the scratch-preference
+    fraction cap when no scratch partition is configured.
 - **`autogrow_fallback_partition`**
   - partition to fall back to if no preferred autogrow partition scores better
 - **`autogrow_fat_partitions`**

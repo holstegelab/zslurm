@@ -3,6 +3,7 @@ import importlib.util
 import io
 import pathlib
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -39,6 +40,7 @@ class QueuedScratchCapacityTests(unittest.TestCase):
         z.status.autogrow_fat_partitions = []
         z.status.default_partition = "genoa"
         z.engines = z.EngineManager()
+        z.engines.cluster_queued_by_partition = {}
         self.jobs = z.JobManager()
         self.jobs.active_total = 100000
         self.jobs.dcache_total = 100000
@@ -96,6 +98,36 @@ class QueuedScratchCapacityTests(unittest.TestCase):
         self.assertTrue(plan["plan_need_ssd"])
         self.assertEqual(plan["raw_best_nodes"], 1)
         self.assertEqual(plan["best_nodes"], 1)
+
+    def test_busy_cluster_still_queues_demand_backed_pilots(self):
+        z = self.zslurm
+        with mock.patch.object(z.zslurm_shared, 'slurm_partition_state_counts_by_scratch', return_value={}):
+            plan = z.compute_autogrow_plan([], 'compute')
+            self.assertEqual(plan['best_nodes'], 1)
+            z.status.config['autogrow_require_idle_nodes'] = True
+            plan = z.compute_autogrow_plan([], 'compute')
+            self.assertEqual(plan['plan_nodes'], 0)
+            self.assertIn('no idle nodes', plan['plan_reason'])
+
+    def test_spider_plain_only_fleet_has_no_implicit_scratch_fraction_cap(self):
+        z = self.zslurm
+        z.status.node_profiles = {'normal': {'cores': 30, 'mem_gb': 240}}
+        z.status.autogrow_prefer_partitions = [('normal', False)]
+        z.status.autogrow_fallback_partition = 'normal'
+        self.jobs.jobs_by_id.clear()
+        for i in range(20):
+            job = z.Job('pav', str(i), 'true', '/tmp', {}, 9, 69632, 176400,
+                        0, None, 0, 0, 0, 0, 0, 0, 'compute', 0, None, '')
+            self.jobs.jobs_by_id[job.jobid] = job
+        fleet = [SimpleNamespace(partition='compute', cores=30, totmem=220708,
+                 res_cpu_reserved=0, res_mem_reserved_mb=0, has_ssd=False) for _ in range(3)]
+        with mock.patch.object(z.zslurm_shared, 'slurm_partition_state_counts_by_scratch', return_value={}):
+            plan = z.compute_autogrow_plan(fleet, 'compute')
+            self.assertGreater(plan['best_nodes'], 0)
+            self.assertEqual(plan['best_part'], 'normal')
+            z.engines.cluster_queued_by_partition = {'normal': 7}
+            plan = z.compute_autogrow_plan(fleet, 'compute')
+            self.assertEqual(plan.get('best_nodes', 0), 0)
 
 
 if __name__ == "__main__":
