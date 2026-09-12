@@ -1244,6 +1244,13 @@ the interface design and phasing.
   engine in the cancellation operation. Even successful `scancel` requests are
   reported as requests, not confirmed termination; inspect Slurm before assuming
   allocations have ended. Logs must be retained for recovery after manager loss.
+  Silent chiefs are fenced against new assignments. Their jobs remain owned
+  until repeated fresh queue observations show absence and `sacct` confirms a
+  terminal state for the exact allocation. Missing or failed observations are
+  not termination evidence. This avoids requeueing onto a second worker while
+  the original may still be writing outputs; accounting delays can therefore
+  delay recovery. The controller no longer blocks for 60 seconds per chief
+  waiting for its own cached queue snapshot to change.
 - **`zsstatus`**: one JSON snapshot an agent polls — health, the three storage budgets,
   scheduler mode, queue, an engine summary, and derived **alarms** (`budget_stall`,
   `no_engines`, `oversized_pending`, `near_oom`).

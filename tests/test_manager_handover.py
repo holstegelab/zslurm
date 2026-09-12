@@ -248,7 +248,7 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
         # Never let an integration test discover or mutate real Slurm jobs.
         fake_bin = self.workdir / "fake-bin"
         fake_bin.mkdir()
-        for command in ("squeue", "scancel", "scontrol", "sbatch"):
+        for command in ("squeue", "scancel", "scontrol", "sbatch", "sacct"):
             script = fake_bin / command
             script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             script.chmod(0o755)

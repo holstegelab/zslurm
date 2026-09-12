@@ -4350,6 +4350,7 @@ class EngineManager(object):
             self.last_squeue_ts = time.time()
         except Exception:
             pass
+        return True
 
     def _matches_cluster_group(self, engine, group=None):
         """Match a worker against the UI groups compute/staging/all."""
@@ -4787,25 +4788,58 @@ class EngineManager(object):
             add_log_line(gb, f"Released {len(done)} held engine allocation(s): {shown}", GREEN)
         return done
 
-    def _is_cid_present(self, cid):
-        """Return True if the given Slurm cluster job id is still present in squeue."""
+    def _slurm_terminal_confirmed(self, cid):
+        """Check the exact allocation; absence from a name-filtered queue is insufficient."""
+        control_id = self._slurm_control_id(cid)
         try:
-            cids = getattr(self, 'last_observed_cids', set()) or set()
-            return str(cid) in cids
-        except Exception:
+            process = Popen(
+                ["sacct", "-n", "-X", "-j", control_id, "-P", "--format=JobIDRaw,State"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, _ = process.communicate()
+            if process.returncode != 0:
+                return False
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8")
+            rows = [line.strip().split("|") for line in stdout.splitlines() if line.strip()]
+            matches = [row for row in rows if len(row) >= 2 and row[0] == control_id]
+            terminal = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
+                        "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
+            return (len(matches) == 1 and bool(matches[0][1].split())
+                    and matches[0][1].split()[0] in terminal)
+        except (OSError, UnicodeError):
             return False
 
-    def _wait_for_cid_termination(self, cid, timeout_seconds=60, poll_interval=2):
-        """Wait up to timeout_seconds for the Slurm job cid to disappear from squeue."""
-        if cid is None or cid is False:
-            return
-        start = time.time()
-        while time.time() - start < timeout_seconds:
-            if not self._is_cid_present(cid):
-                add_log_line(gb, f"Confirmed SLURM job {cid} is no longer present.", CYAN)
-                return
-            time.sleep(poll_interval)
-        add_log_line(gb, f"Timed out waiting for SLURM job {cid} to disappear; proceeding.", YELLOW)
+    def reconcile_timed_out_engine(self, engine, slurm_snapshot_ok):
+        """Fence a silent chief; requeue only after fresh Slurm absence evidence.
+
+        Use the controller's shared query rather than blocking its refresh loop
+        waiting for a cached snapshot to change. Failed observations never prove
+        termination. Cancellation acceptance also does not prove termination.
+        """
+        with self.lock:
+            now = time.time()
+            if now - engine.lastseen <= TIMEOUT:
+                return False
+            engine.stopping = True
+            cid = engine.cluster_id
+            if cid is False:
+                self.stop_local(gb)
+                return True
+            if cid is None:
+                return False
+            if (slurm_snapshot_ok is True
+                    and cid not in self.last_observed_cids
+                    and engine.missing_hits >= SQUEUE_MISSING_TOLERANCE
+                    and self._slurm_terminal_confirmed(cid)):
+                self._unregister(engine, "Engine timed out; Slurm termination confirmed")
+                return True
+            # Keep jobs owned by this chief while cancellation is unresolved.
+            # Retry failures without flooding Slurm on the five-second loop.
+            last_attempt = getattr(engine, "last_timeout_cancel_attempt", None)
+            if last_attempt is None or now - last_attempt >= 60:
+                engine.last_timeout_cancel_attempt = now
+                self.cancel_cid(cid, unregister_after=False)
+            return False
 
     def stop_all(self):
         failed = []
@@ -6247,7 +6281,7 @@ def thread_check_commands():
             continue
         engines.lock.acquire()
         try:
-            engines._check_cluster_engines()
+            slurm_snapshot_ok = engines._check_cluster_engines()
             all_engines = list(engines.engine_by_id.values())
         finally:
             engines.lock.release()
@@ -6255,32 +6289,7 @@ def thread_check_commands():
         now = time.time()
         for engine in all_engines:
             if now - engine.lastseen > TIMEOUT:
-                # Attempt to kill SLURM allocation for this engine first without unregistering yet
-                cid = engine.cluster_id
-                # mark as stopping to avoid further assignments/starts and reconciliation
-                engine.stopping = True
-                try:
-                    if cid is False:
-                        # Local engine
-                        engines.stop_local(gb)
-                    elif cid is not None:
-                        engines.cancel_cid(cid, unregister_after=False)
-                except Exception as ex:
-                    import traceback
-                    add_log_line(gb, f"Exception when terminating engine {engine.engine_id} (cid={cid}): {ex}", RED)
-                    add_log_line(gb, traceback.format_exc(), RED)
-                # Wait briefly for the SLURM job to actually disappear
-                try:
-                    engines._wait_for_cid_termination(cid, timeout_seconds=60, poll_interval=2)
-                except Exception as ex:
-                    import traceback
-                    add_log_line(gb, f"Exception while waiting for SLURM job {cid} to disappear: {ex}", YELLOW)
-                    add_log_line(gb, traceback.format_exc(), YELLOW)
-                # Now unregister and requeue jobs
-                engines._unregister(engine, "Engine timed out")
-                add_log_line(
-                    gb, "Engine with id " + engine.engine_id + " timed out", RED
-                )
+                engines.reconcile_timed_out_engine(engine, slurm_snapshot_ok)
 
         used_cpus = []
         used_mem = []
