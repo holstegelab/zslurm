@@ -5885,23 +5885,6 @@ def compute_autogrow_plan(all_engines, partition):
         
     fat_partitions = list(getattr(status, 'autogrow_fat_partitions', []) or [])
 
-    # Largest single-node cpu / mem across the known profiles (for the "only grow
-    # if we can fill an engine" gate -- must consider BOTH axes, else a memory-bound
-    # backlog with a small core count never triggers growth).
-    largest_cores = 0
-    largest_mem_mb = 0.0
-    try:
-        if status.node_profiles:
-            largest_cores = max(int((prof or {}).get('cores', 0) or 0) for prof in status.node_profiles.values())
-            largest_mem_mb = max(float((prof or {}).get('mem_gb', 0.0) or 0.0) for prof in status.node_profiles.values()) * 1024.0
-    except Exception:
-        largest_cores = 0
-        largest_mem_mb = 0.0
-    if largest_cores <= 0:
-        largest_cores = int(fallback_prof.get('cores', 0) or 0)
-    if largest_mem_mb <= 0.0:
-        largest_mem_mb = float(fallback_prof.get('mem_gb', 0.0) or 0.0) * 1024.0
-
     # Smallest mem/core among the thin (non-fat) profiles: the ceiling of what a
     # cheap node can offer per core. A backlog demanding more GB/core than this
     # can only be cleared efficiently on fat nodes.
@@ -5993,10 +5976,11 @@ def compute_autogrow_plan(all_engines, partition):
     req_mpc = (required_mem_mb / 1024.0) / max(1.0, required_cpu)
     need_fat = req_mpc > (thin_mpc * 1.05)
 
-    # Only decline to grow when a full engine's worth of work is unmet on NEITHER
-    # axis. Previously this gate was CPU-only, so a memory-bound backlog (many small
-    # cores, lots of RAM) never grew fat nodes even under heavy memory pressure.
-    if (required_cpu <= largest_cores and required_mem_mb <= largest_mem_mb
+    # A sub-node backlog can unlock the entire downstream DAG. Do not make it
+    # wait behind long running jobs until a whole node of demand accumulates.
+    # Existing free and queued capacity has already been deducted above, so only
+    # positive unmet demand grows a pilot; idle fleets still cannot grow.
+    if (required_cpu <= 0.0 and required_mem_mb <= 0.0
             and ssd_required_cpu <= 0.0 and ssd_required_mem_mb <= 0.0
             and tot_cpu_cap > 0):
         return {

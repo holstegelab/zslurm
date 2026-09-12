@@ -109,6 +109,29 @@ class QueuedScratchCapacityTests(unittest.TestCase):
             self.assertEqual(plan['plan_nodes'], 0)
             self.assertIn('no idle nodes', plan['plan_reason'])
 
+    def test_subnode_backlog_grows_once_and_not_when_already_covered(self):
+        z = self.zslurm
+        z.status.node_profiles = {'normal': {'cores': 30, 'mem_gb': 240}}
+        z.status.autogrow_prefer_partitions = [('normal', False)]
+        z.status.autogrow_fallback_partition = 'normal'
+        self.jobs.jobs_by_id.clear()
+        job = z.Job('audit', 'small', 'true', '/tmp', {}, 4, 32000, 3600,
+                    0, None, 0, 0, 0, 0, 0, 0, 'compute', 0, None, '')
+        self.jobs.jobs_by_id[job.jobid] = job
+        fleet = [SimpleNamespace(partition='compute', cores=30, totmem=220708,
+                 res_cpu_reserved=27, res_mem_reserved_mb=208896, has_ssd=False)]
+        with mock.patch.object(z.zslurm_shared, 'slurm_partition_state_counts_by_scratch', return_value={}):
+            plan = z.compute_autogrow_plan(fleet, 'compute')
+            self.assertEqual(plan['plan_nodes'], 1)
+            z.engines.cluster_queued_by_partition = {'normal': 1}
+            self.assertEqual(z.compute_autogrow_plan(fleet, 'compute')['plan_nodes'], 0)
+            z.engines.cluster_queued_by_partition = {}
+            fleet[0].res_cpu_reserved = 0
+            fleet[0].res_mem_reserved_mb = 0
+            self.assertEqual(z.compute_autogrow_plan(fleet, 'compute')['plan_nodes'], 0)
+            self.jobs.jobs_by_id.clear()
+            self.assertEqual(z.compute_autogrow_plan(fleet, 'compute')['plan_nodes'], 0)
+
     def test_spider_plain_only_fleet_has_no_implicit_scratch_fraction_cap(self):
         z = self.zslurm
         z.status.node_profiles = {'normal': {'cores': 30, 'mem_gb': 240}}
