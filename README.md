@@ -284,13 +284,18 @@ The autogrow controller:
 - caps every new engine at the next applicable Slurm `MAINT` reservation and
   gives the job a matching Slurm deadline
 
-This means autogrow is not triggered by every pending job. It is triggered when there is meaningful unmet demand after considering:
+This means autogrow is not triggered by every pending job. It is triggered by positive unmet CPU or memory demand, even below one node, after considering:
 
 - work already fitting on current engines
 - work that will fit on already queued engines
 - global archive/active/dcache constraints
 
 So if jobs are pending only because a global storage quota is full, autogrow will not solve that problem by launching more nodes.
+
+A small eligible backlog can unlock a large downstream DAG and must not wait
+for a full node's worth of jobs to accumulate behind long-running work. Already
+queued capacity still suppresses duplicate growth. Consolidation, cooldowns and
+the node cap remain separate controls; enabling growth does not disable them.
 
 #### Maintenance windows
 
