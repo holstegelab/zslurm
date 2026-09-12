@@ -795,6 +795,21 @@ After a successful handover, queued chiefs resolve the alias when they start;
 already-running chiefs receive a migration command and also follow the alias if
 the old manager exits before that command arrives.
 
+Do not retire the source forwarding process merely because all chiefs migrated.
+Older Snakemake ZSlurm executors cache their job-RPC URL and can keep polling the
+old endpoint even when discovery points elsewhere. Keep the source until those
+controllers exit or verify that their executor supports endpoint rediscovery on
+status failure (plugin commit `1f3ffe1` or later). Updating an installed package
+does not update objects already loaded by a running controller.
+
+If the source was already stopped, `zslurm_legacy_proxy.py` can restore only its
+legacy job-RPC endpoint, forwarding to the explicitly identified target manager.
+It requires the preserved source startup banner log, target instance name, and
+expected target manager UUID. It creates no queue or Slurm allocations and
+refuses nonlocal source addresses, direct forwarding loops and mismatched target
+identity. Keep its log private and retain the helper until legacy clients are
+gone. This is a compatibility bridge, not automatic recovery of a lost queue.
+
 ## Output files
 
 ZSlurm writes several useful files in the working directory of the manager or commands:
