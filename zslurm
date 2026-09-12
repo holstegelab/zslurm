@@ -4570,6 +4570,7 @@ class EngineManager(object):
 
     # FIXME: jobs running removal, priority of cancelling less active nodes
     def stop_slurm(self, gb, n, group=None):
+        failed = []
         self.lock.acquire()
         try:
             target = str(group or "all").strip().lower()
@@ -4643,26 +4644,34 @@ class EngineManager(object):
 
                     set_progress_bar(gb, 0.0)
                     for pos, eid in enumerate(stop_engines):
-                        self.cancel_cid(eid)
+                        if not self.cancel_cid(eid):
+                            failed.append(eid)
                         set_progress_bar(gb, float(pos + 1) / float(n))
 
                     time.sleep(2)
                     stop_progress_bar(gb)
-                    set_status_message(gb, "SLURM engines stopped", GREEN)
-                    add_log_line(gb, f"{n} {group_label} SLURM engines stopped", MAGENTA)
+                    if failed:
+                        message = f"SLURM cancellation failed for {failed}; allocations may still run"
+                        set_status_message(gb, message, RED)
+                        add_log_line(gb, message, RED)
+                    else:
+                        message = f"Cancellation requested for {n} {group_label} SLURM engines; termination not yet confirmed"
+                        set_status_message(gb, message, YELLOW)
+                        add_log_line(gb, message, YELLOW)
         finally:
             self.lock.release()
+        return failed
 
     def cancel_cid(self, cid, unregister_after=True):
         self.lock.acquire()
         try:
-            cmd = "scancel " + str(cid)
-            args = shlex.split(cmd)
-            add_log_line(gb, "Cancelling using command: " + cmd, CYAN)
-            p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            log_output(p.stdout, gb, WHITE)
-            log_output(p.stderr, gb, RED)
-            p.wait()
+            control_id = self._slurm_control_id(cid)
+            add_log_line(gb, "Cancelling using command: scancel " + control_id, CYAN)
+            if not self._run_cluster_control(
+                    gb, ["scancel", control_id], f"cancel engine {cid}"):
+                # Keep the chief and its jobs registered for a later retry.
+                # A failed Slurm request is not evidence of termination.
+                return False
 
             if cid in self.engine_by_clusterid:
                 e = self.engine_by_clusterid[cid]
@@ -4671,6 +4680,7 @@ class EngineManager(object):
                     e.stopping = True
                     if unregister_after:
                         self._unregister(e, reason="Engine stopped")
+            return True
         finally:
             self.lock.release()
 
@@ -4798,12 +4808,14 @@ class EngineManager(object):
         add_log_line(gb, f"Timed out waiting for SLURM job {cid} to disappear; proceeding.", YELLOW)
 
     def stop_all(self):
+        failed = []
         if self.count_cluster_engines() > 0:
             add_log_line(gb, "Terminating SLURM engines.", RED)
-            self.stop_slurm(gb, self.count_cluster_engines())
+            failed = self.stop_slurm(gb, self.count_cluster_engines())
         if self.check_local_engine():
             add_log_line(gb, "Terminating local engine.", RED)
             self.stop_local(gb)
+        return failed
 
 
     def failed_node(self, myip, partition, cluster_jobid):        
@@ -8330,11 +8342,15 @@ def main_headless(args):
         while not stop_event.wait(1.0):
             pass
     finally:
+        failed = []
         try:
             if not getattr(status, 'handover_preserve_engines', False):
-                engines.stop_all()
-        except Exception:
-            pass
+                failed = engines.stop_all()
+        except Exception as exc:
+            add_log_line(gb, f"[manager] shutdown cleanup failed: {exc}", RED)
+            raise
+        if failed:
+            raise RuntimeError(f"Manager exited with unresolved Slurm cancellations: {failed}")
         add_log_line(gb, "[manager] headless shutdown complete", YELLOW)
 
 

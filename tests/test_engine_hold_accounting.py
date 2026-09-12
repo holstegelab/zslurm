@@ -49,6 +49,69 @@ class EngineHoldAccountingTests(unittest.TestCase):
         self.assertFalse(self.zslurm._slurm_reason_is_hold("Priority"))
         self.assertFalse(self.zslurm._slurm_reason_is_hold(None))
 
+    def test_failed_cancellation_preserves_engine_and_jobs(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        engine.slurm_job_id = "9004"
+        manager.engine_by_clusterid["123_4"] = engine
+        engine.jobs.add("running-job")
+        before = set(engine.jobs)
+        with mock.patch.object(z, "Popen", return_value=fake_process(
+                returncode=1, stderr=b"Munge socket unavailable")) as popen, \
+                mock.patch.object(manager, "_unregister") as unregister:
+            self.assertFalse(manager.cancel_cid("123_4"))
+        popen.assert_called_once_with(
+            ["scancel", "9004"], stdout=z.subprocess.PIPE, stderr=z.subprocess.PIPE)
+        unregister.assert_not_called()
+        self.assertIs(manager.engine_by_clusterid["123_4"], engine)
+        self.assertFalse(engine.stopping)
+        self.assertEqual(engine.jobs, before)
+        self.assertIn("Munge socket unavailable", z.gb.log_file.getvalue())
+
+    def test_missing_scancel_preserves_registration(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        manager.engine_by_clusterid["123_4"] = engine
+        with mock.patch.object(z, "Popen", side_effect=FileNotFoundError("scancel")):
+            self.assertFalse(manager.cancel_cid("123_4"))
+        self.assertIs(manager.engine_by_clusterid["123_4"], engine)
+        self.assertFalse(engine.stopping)
+
+    def test_successful_cancellation_without_unregister_marks_stopping(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        manager.engine_by_clusterid["123_4"] = engine
+        with mock.patch.object(z, "Popen", return_value=fake_process()):
+            self.assertTrue(manager.cancel_cid("123_4", unregister_after=False))
+        self.assertTrue(engine.stopping)
+        self.assertIs(manager.engine_by_clusterid["123_4"], engine)
+
+    def test_stop_slurm_reports_failed_ids_without_claiming_termination(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        for cid in ("123_4", "123_5"):
+            manager.engine_by_clusterid[cid] = z.Engine(cluster_id=cid, partition="compute")
+        with mock.patch.object(manager, "cancel_cid", side_effect=[False, True]), \
+                mock.patch.object(z, "set_status_message"), \
+                mock.patch.object(z, "set_progress_bar"), \
+                mock.patch.object(z, "stop_progress_bar"), \
+                mock.patch.object(z.time, "sleep"):
+            self.assertEqual(manager.stop_slurm(z.gb, 2), ["123_5"])
+        log = z.gb.log_file.getvalue()
+        self.assertIn("allocations may still run", log)
+        self.assertNotIn("engines stopped", log)
+
+    def test_stop_all_propagates_failed_cancellations(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        with mock.patch.object(manager, "count_cluster_engines", return_value=1), \
+                mock.patch.object(manager, "stop_slurm", return_value=["123_4"]), \
+                mock.patch.object(manager, "check_local_engine", return_value=False):
+            self.assertEqual(manager.stop_all(), ["123_4"])
+
     def test_controller_never_reconciles_queued_engines(self):
         tree = ast.parse(ZSLURM_PATH.read_text())
         controller = next(

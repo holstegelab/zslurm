@@ -1239,6 +1239,11 @@ the interface design and phasing.
   `--no-autoconsolidate`, `--enable-control`, `--control-token TOKEN`, and
   `--instance-name NAME`. It prints a one-line JSON banner with the instance endpoint,
   then runs until SIGTERM.
+  On shutdown, failed Slurm cancellation requests are logged with their allocation
+  IDs and cause a nonzero manager exit. A failed request does not unregister the
+  engine in the cancellation operation. Even successful `scancel` requests are
+  reported as requests, not confirmed termination; inspect Slurm before assuming
+  allocations have ended. Logs must be retained for recovery after manager loss.
 - **`zsstatus`**: one JSON snapshot an agent polls — health, the three storage budgets,
   scheduler mode, queue, an engine summary, and derived **alarms** (`budget_stall`,
   `no_engines`, `oversized_pending`, `near_oom`).
