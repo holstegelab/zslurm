@@ -382,7 +382,19 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - default CPU count for manually started pilots; `0` requests an exclusive
     node
 - **`autogrow_engine_cores`**
-  - CPU count for automatically started pilots; `0` requests an exclusive node
+  - CPU count for automatically started pilots, or their upper bound when
+    `autogrow_dynamic_engine_cores` is enabled; `0` requests an exclusive node
+- **`autogrow_dynamic_engine_cores`** / **`autogrow_engine_min_cores`**
+  - size partial pilots between the configured minimum and
+    `autogrow_engine_cores` from runnable CPU and memory demand
+- **`autogrow_engine_memory_mb_per_core`**
+  - hard Slurm memory grant per requested pilot core; required for memory-aware
+    dynamic sizing
+- **`autogrow_engine_memory_headroom_fraction`**,
+  **`autogrow_engine_memory_cap_fraction`** and
+  **`autogrow_engine_memory_static_reserve_mb`**
+  - mirror the chief's advertised-memory envelope while sizing and accounting
+    for queued partial pilots
 - **`autogrow_enable`** / **`autogrow_max_compute_nodes`**
   - whether automatic allocation is initially enabled and its hard fleet cap
 - **`autogrow_fallback_partition`**
@@ -482,16 +494,25 @@ staging_autogrow_burst_nodes: 4
 
 ### Spider example
 
-Spider grants schedulable memory through allocated cores
-(`DefMemPerCPU=8000`). The supplied `config/sites/spider.yaml` therefore uses
-30-core/240-GB partial pilots. This is deliberately an allocation profile, not
-the physical 960-GB or 1440-GB node size:
+Spider grants memory through allocated cores (`DefMemPerCPU=8000`). The
+supplied `config/sites/spider.yaml` therefore treats 30 cores/240 GB as a
+partial-pilot upper bound. Autogrow sizes a smaller request when the runnable
+demand fits one such pilot; for example, a 1-core/8-GB logical task needs a
+2-core pilot because the chief retains its configured memory headroom. Larger
+backlogs still use the 30-core ceiling. This is an allocation profile, not the
+physical 960-GB or 1440-GB node size:
 
 ```yaml
 cluster_site: spider
 default_partition: normal
 default_engine_cores: 30
 autogrow_engine_cores: 30
+autogrow_dynamic_engine_cores: true
+autogrow_engine_min_cores: 2
+autogrow_engine_memory_mb_per_core: 8000
+autogrow_engine_memory_headroom_fraction: 0.08
+autogrow_engine_memory_cap_fraction: 0.99
+autogrow_engine_memory_static_reserve_mb: 100
 node_profiles:
   normal:
     cores: 30

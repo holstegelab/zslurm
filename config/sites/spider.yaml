@@ -7,9 +7,15 @@ enable_ssd_prompt: false
 ssd_feature_name: ssd
 
 # Spider's Slurm policy grants 8 GB per allocated core. These values describe
-# a 30-core partial pilot allocation, not all physical resources on the node.
+# the upper bound of a partial pilot, not all physical resources on the node.
 default_engine_cores: 30
 autogrow_engine_cores: 30
+autogrow_dynamic_engine_cores: true
+autogrow_engine_min_cores: 2
+autogrow_engine_memory_mb_per_core: 8000
+autogrow_engine_memory_headroom_fraction: 0.08
+autogrow_engine_memory_cap_fraction: 0.99
+autogrow_engine_memory_static_reserve_mb: 100
 node_profiles:
   normal:
     cores: 30

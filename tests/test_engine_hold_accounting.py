@@ -136,10 +136,10 @@ class EngineHoldAccountingTests(unittest.TestCase):
         manager.held_engine_cids = {"123_0", "123_1"}
         output = "\n".join(
             [
-                "9000|123|0|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|JobHeldUser",
-                "9001|123|1|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|Priority",
-                "9002|123|2|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|JobHeldAdmin",
-                "9003|123|3|test-instance|5-00:00:00|R|tcn1|genoa|00:00:00|scratch-node|None",
+                "9000|123|0|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|JobHeldUser",
+                "9001|123|1|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|Priority",
+                "9002|123|2|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|JobHeldAdmin",
+                "9003|123|3|test-instance|5-00:00:00|R|tcn1|genoa|00:00:00|scratch-node|192|None",
             ]
         )
 

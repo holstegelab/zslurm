@@ -355,6 +355,12 @@ class Status(object):
         self.ssd_feature_name = "scratch-node"
         self.default_engine_cores = 0
         self.autogrow_engine_cores = 0
+        self.autogrow_dynamic_engine_cores = False
+        self.autogrow_engine_min_cores = 1
+        self.autogrow_engine_memory_mb_per_core = 0.0
+        self.autogrow_engine_memory_headroom_fraction = 0.0
+        self.autogrow_engine_memory_cap_fraction = 1.0
+        self.autogrow_engine_memory_static_reserve_mb = 0.0
         self.archive_job_partitions = ["archive", "staging"]
         self.autogrow_fallback_partition = "genoa"
         self.autogrow_fat_partitions = ["fat_genoa", "fat_rome"]
@@ -600,6 +606,12 @@ def _cluster_defaults(config=None):
         "maintenance_window_enable": False,
         "default_engine_cores": 0,
         "autogrow_engine_cores": 0,
+        "autogrow_dynamic_engine_cores": False,
+        "autogrow_engine_min_cores": 1,
+        "autogrow_engine_memory_mb_per_core": 0.0,
+        "autogrow_engine_memory_headroom_fraction": 0.0,
+        "autogrow_engine_memory_cap_fraction": 1.0,
+        "autogrow_engine_memory_static_reserve_mb": 0.0,
         "autogrow_enable": False,
         "autogrow_max_compute_nodes": 0,
     }
@@ -632,6 +644,12 @@ def _cluster_defaults(config=None):
             "autogrow_fallback_partition": "normal",
             "default_engine_cores": 30,
             "autogrow_engine_cores": 30,
+            "autogrow_dynamic_engine_cores": True,
+            "autogrow_engine_min_cores": 2,
+            "autogrow_engine_memory_mb_per_core": 8000.0,
+            "autogrow_engine_memory_headroom_fraction": 0.08,
+            "autogrow_engine_memory_cap_fraction": 0.99,
+            "autogrow_engine_memory_static_reserve_mb": 100.0,
         })
     return defaults
 
@@ -678,6 +696,51 @@ def _apply_cluster_config(config):
         _cfg_int(
             cfg.get("autogrow_engine_cores"),
             defaults["autogrow_engine_cores"],
+        ),
+    )
+    status.autogrow_dynamic_engine_cores = _cfg_bool(
+        cfg.get("autogrow_dynamic_engine_cores"),
+        defaults["autogrow_dynamic_engine_cores"],
+    )
+    status.autogrow_engine_min_cores = max(
+        1,
+        _cfg_int(
+            cfg.get("autogrow_engine_min_cores"),
+            defaults["autogrow_engine_min_cores"],
+        ),
+    )
+    status.autogrow_engine_memory_mb_per_core = max(
+        0.0,
+        _cfg_float(
+            cfg.get("autogrow_engine_memory_mb_per_core"),
+            defaults["autogrow_engine_memory_mb_per_core"],
+        ),
+    )
+    status.autogrow_engine_memory_headroom_fraction = min(
+        0.99,
+        max(
+            0.0,
+            _cfg_float(
+                cfg.get("autogrow_engine_memory_headroom_fraction"),
+                defaults["autogrow_engine_memory_headroom_fraction"],
+            ),
+        ),
+    )
+    status.autogrow_engine_memory_cap_fraction = min(
+        1.0,
+        max(
+            0.0,
+            _cfg_float(
+                cfg.get("autogrow_engine_memory_cap_fraction"),
+                defaults["autogrow_engine_memory_cap_fraction"],
+            ),
+        ),
+    )
+    status.autogrow_engine_memory_static_reserve_mb = max(
+        0.0,
+        _cfg_float(
+            cfg.get("autogrow_engine_memory_static_reserve_mb"),
+            defaults["autogrow_engine_memory_static_reserve_mb"],
         ),
     )
     status.autogrow_enable = _cfg_bool(
@@ -3897,6 +3960,8 @@ class EngineManager(object):
         self.cluster_queued_engines_archive = 0
         self.cluster_running_engines_archive = 0
         self.cluster_held_engines_archive = 0
+        self.cluster_queued_by_partition = {}
+        self.cluster_running_by_partition = {}
         self.cluster_held_by_partition = {}
         self.cluster_queued_age_by_partition = {}
         self.cluster_queued_age_by_partition_by_scratch = {}
@@ -3906,6 +3971,7 @@ class EngineManager(object):
         # hold through explicit administrative control. The automatic controllers do
         # not hold, release, or cancel queued engine allocations.
         self.queued_engines_detail = []   # [(cid, partition, age_sec, is_scratch)] -- excludes held
+        self.queued_engine_capacity_by_cid = {}  # cid -> (cores, expected schedulable MB)
         self.held_engine_cids = set()     # cids successfully held by this manager
         self.actual_held_engine_cids = set()  # all cids Slurm currently reports held
         self.held_engines_detail = []     # manager-held [(cid, partition, age_sec, is_scratch)]
@@ -4091,7 +4157,7 @@ class EngineManager(object):
             "--name", ",".join(sorted(instance_names)),
             "-O",
             "jobid:|,arrayjobid:|,arraytaskid:|,name:|,timeleft:|,statecompact:|,"
-            "nodelist:|,partition:|,pendingtime:|,feature:|,reason",
+            "nodelist:|,partition:|,pendingtime:|,feature:|,numcpus:|,reason",
         ]
         try:
             p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -4130,6 +4196,7 @@ class EngineManager(object):
         running_by = defaultdict(int)
         held_by = defaultdict(int)
         queued_engines_detail = []  # (cid, partition, age_sec, is_scratch) for non-R, non-staging, non-held engine allocations
+        queued_capacity_by_cid = {}
         held_detail = []            # same tuple for allocations this manager actually holds
         external_held_detail = []   # actual Slurm holds not owned by this manager
         actual_held_cids = set()
@@ -4138,7 +4205,7 @@ class EngineManager(object):
 
 
         try:
-            for slurm_job_id, jid_raw, atask, cname, ctime, cstate, cnode, cpartition, cpending, cfeatures, creason in output:
+            for slurm_job_id, jid_raw, atask, cname, ctime, cstate, cnode, cpartition, cpending, cfeatures, cnumcpus, creason in output:
                 task = (atask or "").strip()
                 if task and task != "N/A":
                     cid = f"{jid_raw}_{task}"
@@ -4172,6 +4239,13 @@ class EngineManager(object):
                 engine.slurm_partition = cpartition
                 engine.slurm_state = cstate
                 engine.slurm_job_id = str(slurm_job_id or "").strip() or cid
+                expected_cores, expected_mem_mb = _autogrow_engine_capacity(
+                    cpartition, cnumcpus
+                )
+                if expected_cores > 0.0:
+                    engine.cores = expected_cores
+                if expected_mem_mb > 0.0:
+                    engine.totmem = expected_mem_mb
                 if engine.engine_id == "?":
                     engine.partition = (
                         "archive"
@@ -4256,6 +4330,9 @@ class EngineManager(object):
                         queued_engines_detail.append(
                             (cid, cpartition, float(age_sec), _is_scratch)
                         )
+                        queued_capacity_by_cid[cid] = (
+                            float(engine.cores), float(engine.totmem)
+                        )
                     queued_by[cpartition] += 1
 
 
@@ -4322,6 +4399,7 @@ class EngineManager(object):
             self.cluster_running_by_partition = dict(running_by)
             self.cluster_held_by_partition = dict(held_by)
             self.queued_engines_detail = list(queued_engines_detail)
+            self.queued_engine_capacity_by_cid = dict(queued_capacity_by_cid)
             self.held_engines_detail = list(held_detail)
             self.external_held_engines_detail = list(external_held_detail)
             self.actual_held_engine_cids = set(actual_held_cids)
@@ -4334,6 +4412,7 @@ class EngineManager(object):
             self.cluster_running_by_partition = {}
             self.cluster_held_by_partition = {}
             self.queued_engines_detail = []
+            self.queued_engine_capacity_by_cid = {}
             self.held_engines_detail = []
             self.external_held_engines_detail = []
             self.actual_held_engine_cids = set()
@@ -4539,9 +4618,15 @@ class EngineManager(object):
                     add_log_line(gb, "Error during SLURM submission.", RED)
                     return
 
+                planned_cores, planned_mem_mb = _autogrow_engine_capacity(
+                    partition, cores
+                )
+
                 if n == 1:
                     self.engine_by_clusterid[eid] = Engine(
                         cluster_id=eid,
+                        cores=planned_cores,
+                        totmem=planned_mem_mb,
                         partition=lpartition,
                         managed=True,
                         instance=status.instance_name,
@@ -4554,6 +4639,8 @@ class EngineManager(object):
                         cid = eid + "_" + str(i)                        
                         self.engine_by_clusterid[cid] = Engine(
                             cluster_id=cid,
+                            cores=planned_cores,
+                            totmem=planned_mem_mb,
                             partition=lpartition,
                             managed=True,
                             instance=status.instance_name,
@@ -5773,6 +5860,100 @@ def initiate_handover(old_instance):
                 'error': f"could not contact old instance {old_name}: {error}"}
 
 
+def _partial_engine_schedulable_memory_mb(cores):
+    """Mirror the chief's memory envelope for a partial Slurm allocation."""
+    try:
+        cores = max(0, int(cores))
+        per_core = max(
+            0.0,
+            float(getattr(status, 'autogrow_engine_memory_mb_per_core', 0.0)),
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    if cores <= 0 or per_core <= 0.0:
+        return 0.0
+    hard_limit_mb = float(cores) * per_core
+    reserve_mb = max(
+        0.0,
+        float(getattr(status, 'autogrow_engine_memory_static_reserve_mb', 0.0)),
+    )
+    headroom = min(
+        0.99,
+        max(
+            0.0,
+            float(getattr(status, 'autogrow_engine_memory_headroom_fraction', 0.0)),
+        ),
+    )
+    cap_fraction = min(
+        1.0,
+        max(
+            0.0,
+            float(getattr(status, 'autogrow_engine_memory_cap_fraction', 1.0)),
+        ),
+    )
+    return max(
+        0.0,
+        min(
+            cap_fraction * hard_limit_mb,
+            (1.0 - headroom) * max(0.0, hard_limit_mb - reserve_mb),
+        ),
+    )
+
+
+def _autogrow_engine_capacity(partition, requested_cores):
+    """Return the capacity a queued engine is expected to advertise."""
+    prof = status.node_profiles.get(str(partition)) or {}
+    if bool(getattr(status, 'autogrow_dynamic_engine_cores', False)):
+        try:
+            cores = max(0, int(requested_cores))
+        except (TypeError, ValueError):
+            cores = 0
+        memory_mb = _partial_engine_schedulable_memory_mb(cores)
+        if cores > 0 and memory_mb > 0.0:
+            return float(cores), float(memory_mb)
+    return (
+        max(0.0, float(prof.get('cores', 0.0) or 0.0)),
+        max(0.0, float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0),
+    )
+
+
+def _autogrow_requested_engine_cores(
+        eligible, best_part, size_cpu, size_mem_mb, raw_best_nodes):
+    """Size one partial pilot to demand, while retaining a configured hard cap."""
+    configured = max(0, int(getattr(status, 'autogrow_engine_cores', 0) or 0))
+    if configured <= 0 or not bool(
+            getattr(status, 'autogrow_dynamic_engine_cores', False)):
+        return configured
+    profile = status.node_profiles.get(str(best_part)) or {}
+    profile_cores = max(0, int(float(profile.get('cores', 0.0) or 0.0)))
+    maximum = min(configured, profile_cores) if profile_cores > 0 else configured
+    minimum = min(
+        maximum,
+        max(1, int(getattr(status, 'autogrow_engine_min_cores', 1) or 1)),
+    )
+    if int(raw_best_nodes or 0) > 1:
+        return maximum
+
+    largest_cpu = max(
+        [max(0.0, float(getattr(job, 'ncpu', 0.0) or 0.0)) for job in eligible]
+        or [0.0]
+    )
+    largest_mem_mb = max(
+        [max(0.0, float(getattr(job, 'mem', 0.0) or 0.0)) for job in eligible]
+        or [0.0]
+    )
+    needed_cpu = int(math.ceil(max(float(size_cpu), largest_cpu, 0.0)))
+    needed_mem_mb = max(float(size_mem_mb), largest_mem_mb, 0.0)
+    memory_cores = 0
+    for candidate in range(1, maximum + 1):
+        if _partial_engine_schedulable_memory_mb(candidate) + 1e-9 >= needed_mem_mb:
+            memory_cores = candidate
+            break
+    if memory_cores == 0 and needed_mem_mb > 0.0:
+        memory_cores = maximum
+    return min(maximum, max(minimum, needed_cpu, memory_cores))
+
+
 def compute_autogrow_plan(all_engines, partition):    
     eligible = []
     download_available = max(
@@ -5827,14 +6008,42 @@ def compute_autogrow_plan(all_engines, partition):
     queue_cpu_cap = 0.0
     queue_mem_cap_mb = 0.0
 
-    for part_name in unique_part:
-        nqueued_engines = engines.cluster_queued_by_partition.get(part_name, 0)      
-        prof = status.node_profiles.get(part_name)
-        if prof is None:
+    queued_detail_counts = defaultdict(int)
+    queued_capacity = getattr(engines, 'queued_engine_capacity_by_cid', {}) or {}
+    for detail in list(getattr(engines, 'queued_engines_detail', []) or []):
+        try:
+            cid, part_name, _age, _scratch = detail
+        except (TypeError, ValueError):
             continue
-        
-        queue_cpu_cap += nqueued_engines * float(prof.get('cores', 0.0))
-        queue_mem_cap_mb += nqueued_engines * float(prof.get('mem_gb', 0.0)) * 1024.0
+        if part_name not in unique_part:
+            continue
+        queued_detail_counts[part_name] += 1
+        prof = status.node_profiles.get(part_name) or {}
+        capacity = queued_capacity.get(str(cid))
+        try:
+            queued_cores = float(capacity[0])
+            queued_mem_mb = float(capacity[1])
+        except (TypeError, ValueError, IndexError):
+            queued_cores = float(prof.get('cores', 0.0) or 0.0)
+            queued_mem_mb = float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
+        queue_cpu_cap += max(0.0, queued_cores)
+        queue_mem_cap_mb += max(0.0, queued_mem_mb)
+
+    # Preserve compatibility with old snapshots or transient squeue rows that do
+    # not yet expose per-allocation capacity: only those unmatched allocations use
+    # the full configured profile as a conservative legacy fallback.
+    for part_name in unique_part:
+        nqueued_engines = int(
+            (getattr(engines, 'cluster_queued_by_partition', {}) or {}).get(
+                part_name, 0
+            ) or 0
+        )
+        unmatched = max(0, nqueued_engines - queued_detail_counts[part_name])
+        prof = status.node_profiles.get(part_name) or {}
+        queue_cpu_cap += unmatched * float(prof.get('cores', 0.0) or 0.0)
+        queue_mem_cap_mb += (
+            unmatched * float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
+        )
 
         
     fat_partitions = list(getattr(status, 'autogrow_fat_partitions', []) or [])
@@ -5909,15 +6118,17 @@ def compute_autogrow_plan(all_engines, partition):
         if not is_scratch:
             continue
         prof = status.node_profiles.get(str(queued_part)) or {}
-        if not prof:
-            continue
+        capacity = queued_capacity.get(str(_cid))
         try:
+            queued_cpu = max(0.0, float(capacity[0]))
+            queued_mem_mb = max(0.0, float(capacity[1]))
+        except (TypeError, ValueError, IndexError):
+            if not prof:
+                continue
             queued_cpu = max(0.0, float(prof.get('cores', 0.0) or 0.0))
             queued_mem_mb = max(
                 0.0, float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
             )
-        except (TypeError, ValueError):
-            continue
         queued_ssd_cpu += queued_cpu
         queued_ssd_mem_mb += queued_mem_mb
 
@@ -6123,6 +6334,10 @@ def compute_autogrow_plan(all_engines, partition):
         best_nodes = 1
         fat_cap_applied = True
 
+    requested_engine_cores = _autogrow_requested_engine_cores(
+        eligible, best_part, size_cpu, size_mem_mb, raw_best_nodes
+    )
+
     plan = {
         'has_eligible': len(eligible) > 0,
         'eligible_n': len(eligible),
@@ -6133,6 +6348,7 @@ def compute_autogrow_plan(all_engines, partition):
         'plan_nodes': best_nodes,
         'best_part': best_part,
         'best_nodes': best_nodes,
+        'engine_cores': requested_engine_cores,
 
         'needed_cpu': nodes_cpu,
         'needed_mem': nodes_mem,
@@ -6556,7 +6772,12 @@ def thread_check_commands():
                 cooldown_remaining_compute = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_compute_ts)))
                 
                 if plan.get('best_nodes', 0) > 0:
-                    plan_compute = f"grow: {plan.get('best_nodes', 0)} @ {plan.get('best_part', 'compute')}, cooldown {int(cooldown_remaining_compute)}s left"                                            
+                    plan_compute = (
+                        f"grow: {plan.get('best_nodes', 0)} @ "
+                        f"{plan.get('best_part', 'compute')} "
+                        f"({plan.get('engine_cores', 0) or 'exclusive'} cores), "
+                        f"cooldown {int(cooldown_remaining_compute)}s left"
+                    )
                 else:
                     plan_compute = f"no nodes needed"
 
@@ -6597,7 +6818,10 @@ def thread_check_commands():
                                     status.autogrow_runtime_default,
                                     plan.get('best_part'),
                                     constraint,
-                                    getattr(status, 'autogrow_engine_cores', 0),
+                                    int(plan.get(
+                                        'engine_cores',
+                                        getattr(status, 'autogrow_engine_cores', 0),
+                                    ) or 0),
                                 )
                                 status.autogrow_last_action_compute_ts = now
                                 if started:
