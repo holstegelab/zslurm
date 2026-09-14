@@ -11,6 +11,9 @@ ssd_feature_name: ssd
 default_engine_cores: 30
 autogrow_engine_cores: 30
 autogrow_dynamic_engine_cores: true
+# Submit demand-backed partial pilots even when no node is wholly IDLE; Slurm
+# can place them on MIXED nodes or keep them pending until capacity is available.
+autogrow_require_idle_nodes: false
 autogrow_engine_min_cores: 2
 autogrow_engine_memory_mb_per_core: 8000
 autogrow_engine_memory_headroom_fraction: 0.08

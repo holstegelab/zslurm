@@ -387,6 +387,10 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
 - **`autogrow_dynamic_engine_cores`** / **`autogrow_engine_min_cores`**
   - size partial pilots between the configured minimum and
     `autogrow_engine_cores` from runnable CPU and memory demand
+- **`autogrow_require_idle_nodes`**
+  - require a wholly idle Slurm node before submitting an autogrow pilot;
+    Spider disables this for partial pilots so Slurm can place them on mixed
+    nodes or queue them until capacity becomes available
 - **`autogrow_engine_memory_mb_per_core`**
   - hard Slurm memory grant per requested pilot core; required for memory-aware
     dynamic sizing
@@ -508,6 +512,7 @@ default_partition: normal
 default_engine_cores: 30
 autogrow_engine_cores: 30
 autogrow_dynamic_engine_cores: true
+autogrow_require_idle_nodes: false
 autogrow_engine_min_cores: 2
 autogrow_engine_memory_mb_per_core: 8000
 autogrow_engine_memory_headroom_fraction: 0.08

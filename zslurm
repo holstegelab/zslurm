@@ -356,6 +356,7 @@ class Status(object):
         self.default_engine_cores = 0
         self.autogrow_engine_cores = 0
         self.autogrow_dynamic_engine_cores = False
+        self.autogrow_require_idle_nodes = True
         self.autogrow_engine_min_cores = 1
         self.autogrow_engine_memory_mb_per_core = 0.0
         self.autogrow_engine_memory_headroom_fraction = 0.0
@@ -378,6 +379,7 @@ class Status(object):
         self.phase_reports_file = None
         self.reports_lock = threading.RLock()
         self.autogrow_plan = None
+        self.autogrow_plan_detail = None
 
         # Agent / programmatic-control interface (see docs/agent-interface-plan.md).
         # Mutating control RPCs (set_budgets/set_scheduler_mode/set_autogrow/
@@ -607,6 +609,7 @@ def _cluster_defaults(config=None):
         "default_engine_cores": 0,
         "autogrow_engine_cores": 0,
         "autogrow_dynamic_engine_cores": False,
+        "autogrow_require_idle_nodes": True,
         "autogrow_engine_min_cores": 1,
         "autogrow_engine_memory_mb_per_core": 0.0,
         "autogrow_engine_memory_headroom_fraction": 0.0,
@@ -645,6 +648,10 @@ def _cluster_defaults(config=None):
             "default_engine_cores": 30,
             "autogrow_engine_cores": 30,
             "autogrow_dynamic_engine_cores": True,
+            # Spider schedules partial allocations into free cores on MIXED
+            # nodes.  Requiring a completely IDLE node would strand runnable
+            # work instead of letting Slurm queue/backfill the pilot.
+            "autogrow_require_idle_nodes": False,
             "autogrow_engine_min_cores": 2,
             "autogrow_engine_memory_mb_per_core": 8000.0,
             "autogrow_engine_memory_headroom_fraction": 0.08,
@@ -701,6 +708,10 @@ def _apply_cluster_config(config):
     status.autogrow_dynamic_engine_cores = _cfg_bool(
         cfg.get("autogrow_dynamic_engine_cores"),
         defaults["autogrow_dynamic_engine_cores"],
+    )
+    status.autogrow_require_idle_nodes = _cfg_bool(
+        cfg.get("autogrow_require_idle_nodes"),
+        defaults["autogrow_require_idle_nodes"],
     )
     status.autogrow_engine_min_cores = max(
         1,
@@ -3760,8 +3771,9 @@ def list_jobs_detailed(owner=None, states=None):
 
 
 def get_autogrow_plan():
-    """Expose the controller's last autogrow plan (rendered only to curses today)."""
+    """Expose the controller's last rendered and structured autogrow plan."""
     return {"ok": True, "autogrow_plan": getattr(status, 'autogrow_plan', None),
+            "autogrow_plan_detail": getattr(status, 'autogrow_plan_detail', None),
             "autogrow_enable": bool(status.autogrow_enable),
             "autogrow_max_compute_nodes": int((getattr(status, 'config', {}) or {}).get('autogrow_max_compute_nodes', 0) or 0)}
 
@@ -6288,10 +6300,11 @@ def compute_autogrow_plan(all_engines, partition):
                 'plan_reason': 'ssd-preferred: non-SSD engine cap reached, waiting for scratch capacity',
             }
 
-    # Don't queue an engine that has nowhere to start right now: parking a PENDING
-    # engine allocation while the whole cluster is full is wasteful and contradicts
-    # any concurrent phase-out. Wait for a node to free instead.
-    if best_idle <= 0:
+    # Some sites only schedule whole-node pilots and should wait for a currently
+    # idle node.  Spider pilots are partial allocations, however: they can
+    # backfill on MIXED nodes and Slurm (not zslurm) should decide when they run.
+    if best_idle <= 0 and bool(
+            getattr(status, 'autogrow_require_idle_nodes', True)):
         return {
             'has_eligible': len(eligible) > 0,
             'eligible_n': len(eligible),
@@ -6357,6 +6370,10 @@ def compute_autogrow_plan(all_engines, partition):
         'required_mpc': required_mpc,
         'raw_best_nodes': raw_best_nodes,
         'fat_cap_applied': fat_cap_applied,
+        'plan_reason': (
+            'submitted to Slurm queue despite zero fully idle nodes'
+            if best_idle <= 0 else None
+        ),
     }
     
     return plan
@@ -6769,6 +6786,7 @@ def thread_check_commands():
                 autogrow_last_plan_ts = now
                 
                 plan = compute_autogrow_plan(all_engines, "compute")
+                status.autogrow_plan_detail = dict(plan)
                 cooldown_remaining_compute = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_compute_ts)))
                 
                 if plan.get('best_nodes', 0) > 0:
@@ -6779,7 +6797,7 @@ def thread_check_commands():
                         f"cooldown {int(cooldown_remaining_compute)}s left"
                     )
                 else:
-                    plan_compute = f"no nodes needed"
+                    plan_compute = str(plan.get('plan_reason') or "no nodes needed")
 
                 if cooldown_remaining_compute <= 0: # Autogrow cooldown expired, lets see if we need to start some engines
                     if plan.get('best_part',None) is not None:

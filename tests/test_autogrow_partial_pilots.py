@@ -67,6 +67,20 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         ):
             return self.zslurm.compute_autogrow_plan([], "compute")
 
+    def plan_without_fully_idle_nodes(self):
+        availability = {
+            "normal": {
+                "scratch": {"states": {"IDLE": 0}},
+                "no_scratch": {"states": {"IDLE": 0}},
+            }
+        }
+        with mock.patch.object(
+            self.zslurm.zslurm_shared,
+            "slurm_partition_state_counts_by_scratch",
+            return_value=availability,
+        ):
+            return self.zslurm.compute_autogrow_plan([], "compute")
+
     def test_single_eight_gb_job_requests_two_core_pilot(self):
         self.add_job("one", 1, 8000)
 
@@ -77,6 +91,21 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         self.assertAlmostEqual(
             self.zslurm._partial_engine_schedulable_memory_mb(2), 14628.0
         )
+
+    def test_spider_queues_partial_pilot_without_fully_idle_nodes(self):
+        self.add_job("one", 1, 8000)
+
+        plan = self.plan_without_fully_idle_nodes()
+
+        self.assertEqual(plan["best_nodes"], 1)
+        self.assertEqual(plan["engine_cores"], 2)
+        self.assertIn("Slurm queue", plan["plan_reason"])
+
+    def test_no_runnable_work_never_creates_an_empty_pilot(self):
+        plan = self.plan_without_fully_idle_nodes()
+
+        self.assertFalse(plan["has_eligible"])
+        self.assertEqual(plan.get("best_nodes", 0), 0)
 
     def test_memory_and_cpu_both_raise_partial_pilot_size(self):
         self.add_job("memory", 1, 16000)

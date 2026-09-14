@@ -30,6 +30,7 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertEqual(defaults["default_engine_cores"], 30)
         self.assertEqual(defaults["autogrow_engine_cores"], 30)
         self.assertTrue(defaults["autogrow_dynamic_engine_cores"])
+        self.assertFalse(defaults["autogrow_require_idle_nodes"])
         self.assertEqual(defaults["autogrow_engine_min_cores"], 2)
         self.assertEqual(defaults["autogrow_engine_memory_mb_per_core"], 8000.0)
         self.assertEqual(
@@ -48,6 +49,7 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertEqual(defaults["default_engine_cores"], 0)
         self.assertEqual(defaults["autogrow_engine_cores"], 0)
         self.assertFalse(defaults["autogrow_dynamic_engine_cores"])
+        self.assertTrue(defaults["autogrow_require_idle_nodes"])
         self.assertTrue(defaults["autogrow_enable"])
         self.assertTrue(defaults["maintenance_window_enable"])
         self.assertIn("fat_genoa", defaults["node_profiles"])
@@ -68,6 +70,7 @@ class ClusterSiteTests(unittest.TestCase):
             "default_engine_cores": 12,
             "autogrow_engine_cores": 16,
             "autogrow_dynamic_engine_cores": False,
+            "autogrow_require_idle_nodes": True,
             "autogrow_enable": True,
             "autogrow_max_compute_nodes": 3,
         }
@@ -76,6 +79,7 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertEqual(self.zslurm.status.default_engine_cores, 12)
         self.assertEqual(self.zslurm.status.autogrow_engine_cores, 16)
         self.assertFalse(self.zslurm.status.autogrow_dynamic_engine_cores)
+        self.assertTrue(self.zslurm.status.autogrow_require_idle_nodes)
         self.assertTrue(self.zslurm.status.autogrow_enable)
         self.assertEqual(config["autogrow_max_compute_nodes"], 3)
 
