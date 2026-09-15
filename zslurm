@@ -615,6 +615,7 @@ def _cluster_defaults(config=None):
         "autogrow_engine_memory_headroom_fraction": 0.0,
         "autogrow_engine_memory_cap_fraction": 1.0,
         "autogrow_engine_memory_static_reserve_mb": 0.0,
+        "autogrow_max_nonssd_fraction": 0.5,
         "autogrow_enable": False,
         "autogrow_max_compute_nodes": 0,
     }
@@ -657,6 +658,10 @@ def _cluster_defaults(config=None):
             "autogrow_engine_memory_headroom_fraction": 0.08,
             "autogrow_engine_memory_cap_fraction": 0.99,
             "autogrow_engine_memory_static_reserve_mb": 100.0,
+            # Spider's normal pilots do not request local scratch.  The
+            # scratch-preference moderation used on Snellius would therefore
+            # cap this one-class fleet at a single pilot forever.
+            "autogrow_max_nonssd_fraction": 1.0,
         })
     return defaults
 
@@ -752,6 +757,16 @@ def _apply_cluster_config(config):
         _cfg_float(
             cfg.get("autogrow_engine_memory_static_reserve_mb"),
             defaults["autogrow_engine_memory_static_reserve_mb"],
+        ),
+    )
+    status.autogrow_max_nonssd_fraction = min(
+        1.0,
+        max(
+            0.0,
+            _cfg_float(
+                cfg.get("autogrow_max_nonssd_fraction"),
+                defaults["autogrow_max_nonssd_fraction"],
+            ),
         ),
     )
     status.autogrow_enable = _cfg_bool(

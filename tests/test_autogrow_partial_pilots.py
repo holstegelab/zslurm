@@ -3,6 +3,7 @@ import importlib.util
 import io
 import pathlib
 import threading
+import types
 import unittest
 from unittest import mock
 
@@ -53,7 +54,7 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         self.jobs.jobs_by_id[job.jobid] = job
         return job
 
-    def plan(self):
+    def plan(self, engines=None):
         availability = {
             "normal": {
                 "scratch": {"states": {"IDLE": 0}},
@@ -65,7 +66,7 @@ class PartialPilotAutogrowTests(unittest.TestCase):
             "slurm_partition_state_counts_by_scratch",
             return_value=availability,
         ):
-            return self.zslurm.compute_autogrow_plan([], "compute")
+            return self.zslurm.compute_autogrow_plan(engines or [], "compute")
 
     def plan_without_fully_idle_nodes(self):
         availability = {
@@ -126,6 +127,19 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         self.assertEqual(plan["raw_best_nodes"], 2)
         self.assertEqual(plan["best_nodes"], 1)
         self.assertEqual(plan["engine_cores"], 30)
+
+    def test_spider_can_grow_beyond_one_non_scratch_pilot(self):
+        for index in range(40):
+            self.add_job(index, 1, 1000)
+        existing = types.SimpleNamespace(partition="compute", has_ssd=False)
+
+        plan = self.plan([existing])
+
+        self.assertEqual(plan["best_nodes"], 1)
+        self.assertEqual(plan["engine_cores"], 30)
+        self.assertNotIn(
+            "non-SSD engine cap", plan.get("plan_reason") or ""
+        )
 
     def test_queued_partial_pilot_is_not_counted_as_full_profile(self):
         for index in range(3):
