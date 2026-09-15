@@ -25,11 +25,12 @@ python -m pip install .
 ```
 
 Install the manager and worker entry points into the same environment. The
-Slurm engine launcher resolves `zslurm_chief` next to itself, so the same
-installation works on Snellius and Spider without a hardcoded conda path. For
-a relocated environment whose `bin` directory is not inherited by `sbatch`,
-export `ZSLURM_ENGINE_ENV_BIN=/path/to/environment/bin` before starting the
-manager.
+manager resolves the pilot launcher, `zslurm_chief`, and its Python interpreter
+before calling `sbatch`, then exports their exact paths to the pilot. This is
+portable across Snellius and Spider even though Slurm copies the launcher to a
+spool directory. `ZSLURM_ENGINE_LAUNCHER`, `ZSLURM_CHIEF_PATH`,
+`ZSLURM_ENGINE_PYTHON`, and `ZSLURM_ENGINE_ENV_BIN` remain explicit overrides
+for relocated or deliberately split installations.
 
 Site templates are available under `config/sites/`:
 
