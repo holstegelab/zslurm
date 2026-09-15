@@ -294,6 +294,44 @@ class EngineHoldAccountingTests(unittest.TestCase):
             [row[0] for row in manager.queued_engines_detail], ["123_1"]
         )
 
+    def test_registered_pilot_is_observed_by_id_when_slurm_name_has_suffix(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(
+            engine_id="worker-1",
+            cluster_id="777",
+            partition="compute",
+            managed=True,
+            instance="test-instance",
+        )
+        manager.engine_by_id[engine.engine_id] = engine
+        manager.engine_by_clusterid[engine.cluster_id] = engine
+        custom_name_row = (
+            "777|777|N/A|test-instance-recall-wide|23:45:00|R|worker-1|"
+            "normal|00:00:00|(null)|None\n"
+        ).encode("utf-8")
+
+        with mock.patch.object(
+            z,
+            "Popen",
+            side_effect=[
+                fake_process(stdout=b""),
+                fake_process(stdout=custom_name_row),
+            ],
+        ) as popen:
+            manager._check_cluster_engines()
+
+        self.assertEqual(len(popen.call_args_list), 2)
+        self.assertIn("--name", popen.call_args_list[0].args[0])
+        self.assertIn("--jobs", popen.call_args_list[1].args[0])
+        self.assertIn("777", popen.call_args_list[1].args[0])
+        self.assertTrue(engine.managed)
+        self.assertEqual(engine.missing_hits, 0)
+        self.assertEqual(engine.observed_hits, 1)
+        self.assertEqual(manager.cluster_running_engines, 1)
+        self.assertEqual(manager.cluster_running_by_partition, {"normal": 1})
+        self.assertEqual(engine.timeleft, 23 * 3600 + 45 * 60)
+
 
 if __name__ == "__main__":
     unittest.main()

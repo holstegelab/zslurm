@@ -4129,39 +4129,73 @@ class EngineManager(object):
     def _check_cluster_engines(self):
         # After an explicit handover, imported allocations retain the old
         # Slurm job name.  Query all logical instance names represented by our
-        # placeholders, while still excluding the user's independent managers.
+        # placeholders.  Registered pilots may also have been submitted with a
+        # human-readable suffix in their Slurm name.  Query their exact Slurm
+        # ids as a second selector so a harmless display-name difference cannot
+        # demote a live chief to ``managed=False`` and strand runnable work.
         instance_names = {str(status.instance_name)}
         for known_engine in self.engine_by_clusterid.values():
             known_instance = getattr(known_engine, 'instance', None)
             if known_instance:
                 instance_names.add(str(known_instance))
-        args = [
-            "squeue", "-h", "-r", "--user", getpass.getuser(),
-            "--name", ",".join(sorted(instance_names)),
-            "-O",
+        output_format = (
             "jobid:|,arrayjobid:|,arraytaskid:|,name:|,timeleft:|,statecompact:|,"
-            "nodelist:|,partition:|,pendingtime:|,feature:|,reason",
-        ]
-        try:
-            p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            output, error = p.communicate()
-            if p.returncode not in (None, 0):
-                if isinstance(error, bytes):
-                    error = error.decode("utf-8", errors="replace")
-                add_log_line(
-                    gb,
-                    "Unable to query Slurm engine allocations (exit %s): %s"
-                    % (p.returncode, str(error or "").strip()),
-                    RED,
+            "nodelist:|,partition:|,pendingtime:|,feature:|,reason"
+        )
+        selectors = [["--name", ",".join(sorted(instance_names))]]
+        known_slurm_ids = sorted({
+            str(getattr(engine, "slurm_job_id", None) or cid)
+            for cid, engine in self.engine_by_clusterid.items()
+            if (
+                engine is not None
+                and cid not in (None, "", False)
+                and re.fullmatch(
+                    r"\d+(?:_\d+)?",
+                    str(getattr(engine, "slurm_job_id", None) or cid),
                 )
-                return
-            if isinstance(output, bytes):
-                output = output.decode("utf-8")
-        except OSError:
-            # lets assume this is temporary
-            return
+            )
+        })
+        if known_slurm_ids:
+            selectors.append(["--jobs", ",".join(known_slurm_ids)])
 
-        output = [e.strip().split("|") for e in output.split("\n") if e]
+        output_lines = []
+        for selector in selectors:
+            args = [
+                "squeue", "-h", "-r", "--user", getpass.getuser(),
+            ] + selector + ["-O", output_format]
+            try:
+                p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                query_output, error = p.communicate()
+                if p.returncode not in (None, 0):
+                    if isinstance(error, bytes):
+                        error = error.decode("utf-8", errors="replace")
+                    add_log_line(
+                        gb,
+                        "Unable to query Slurm engine allocations (exit %s): %s"
+                        % (p.returncode, str(error or "").strip()),
+                        RED,
+                    )
+                    return
+                if isinstance(query_output, bytes):
+                    query_output = query_output.decode("utf-8")
+            except OSError:
+                # A failed observation is never evidence that a pilot vanished.
+                return
+            output_lines.extend(
+                line.strip() for line in query_output.split("\n") if line
+            )
+
+        # A manager-named registered pilot is returned by both selectors.  The
+        # instantiated Slurm job id is stable and therefore a safe union key.
+        output = []
+        seen_slurm_job_ids = set()
+        for line in output_lines:
+            fields = line.split("|")
+            slurm_job_id = fields[0].strip() if fields else ""
+            if slurm_job_id in seen_slurm_job_ids:
+                continue
+            seen_slurm_job_ids.add(slurm_job_id)
+            output.append(fields)
 
         z = defaultdict(int)
 
