@@ -15,6 +15,7 @@ except:
 import socket
 import threading
 import re
+import shutil
 
 
 class ReuseAddrXMLRPCServer(SimpleXMLRPCServer):
@@ -62,6 +63,54 @@ DEFAULT_NODE_PROFILES = {
     "fat_genoa": {"cores": 192, "mem_gb": 1440},
     "fat_rome": {"cores": 128, "mem_gb": 960},
 }
+
+
+def _prepare_engine_runtime(runtime_dir=None, python_executable=None,
+                            environ=None):
+    """Pin the pilot launcher and worker interpreter for Slurm children.
+
+    ``sbatch`` copies a script into its spool directory, so the launcher's
+    location cannot reliably be inferred from ``BASH_SOURCE`` on the worker.
+    Resolve the scripts while the manager is still in its installed runtime
+    and export their exact paths. Explicit environment overrides remain
+    authoritative for relocated or split installations.
+    """
+    env = os.environ if environ is None else environ
+    runtime_dir = os.path.abspath(
+        runtime_dir if runtime_dir is not None
+        else os.path.dirname(os.path.realpath(__file__))
+    )
+    python_executable = os.path.abspath(
+        python_executable if python_executable is not None else sys.executable
+    )
+
+    launcher = env.get("ZSLURM_ENGINE_LAUNCHER")
+    if not launcher:
+        installed_launcher = os.path.join(runtime_dir, "slurm_to_zslurm")
+        launcher = (
+            installed_launcher
+            if os.path.isfile(installed_launcher)
+            else shutil.which("slurm_to_zslurm", path=env.get("PATH"))
+        )
+    if not launcher:
+        # Preserve the historical error path. The bounded sbatch stderr is
+        # now logged by the caller, making an incomplete install diagnosable.
+        launcher = "slurm_to_zslurm"
+
+    if os.path.isfile(python_executable) and os.access(python_executable, os.X_OK):
+        env.setdefault("ZSLURM_ENGINE_PYTHON", python_executable)
+        env.setdefault("ZSLURM_ENGINE_ENV_BIN", os.path.dirname(python_executable))
+
+    if not env.get("ZSLURM_CHIEF_PATH"):
+        installed_chief = os.path.join(runtime_dir, "zslurm_chief")
+        chief = (
+            installed_chief
+            if os.path.isfile(installed_chief)
+            else shutil.which("zslurm_chief", path=env.get("PATH"))
+        )
+        if chief:
+            env["ZSLURM_CHIEF_PATH"] = chief
+    return launcher
 
 # On a non-SSD engine, let an ssd_use=no job absorb up to ten percent of a
 # node-equivalent more CPU/memory packing imbalance than ssd_use=possible work.
@@ -4618,9 +4667,12 @@ class EngineManager(object):
                 else:
                     lpartition = "compute"
 
-                # Add command to run under sbatch and its arguments
+                # Resolve the runtime before calling sbatch. Slurm copies the
+                # launcher into a spool directory, so a relative executable or
+                # sibling lookup on the worker is not reliable.
+                engine_launcher = _prepare_engine_runtime()
                 args.extend([
-                    "slurm_to_zslurm",
+                    engine_launcher,
                     "-a", str(status.address),
                     "-p", str(status.port),
                     "--instance", str(status.instance_name),
@@ -4629,20 +4681,24 @@ class EngineManager(object):
                 if cores > 0:
                     args.extend(["-c", str(int(cores))])
 
-                eid = Popen(
+                stdout, stderr = Popen(
                     args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                ).communicate()[0]
-                if isinstance(eid, bytes):
-                    eid = eid.decode("utf-8")
+                ).communicate()
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode("utf-8", errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", errors="replace")
 
-                eid = eid.strip()
+                eid = stdout.strip()
                 try:
                     log_cmd = " ".join(shlex.quote(str(a)) for a in args)
                 except Exception:
                     log_cmd = "sbatch ..."
                 add_log_line(gb, "Queueing engines (%s) using: " % eid + log_cmd, GREEN)
                 if "error" in eid or not eid:
-                    add_log_line(gb, "Error during SLURM submission.", RED)
+                    detail = " ".join(stderr.strip().split())[:1000]
+                    suffix = ": " + detail if detail else "."
+                    add_log_line(gb, "Error during SLURM submission" + suffix, RED)
                     return
 
                 planned_cores, planned_mem_mb = _autogrow_engine_capacity(
