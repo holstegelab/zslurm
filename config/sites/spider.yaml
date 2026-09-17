@@ -2,9 +2,23 @@
 # cap before enabling autogrow.
 cluster_site: spider
 default_partition: normal
-staging_partition: staging
+# Spider has no physical staging partition. Archive-source workflows require a
+# separately configured backend/pilot class; dCache and S3 transfers use normal
+# compute pilots.
+staging_partition: __disabled__
+staging_autogrow_enable: false
 enable_ssd_prompt: false
 ssd_feature_name: ssd
+# Spider's Slurm allocation binds node-local XFS to TMPDIR=/tmp. This is
+# intentionally opt-in so a Snellius pilot never mistakes ordinary /tmp for
+# schedulable scratch.
+scratch_use_tmpdir: true
+# Local XFS is shared by partial pilots on a node. A conservative 100 GiB/core
+# cap prevents every pilot from advertising the entire 12-TiB device.
+scratch_capacity_gb_per_core: 100
+# Spider project storage is CephFS; Snellius GPFS RDMA counters are not a
+# meaningful I/O signal here.
+gpfs_io_enable: false
 
 # Spider's Slurm policy grants 8 GB per allocated core. These values describe
 # the upper bound of a partial pilot, not all physical resources on the node.
@@ -24,7 +38,7 @@ node_profiles:
     cores: 30
     mem_gb: 240
 autogrow_prefer_partitions:
-  - [normal, false]
+  - [normal, true]
 autogrow_fallback_partition: normal
 autogrow_fat_partitions: []
 

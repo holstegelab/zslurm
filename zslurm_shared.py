@@ -439,6 +439,7 @@ def get_job_url(instance=None, address=None):
 # Scratch-aware Slurm helpers
 _scratch_parts_cache_ts = 0.0
 _scratch_parts_cache = None
+_scratch_parts_cache_feature = None
 
 
 def _canon_state(s):
@@ -557,13 +558,15 @@ def _parse_scontrol_json_nodes(s):
     return out
 
 
-def _collect_states_by_scratch(nodes):
+def _collect_states_by_scratch(nodes, feature_name="scratch-node"):
     parts = {}
     for nd in nodes:
         pset = nd.get("partitions") or []
         if not pset:
             pset = ["(none)"]
-        has_scratch = ("scratch-node" in (nd.get("features") or set()))
+        has_scratch = bool(
+            feature_name and feature_name in (nd.get("features") or set())
+        )
         key = "scratch" if has_scratch else "no_scratch"
         st = nd.get("state") or "UNKNOWN"
         for p in pset:
@@ -579,10 +582,17 @@ def _collect_states_by_scratch(nodes):
     return parts
 
 
-def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60):
+def slurm_partition_state_counts_by_scratch(
+    cache_ttl_sec=60, feature_name="scratch-node"
+):
     global _scratch_parts_cache_ts, _scratch_parts_cache
+    global _scratch_parts_cache_feature
     now = time.time()
-    if _scratch_parts_cache is not None and (now - _scratch_parts_cache_ts) < float(cache_ttl_sec):
+    if (
+        _scratch_parts_cache is not None
+        and _scratch_parts_cache_feature == feature_name
+        and (now - _scratch_parts_cache_ts) < float(cache_ttl_sec)
+    ):
         return _scratch_parts_cache
     raw = None
     try:
@@ -604,9 +614,10 @@ def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60):
                 nodes = []
         except Exception:
             nodes = []
-    parts = _collect_states_by_scratch(nodes or [])
+    parts = _collect_states_by_scratch(nodes or [], feature_name=feature_name)
     _scratch_parts_cache = parts
     _scratch_parts_cache_ts = now
+    _scratch_parts_cache_feature = feature_name
     return parts
 
 

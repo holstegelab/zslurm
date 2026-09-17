@@ -689,8 +689,9 @@ def _cluster_defaults(config=None):
         # describes the allocation, not the physical RAM installed in a node.
         defaults.update({
             "default_partition": "normal",
+            "staging_partition": "__disabled__",
             "ssd_feature_name": "ssd",
-            "autogrow_prefer_partitions": [("normal", False)],
+            "autogrow_prefer_partitions": [("normal", True)],
             "node_profiles": {
                 "normal": {"cores": 30, "mem_gb": 240},
             },
@@ -707,9 +708,8 @@ def _cluster_defaults(config=None):
             "autogrow_engine_memory_headroom_fraction": 0.08,
             "autogrow_engine_memory_cap_fraction": 0.99,
             "autogrow_engine_memory_static_reserve_mb": 100.0,
-            # Spider's normal pilots do not request local scratch.  The
-            # scratch-preference moderation used on Snellius would therefore
-            # cap this one-class fleet at a single pilot forever.
+            # Every current Spider normal node has the configured SSD feature,
+            # so non-SSD moderation is irrelevant for this one-class fleet.
             "autogrow_max_nonssd_fraction": 1.0,
         })
     return defaults
@@ -6263,7 +6263,14 @@ def compute_autogrow_plan(all_engines, partition):
         }
 
     try:
-        parts_states_by_scratch = zslurm_shared.slurm_partition_state_counts_by_scratch(60)
+        parts_states_by_scratch = (
+            zslurm_shared.slurm_partition_state_counts_by_scratch(
+                60,
+                feature_name=getattr(
+                    status, "ssd_feature_name", "scratch-node"
+                ),
+            )
+        )
     except Exception:
         parts_states_by_scratch = {}
 
@@ -6932,10 +6939,14 @@ def thread_check_commands():
                 staging_burst_threshold = max(1, int(getattr(status, 'staging_autogrow_burst_threshold', 50)))
                 staging_base_nodes = max(0, int(getattr(status, 'staging_autogrow_base_nodes', 1)))
                 staging_burst_nodes = max(staging_base_nodes, int(getattr(status, 'staging_autogrow_burst_nodes', 4)))
-                if staging_pending >= staging_burst_threshold:
-                    desired_staging = staging_burst_nodes
-                elif staging_pending > 0:
-                    desired_staging = staging_base_nodes
+                staging_autogrow_enable = _cfg_bool(
+                    status.config.get("staging_autogrow_enable"), True
+                )
+                if staging_autogrow_enable:
+                    if staging_pending >= staging_burst_threshold:
+                        desired_staging = staging_burst_nodes
+                    elif staging_pending > 0:
+                        desired_staging = staging_base_nodes
                 
                 queued_map = getattr(engines, 'cluster_queued_by_partition', {}) or {}
                 running_map = getattr(engines, 'cluster_running_by_partition', {}) or {}
@@ -6944,7 +6955,9 @@ def thread_check_commands():
 
                 cooldown_remaining_staging = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_staging_ts)))
 
-                if desired_staging > current_staging:
+                if not staging_autogrow_enable:
+                    plan_staging = "disabled"
+                elif desired_staging > current_staging:
                     plan_staging = f"grow {desired_staging  - current_staging}, cooldown {int(cooldown_remaining_staging)}s left"
                 else:
                     plan_staging = f"no nodes needed"

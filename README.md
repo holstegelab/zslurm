@@ -509,6 +509,12 @@ physical 960-GB or 1440-GB node size:
 ```yaml
 cluster_site: spider
 default_partition: normal
+staging_partition: __disabled__
+staging_autogrow_enable: false
+ssd_feature_name: ssd
+scratch_use_tmpdir: true
+scratch_capacity_gb_per_core: 100
+gpfs_io_enable: false
 default_engine_cores: 30
 autogrow_engine_cores: 30
 autogrow_dynamic_engine_cores: true
@@ -530,6 +536,21 @@ maintenance_window_enable: false
 The chief derives its final schedulable memory from the Slurm environment and
 cgroup, so a site or partition with a different memory-per-core grant is never
 allowed to advertise the physical node's complete RAM accidentally.
+
+Spider binds node-local XFS to `TMPDIR=/tmp` inside each Slurm allocation.
+`scratch_use_tmpdir` is deliberately site-specific: without it, a chief never
+mistakes ordinary system `/tmp` for schedulable SSD. The chief creates a private
+mode-0700 `.zslurm/jobs/job-<zslurm-id>-<suffix>` directory for every child
+attempt, exports it
+as `ZSLURM_SCRATCH_DIR`, points the standard temp variables there, and removes
+only that directory when the child ends. A per-core capacity cap prevents
+multiple partial pilots on one node from each advertising the complete 12-TiB
+device. The actual filesystem free space remains an additional hard bound.
+
+Spider has no physical `staging` partition and its project filesystem is
+CephFS. The supplied site file therefore disables staging autogrow and GPFS
+RDMA telemetry. Archive-class input jobs require a separately implemented and
+tested Spider backend; dCache and S3 jobs continue to use compute pilots.
 
 ## Storage quotas as a global resource monitor
 
@@ -762,7 +783,9 @@ set each tool's thread arguments consistently with the lease it acquires.
 
 The chief injects `ZSLURM_LEASE_SOCKET`, `ZSLURM_LEASE_TOKEN`,
 `ZSLURM_JOB_ID`, `ZSLURM_LEASE_MAX_CORES`, and
-`ZSLURM_LEASE_MAX_MEM_MB` into every child. The socket is node-local and mode
+`ZSLURM_LEASE_MAX_MEM_MB` into every child. On a scratch-capable pilot it also
+injects `ZSLURM_SCRATCH_ROOT` and the private `ZSLURM_SCRATCH_DIR`, and rewrites
+`TMPDIR`, `TMP`, `TEMP`, and `TEMPDIR` to the latter. The socket is node-local and mode
 `0600`; every request additionally requires the job-specific capability token.
 Jobs should use `zslurm_lease` rather than speaking the JSON protocol directly.
 

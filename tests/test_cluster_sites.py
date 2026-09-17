@@ -27,6 +27,7 @@ class ClusterSiteTests(unittest.TestCase):
         defaults = self.zslurm._cluster_defaults({"cluster_site": "spider"})
 
         self.assertEqual(defaults["default_partition"], "normal")
+        self.assertEqual(defaults["staging_partition"], "__disabled__")
         self.assertEqual(defaults["default_engine_cores"], 30)
         self.assertEqual(defaults["autogrow_engine_cores"], 30)
         self.assertTrue(defaults["autogrow_dynamic_engine_cores"])
@@ -34,6 +35,9 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertEqual(defaults["autogrow_engine_min_cores"], 2)
         self.assertEqual(defaults["autogrow_engine_memory_mb_per_core"], 8000.0)
         self.assertEqual(defaults["autogrow_max_nonssd_fraction"], 1.0)
+        self.assertEqual(
+            defaults["autogrow_prefer_partitions"], [("normal", True)]
+        )
         self.assertEqual(
             defaults["node_profiles"]["normal"],
             {"cores": 30, "mem_gb": 240},
