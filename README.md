@@ -1301,6 +1301,43 @@ the interface design and phasing.
   `grow`/`shrink`. `submit_job` accepts optional `idempotency_key` and `priority`
   arguments for retry-safe, priority-aware submission.
 
+### Temporary job-start filesystem failures
+
+New chiefs retain a granted job and retry startup after temporary filesystem
+errors such as `EDQUOT` (quota exceeded), `ENOSPC`, `EIO` and `ESTALE`. They do
+not fail the job or spend a Snakemake retry merely because its log cannot yet
+be created. Retries back off from 20 seconds to at most 300 seconds, configured
+with `job_start_retry_seconds` and `job_start_retry_max_seconds`.
+
+The chief keeps polling, reporting other completions and handling cancellation.
+Its accounting lock is not held while creating the log. It keeps the job's
+existing CPU/memory/storage/transfer grant exactly once, does not request more
+work while startup is deferred, and retries even when those grants leave zero
+unreserved cores. Actual memory headroom is rechecked before spawn. A cancelled
+waiting start releases its local holding and cannot launch later.
+
+The existing manager protocol labels a granted job `RUNNING` before spawning;
+therefore a deferred start remains `RUNNING` with zero measured usage. Its chief
+log reports `START DEFERRED`, the error and the next retry delay. No new manager
+RPC or manager restart is needed. Invalid commands still fail the individual
+job. This mechanism cannot rescue a computation that has already started and
+then fails while writing its own output files.
+
+Chief diagnostic write/flush errors are best-effort so a full Slurm log cannot
+kill coordination. This does not suppress errors writing child-job outputs.
+Unexpected fatal chief errors release locks and terminate children before
+unregistering, avoiding stranded monitor threads and unsupervised duplicate
+attempts. Deploy the new chief before starting engines; existing chief processes
+retain their already-loaded implementation and are not hot-reloaded.
+
+Regression tests inject quota/disk/I/O errors, exercise a real child after
+recovery, check exact reservation/lease accounting, bounded backoff, cancellation
+during log creation, and failed process/thread creation:
+
+```bash
+python -m pytest -q tests/test_chief_startup.py tests/test_dynamic_leases.py
+```
+
 ### Claude Code skill
 
 A ready-to-use **Claude Code skill** that teaches an agent to drive ZSlurm + Snellius is

@@ -13,8 +13,11 @@ import getpass
 import math
 import zslurm_shared
 import zslurm_lease
+from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts
 import socket
 
+sys.stdout = BestEffortDiagnosticStream(sys.stdout)
+sys.stderr = BestEffortDiagnosticStream(sys.stderr)
 try:
     import http.client as httplib
 except:
@@ -1065,13 +1068,15 @@ def handler(signum, frame) :
     sys.exit()
 
 def terminate_jobs():
-    status.lock.acquire()
-    for process in list(status.running_processes.values()):
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except OSError:
-            pass
-    status.lock.release()
+    starter = globals().get('job_starter')
+    if starter is not None:
+        starter.cancel_all()
+    with status.lock:
+        for process in list(status.running_processes.values()):
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except OSError:
+                pass
 
     counter = 20 #give 20 seconds to shut down normally
     while counter > 0 and len(status.running_processes) > 0:
@@ -1081,14 +1086,13 @@ def terminate_jobs():
 
 
     #kill any remaining jobs
-    status.lock.acquire()
-    for process in list(status.running_processes.values()):
-        print("\t[%s] Killing remaining process" % myid)
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except OSError:
-            pass
-    status.lock.release()
+    with status.lock:
+        for process in list(status.running_processes.values()):
+            print("\t[%s] Killing remaining process" % myid)
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except OSError:
+                pass
 
 class status:
     lock = None
@@ -1102,7 +1106,8 @@ class status:
     current_mem_usage = {}
 
 def job_monitor(
-    jobid, process, ncpu, mem, logfile, logfile_path, job_scratch_path=None
+    jobid, process, ncpu, mem, logfile, logfile_path,
+    job_scratch_context=None,
 ):
     memcache = [] #stores memory usage at different snapshots over time
     cpucache = [] #stores cpu usage at different snapshots over time
@@ -1198,12 +1203,11 @@ def job_monitor(
                     # Uncapped core-equivalent usage (non-negative)
 
                     cpu_percentage = max(0.0, float(cpu_percentage))                
-                    status.lock.acquire()
-                    status.current_cpu_usage[jobid] = cpu_percentage
-                    pss_mb = r['pss'] / (1024.0 * 1024.0)
-                    rss_mb = r['rss'] / (1024.0 * 1024.0)
-                    status.current_mem_usage[jobid] = pss_mb
-                    status.lock.release()
+                    with status.lock:
+                        status.current_cpu_usage[jobid] = cpu_percentage
+                        pss_mb = r['pss'] / (1024.0 * 1024.0)
+                        rss_mb = r['rss'] / (1024.0 * 1024.0)
+                        status.current_mem_usage[jobid] = pss_mb
 
                     lease_controller.record_usage(
                         jobid,
@@ -1309,49 +1313,49 @@ def job_monitor(
     #print(("%s - Job %s done with rcode %s" % (xtime(), str(jobid), str(retcode))))
     #print ("%s - Report %s" % (xtime(), str(report)))
 
-    status.lock.acquire()
-    current_attempt = zslurm_lease.claim_finished_attempt(
-        status.running_processes, jobid, process
-    )
-    if current_attempt:
-        # Finalising the lease also closes its last reporting phase. Attach
-        # both per-phase rows and time-integrated effective reservations to
-        # the normal job report before it is sent to the manager.
-        lease_report = lease_controller.finish_job(jobid, ncpu, mem)
-        phases = lease_report.get("phases", [])
-        report["lease_phases"] = phases
-        for field in (
-            "phase_count",
-            "reserved_core_seconds",
-            "sampled_reserved_core_seconds",
-            "used_core_seconds",
-            "reserved_mem_mb_seconds",
-            "sampled_reserved_mem_mb_seconds",
-            "pss_mb_seconds",
-            "cpu_efficiency",
-            "memory_efficiency",
-            "sample_coverage",
-        ):
-            if field in lease_report:
-                report["lease_" + field] = lease_report[field]
-        status.return_codes[jobid] = retcode
-        status.reports[jobid] = report
-        status.current_cpu_usage.pop(jobid, None)
-        status.current_mem_usage.pop(jobid, None)
-        event_timer.set()
-    else:
-        sys.stderr.write(
-            f"job_monitor cleanup: stale or duplicate attempt for jobid {jobid}; "
-            "current process left untouched\n"
+    with status.lock:
+        current_attempt = zslurm_lease.claim_finished_attempt(
+            status.running_processes, jobid, process
         )
-        sys.stderr.flush()
-    status.lock.release()
+        if current_attempt:
+            # Finalising the lease also closes its last reporting phase. Attach
+            # both per-phase rows and time-integrated effective reservations to
+            # the normal job report before it is sent to the manager.
+            lease_report = lease_controller.finish_job(jobid, ncpu, mem)
+            phases = lease_report.get("phases", [])
+            report["lease_phases"] = phases
+            for field in (
+                "phase_count",
+                "reserved_core_seconds",
+                "sampled_reserved_core_seconds",
+                "used_core_seconds",
+                "reserved_mem_mb_seconds",
+                "sampled_reserved_mem_mb_seconds",
+                "pss_mb_seconds",
+                "cpu_efficiency",
+                "memory_efficiency",
+                "sample_coverage",
+            ):
+                if field in lease_report:
+                    report["lease_" + field] = lease_report[field]
+            status.return_codes[jobid] = retcode
+            status.reports[jobid] = report
+            status.current_cpu_usage.pop(jobid, None)
+            status.current_mem_usage.pop(jobid, None)
+            event_timer.set()
+        else:
+            sys.stderr.write(
+                f"job_monitor cleanup: stale or duplicate attempt for jobid {jobid}; "
+                "current process left untouched\n"
+            )
+            sys.stderr.flush()
 
     logfile.close()
 
-    if current_attempt and job_scratch_path:
+    if job_scratch_context:
+        job_scratch_root, job_scratch_path = job_scratch_context
         try:
-            cleanup_job_scratch(scratch_path, job_scratch_path)
+            cleanup_job_scratch(job_scratch_root, job_scratch_path)
         except Exception as ex:
             sys.stderr.write(
                 f"{xtime()}:{jobid} - Scratch cleanup failed for "
@@ -1455,6 +1459,31 @@ lease_socket_path = _lease_socket_path()
 lease_server = zslurm_lease.LeaseServer(
     lease_socket_path, lease_controller
 ).start()
+
+
+def _prepare_child_scratch_environment(env, jobid):
+    # Scratch may be discovered again after chief startup. Bind the root into
+    # the returned context so a later refresh cannot redirect cleanup.
+    root = scratch_path
+    if not root:
+        return None
+    path = configure_job_scratch_environment(env, root, jobid)
+    return root, path
+
+
+def _cleanup_child_scratch_context(context):
+    root, path = context
+    cleanup_job_scratch(root, path)
+
+
+job_starter = DeferredJobStarts(
+    status, lease_controller, lease_socket_path, job_monitor, event_timer,
+    retry_seconds=config.get('job_start_retry_seconds', PING_INTERVAL),
+    retry_max_seconds=config.get('job_start_retry_max_seconds', 300.0),
+    memory_available=_lease_memory_available,
+    prepare_child_environment=_prepare_child_scratch_environment,
+    cleanup_child_context=_cleanup_child_scratch_context,
+)
 atexit.register(lease_server.close)
 sys.stderr.write(f"{xtime()} - LEASE SERVER; INFO: {lease_socket_path}\n")
 sys.stderr.flush()
@@ -1473,51 +1502,50 @@ try :
         event_timer.clear()
 
         while status.return_codes:
-            status.lock.acquire()
-            nretcodes = {}
-            for jobid, rcode in list(status.return_codes.items()):
-                try :
-                    s.job_finished(myid, jobid, rcode,status.reports.get(jobid,{'no_job_report':True, 'jobid':jobid}))
-                    #print('%s - Reported that job %s finished with rcode %s' % (xtime(), str(jobid), str(rcode)))
+            with status.lock:
+                nretcodes = {}
+                for jobid, rcode in list(status.return_codes.items()):
+                    try :
+                        s.job_finished(myid, jobid, rcode,status.reports.get(jobid,{'no_job_report':True, 'jobid':jobid}))
+                        #print('%s - Reported that job %s finished with rcode %s' % (xtime(), str(jobid), str(rcode)))
 
-                    status.reports.pop(jobid,None)
-                except MANAGER_RPC_ERRORS as rpc_error :
-                    print(
-                        '%s - [%s] Manager RPC failed while reporting jobid %s: %s'
-                        % (xtime(), myid, str(jobid), rpc_error)
-                    )
-                    try:
-                        reconnected = reconnect_to_instance(inst_name, uri)
-                        if reconnected is not None:
-                            s, myid, uri = reconnected
-                            manager_supports_gpfs_io = manager_supports_method(
-                                s, "poll_with_gpfs")
-                            status.assigned_jobs.clear()
-                            last_seen = time.time()
-                            s.job_finished(
-                                myid,
-                                jobid,
-                                rcode,
-                                status.reports.get(
-                                    jobid,
-                                    {'no_job_report': True, 'jobid': jobid},
-                                ),
-                            )
-                            status.reports.pop(jobid, None)
-                            print(
-                                f"[{myid}] Reconnected through instance "
-                                f"{inst_name} to {uri}; completion reported."
-                            )
-                            continue
-                    except Exception as reconnect_error:
-                        sys.stderr.write(
-                            f"{xtime()} - [{myid}] Completion reconnect failed: "
-                            f"{reconnect_error}\n"
+                        status.reports.pop(jobid,None)
+                    except MANAGER_RPC_ERRORS as rpc_error :
+                        print(
+                            '%s - [%s] Manager RPC failed while reporting jobid %s: %s'
+                            % (xtime(), myid, str(jobid), rpc_error)
                         )
-                        sys.stderr.flush()
-                    nretcodes[jobid] = rcode
-            status.return_codes = nretcodes
-            status.lock.release()
+                        try:
+                            reconnected = reconnect_to_instance(inst_name, uri)
+                            if reconnected is not None:
+                                s, myid, uri = reconnected
+                                manager_supports_gpfs_io = manager_supports_method(
+                                    s, "poll_with_gpfs")
+                                status.assigned_jobs.clear()
+                                last_seen = time.time()
+                                s.job_finished(
+                                    myid,
+                                    jobid,
+                                    rcode,
+                                    status.reports.get(
+                                        jobid,
+                                        {'no_job_report': True, 'jobid': jobid},
+                                    ),
+                                )
+                                status.reports.pop(jobid, None)
+                                print(
+                                    f"[{myid}] Reconnected through instance "
+                                    f"{inst_name} to {uri}; completion reported."
+                                )
+                                continue
+                        except Exception as reconnect_error:
+                            sys.stderr.write(
+                                f"{xtime()} - [{myid}] Completion reconnect failed: "
+                                f"{reconnect_error}\n"
+                            )
+                            sys.stderr.flush()
+                        nretcodes[jobid] = rcode
+                status.return_codes = nretcodes
             if status.return_codes:
                 time.sleep(PING_INTERVAL) #retry later
        
@@ -1527,138 +1555,54 @@ try :
         mb_memory_available = min(e_memtot_buffer - sum(status.current_mem_usage.values(),0.0), dyn_available_mb)
 
         
-        status.lock.acquire()  
-        #print("%s - CYCLE" % xtime(), str(status.current_cpu), str(status.current_mem), str(mb_memory_available))
-        # A waiting reacquisition is a local admission barrier: let existing
-        # children drain, but do not fill the capacity that the oldest waiter
-        # needs. Acquisitions are FIFO and all-or-nothing in the controller.
-        lease_acquire_pending = lease_controller.has_pending_acquire()
-        if (
-            mode == zslurm_shared.RUNNING
-            and not lease_acquire_pending
-            and status.current_cpu > 0 and status.current_mem > 0
-            and mb_memory_available > float(config.get('mem_min_requestable_mb', 256.0))
-        ):
-            if status.assigned_jobs:
-                jobs = list(status.assigned_jobs.values())
-            else:
-                try:
-                    #print("%s - REQUEST"%xtime(), myid, str(status.current_cpu), str(status.current_mem), str(mb_memory_available), partition)
-                    overcommit = float(config.get('mem_overcommit_fraction', 1.0))
-                    jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available) * overcommit, partition)
-                    #print('%s - REQUEST RESULT' % xtime(), len(jobs))
-                except MANAGER_RPC_ERRORS as serror :
-                    print ("%s - REQUEST HTTP Error" % xtime())
-                    jobs = []
-            for job in jobs:
-                jobid, job_name, command, cwd, env, ncpu, mem, state = job
-                if state == 'ASSIGNED':
-                    if status.current_cpu >= ncpu and min(status.current_mem,mb_memory_available) >= mem:
-                        status.assigned_jobs.pop(jobid,None)
-                        try :
-                            permission = s.can_run_assigned_job(myid, jobid)
-                        except MANAGER_RPC_ERRORS as serror :
-                            continue
-                        if not permission: #drop
-                            continue
-
-                    else:
-                        #print("%s - DELAY" % xtime())
-                        status.assigned_jobs[jobid] = job
-                        continue
-                #print("%s - EXECUTE" % xtime())
-                # Prevent duplicate starts for the same jobid
-                if jobid in status.running_processes:
-                    sys.stderr.write(f"{xtime()} - DUPLICATE START SKIPPED; INFO: job {jobid} already running\n")
-                    sys.stderr.flush()
-                    continue
-                #start job
-                curdir = os.getcwd()
-                os.chdir(cwd)
-
-                os.makedirs('zslurm_logs',exist_ok=True)
-                logfile_path = f'zslurm_logs/zslurm-{job_name}-{jobid}.out'
-
-                
-                #do not put logfile in a with, but keep it open, as subprocess will make use of it
-                logfile = open(logfile_path,'w')
-
-                command = shlex.split(command)
-                job_scratch_path = None
-                try:
-                    sys.stderr.write(f"{xtime()}:{jobid} - START; INFO: {ncpu} {mem} {' '.join(command)} {logfile_path}\n")
-                    sys.stderr.flush()
-                    # This job runs inside THIS engine's Slurm allocation, but `env` was
-                    # captured on the manager node and still carries the MANAGER's SLURM_*
-                    # identity (SLURM_JOB_ID, node vars, ...). Rules that locate node-local
-                    # scratch via /scratch-node/$USER.$SLURM_JOB_ID would otherwise miss and
-                    # fall back to a foreign engine's scratch dir, which gets reaped when
-                    # engines cycle -> samtools "bgzf_read ... error" / lost temp files.
-                    # Replace the whole SLURM_* namespace in the job env with this engine's
-                    # real values so the job sees the node it actually runs on.
-                    if isinstance(env, dict):
-                        env = {k: v for k, v in env.items() if not k.startswith("SLURM")}
-                        env.update({k: v for k, v in os.environ.items() if k.startswith("SLURM")})
-                    else:
-                        env = dict(os.environ)
-                    # Never leak the controller's scratch or temporary paths
-                    # into a child running on another host/allocation.
-                    for tmp_name in (
-                        "ZSLURM_SCRATCH_ROOT", "ZSLURM_SCRATCH_DIR",
-                        "TMPDIR", "TMP", "TEMP", "TEMPDIR",
-                    ):
-                        env.pop(tmp_name, None)
-                    if scratch_path:
-                        job_scratch_path = configure_job_scratch_environment(
-                            env, scratch_path, jobid
-                        )
-                    lease_env = lease_controller.prepare_job(jobid, ncpu, mem)
-                    lease_env[zslurm_lease.ENV_SOCKET] = lease_socket_path
-                    if isinstance(env, dict):
-                        env.update(lease_env)
-                    process = subprocess.Popen(command,stdout=logfile,stderr=logfile,cwd=cwd,env=env,preexec_fn=os.setpgrp)
-
-                    status.current_cpu -= ncpu
-                    status.current_mem -= mem
-                    status.running_processes[jobid] = process
-
-                    os.chdir(curdir)
-                    
-                    #start monitoring
-                    t = threading.Thread(
-                        target=job_monitor,
-                        args=(jobid, process, ncpu, mem, logfile, logfile_path,
-                              job_scratch_path),
-                    )
-                    t.start()
-                except Exception as e:
-                    import traceback
-                    # Spawn never reached the point where the initial maximum
-                    # was subtracted, so discard without returning resources.
+        # No filesystem operations under this lock: a failed log creation used
+        # to abandon it and strand all monitor threads after unregistering.
+        with status.lock:
+            lease_acquire_pending = lease_controller.has_pending_acquire()
+            if (
+                mode == zslurm_shared.RUNNING
+                and not lease_acquire_pending
+                and not job_starter.pending
+                and status.current_cpu > 0 and status.current_mem > 0
+                and mb_memory_available > float(config.get('mem_min_requestable_mb', 256.0))
+            ):
+                if status.assigned_jobs:
+                    jobs = list(status.assigned_jobs.values())
+                else:
                     try:
-                        lease_controller.discard_prepared_job(jobid)
-                    except Exception:
-                        pass
-                    if job_scratch_path:
-                        try:
-                            cleanup_job_scratch(
-                                scratch_path, job_scratch_path
-                            )
-                        except Exception:
-                            pass
-                    sys.stderr.write(traceback.format_exc())
-                    sys.stderr.write(f"{xtime()}:{jobid} - ERROR; INFO: {ncpu} {mem} {command} {logfile_path} {str(e)}\n")
-                    status.return_codes[jobid] = -20
-                    os.chdir(curdir)
+                        overcommit = float(config.get('mem_overcommit_fraction', 1.0))
+                        jobs = s.request_jobs(myid, status.current_cpu, min(status.current_mem, mb_memory_available) * overcommit, partition)
+                    except MANAGER_RPC_ERRORS:
+                        DeferredJobStarts.log('REQUEST HTTP Error')
+                        jobs = []
+                for job in jobs:
+                    jobid, job_name, command, cwd, env, ncpu, mem, state = job
+                    if jobid in status.running_processes or jobid in job_starter.pending:
+                        continue
+                    if state == 'ASSIGNED':
+                        if status.current_cpu >= ncpu and min(status.current_mem, mb_memory_available) >= mem:
+                            status.assigned_jobs.pop(jobid, None)
+                            try:
+                                permission = s.can_run_assigned_job(myid, jobid)
+                            except MANAGER_RPC_ERRORS:
+                                continue
+                            if not permission:
+                                continue
+                            job = tuple(job[:-1]) + ('RUNNING',)
+                        else:
+                            status.assigned_jobs[jobid] = job
+                            continue
+                    job_starter.claim(job)
 
+        # Retry even with zero free cores: these starts already own their grants.
+        # Backoff is non-blocking, so heartbeats, leases and completion reporting
+        # continue while the shared filesystem is temporarily unwritable.
+        if mode == zslurm_shared.RUNNING:
+            job_starter.run_ready()
+        else:
+            job_starter.cancel_all()
 
-
-
-                
-
-        status.lock.release()
-
-        if mode == zslurm_shared.STOPPING and not status.running_processes:
+        if mode == zslurm_shared.STOPPING and not status.running_processes and not job_starter.pending and not status.return_codes:
             break
 
            
@@ -1692,7 +1636,7 @@ try :
             cgroup_limit_mb = get_cgroup_memory_limit_mb()
             mem_capacity = e_memtot_buffer if cgroup_limit_mb is None else min(e_memtot_buffer, cgroup_limit_mb)
             mem_usage = min(100.0, max(0.0, 100.0 * (cgroup_memory_mb / max(mem_capacity, 1e-9))))
-        idle = len(status.running_processes) == 0
+        idle = not status.running_processes and not job_starter.pending
         if idle and idle_start == 0:
             idle_start = time.time()
         elif not idle:
@@ -1782,6 +1726,7 @@ try :
             if (cmd == zslurm_shared.STOP) :
                 print('[%s] Received command to stop.' % myid)
                 mode = zslurm_shared.STOPPING
+                job_starter.cancel_all()
             elif (cmd == zslurm_shared.DIE):
                 print('[%s] Received command to die.' % myid)
                 mode = zslurm_shared.STOPPING
@@ -1789,10 +1734,9 @@ try :
                 terminate_jobs()
             elif (cmd == zslurm_shared.DEASSIGN):
                 print(('[%s] Received command to deassign job: ' % myid)+ str(param))
-                status.lock.acquire()
-                jobid = param
-                status.assigned_jobs.pop(jobid,None)
-                status.lock.release()
+                with status.lock:
+                    jobid = param
+                    status.assigned_jobs.pop(jobid,None)
             elif (cmd == zslurm_shared.CANCEL):
                 print(('[%s] Received command to cancel job: ' % myid)+ str(param))
                 cancel_job_list.append(param)
@@ -1859,23 +1803,23 @@ try :
                 print("[%s] UNKNOWN COMMAND RECEIVED, EXITING!" %myid)
                 break
         if cancel_job_list:
-            status.lock.acquire()
-            processes = []
-            for jobid in cancel_job_list:
-                if jobid in status.running_processes:
+            with status.lock:
+                processes = []
+                for jobid in cancel_job_list:
+                    job_starter.cancel(jobid)
+                    if jobid in status.running_processes:
                     
-                    p = status.running_processes[jobid]
-                    try:
-                        process = psutil.Process(p.pid)
-                        processes.append(process)
-                        for proc in process.children(recursive=True):
-                            processes.append(proc)
-                            proc.terminate()
-                        process.terminate()
-                        #os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-                    except psutil.NoSuchProcess:
-                        pass
-            status.lock.release()
+                        p = status.running_processes[jobid]
+                        try:
+                            process = psutil.Process(p.pid)
+                            processes.append(process)
+                            for proc in process.children(recursive=True):
+                                processes.append(proc)
+                                proc.terminate()
+                            process.terminate()
+                            #os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                        except psutil.NoSuchProcess:
+                            pass
             
             time.sleep(10) #allow jobs some time to terminate normally
 
@@ -1898,5 +1842,11 @@ except (Exception, KeyboardInterrupt, SystemExit) :
     sys.stdout.flush()
     sys.stderr.flush()
 
-    safe_unregister(s, myid)
+    # All accounting locks unwind via context managers. On an unexpected fatal
+    # error, stop/reap children before giving their jobs back to the manager;
+    # never leave a half-alive chief occupying a Slurm allocation indefinitely.
+    try:
+        terminate_jobs()
+    finally:
+        safe_unregister(s, myid)
     raise
