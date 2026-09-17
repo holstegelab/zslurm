@@ -11,6 +11,7 @@ import threading
 import traceback
 import getpass
 import math
+import tempfile
 import zslurm_shared
 import zslurm_lease
 from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts

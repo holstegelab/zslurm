@@ -44,6 +44,16 @@ class ChiefScratchTests(unittest.TestCase):
             "configure_job_scratch_environment",
         )
 
+    def test_real_chief_imports_scratch_runtime_dependencies(self):
+        tree = ast.parse(CHIEF_PATH.read_text(encoding="utf-8"))
+        imported = {
+            alias.name.split(".", 1)[0]
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        self.assertIn("tempfile", imported)
+
     def test_spider_tmpdir_requires_slurm_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             detect = self.namespace["detect_scratch_path"]
