@@ -372,6 +372,9 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - Slurm partition name used for archive/staging-oriented engines
 - **`enable_ssd_prompt`**
   - whether the interactive UI asks about SSD-capable nodes
+- **`enable_feature_prompt`**
+  - whether the manual-engine dialog asks for an arbitrary Slurm feature;
+    Spider disables this because its normal nodes expose local scratch
 - **`ssd_feature_name`**
   - Slurm feature/constraint string used for SSD-capable nodes
 - **`autogrow_prefer_partitions`**
@@ -511,6 +514,7 @@ cluster_site: spider
 default_partition: normal
 staging_partition: __disabled__
 staging_autogrow_enable: false
+enable_feature_prompt: false
 ssd_feature_name: ssd
 scratch_use_tmpdir: true
 scratch_capacity_gb_per_core: 100
@@ -1111,10 +1115,12 @@ Useful options:
 
 This makes `zsnodes` the best tool for checking whether engines are full, idle, unmanaged, stopping, or carrying SSD-constrained work.
 
-The curses status row uses `CPU/GPFS (%)`: the first value is host CPU busy;
-the second is the mean GPFS fabric utilization across reporting compute
-engines. GPFS traffic is measured from the byte counters on the RDMA port that
-Spectrum Scale is configured to use. `GPFS%` is
+When GPFS telemetry is enabled, the curses status row uses `CPU/GPFS (%)`: the
+first value is host CPU busy; the second is the mean GPFS fabric utilization
+across reporting compute engines. When it is disabled (as on Spider), the row
+is labeled `Host CPU (%)` and omits the inapplicable GPFS value. GPFS traffic is
+measured from the byte counters on the RDMA port that Spectrum Scale is
+configured to use. `GPFS%` is
 `max(receive_rate, transmit_rate) / link_rate`, because the fabric is full
 duplex. It is throughput utilization, not Linux IO-wait time. The old
 `sys_iowait_pct` metric remains available through `zsnodes` and node reports.

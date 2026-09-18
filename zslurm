@@ -401,7 +401,9 @@ class Status(object):
         self.default_partition = "normal"
         self.staging_partition = "staging"
         self.enable_ssd_prompt = False
+        self.enable_feature_prompt = True
         self.ssd_feature_name = "scratch-node"
+        self.gpfs_io_enable = True
         self.default_engine_cores = 0
         self.autogrow_engine_cores = 0
         self.autogrow_dynamic_engine_cores = False
@@ -649,7 +651,9 @@ def _cluster_defaults(config=None):
         "default_partition": "normal",
         "staging_partition": "staging",
         "enable_ssd_prompt": False,
+        "enable_feature_prompt": True,
         "ssd_feature_name": "scratch-node",
+        "gpfs_io_enable": True,
         "autogrow_prefer_partitions": [("normal", False)],
         "node_profiles": {},
         "autogrow_fallback_partition": "normal",
@@ -690,7 +694,9 @@ def _cluster_defaults(config=None):
         defaults.update({
             "default_partition": "normal",
             "staging_partition": "__disabled__",
+            "enable_feature_prompt": False,
             "ssd_feature_name": "ssd",
+            "gpfs_io_enable": False,
             "autogrow_prefer_partitions": [("normal", True)],
             "node_profiles": {
                 "normal": {"cores": 30, "mem_gb": 240},
@@ -715,6 +721,19 @@ def _cluster_defaults(config=None):
     return defaults
 
 
+def _cpu_io_display(host_cpu_pct, gpfs_io_pct, gpfs_io_enable=True):
+    """Return the site-appropriate TUI label and compact value."""
+    host_text = "%.0f" % float(host_cpu_pct)
+    if not gpfs_io_enable:
+        return "Host CPU (%): ", host_text
+    gpfs_text = (
+        "%.0f" % float(numpy.mean(gpfs_io_pct))
+        if len(gpfs_io_pct) > 0
+        else "n/a"
+    )
+    return "CPU/GPFS (%): ", "%s | %s" % (host_text, gpfs_text)
+
+
 def _apply_cluster_config(config):
     cfg = config if isinstance(config, dict) else {}
     defaults = _cluster_defaults(cfg)
@@ -723,7 +742,13 @@ def _apply_cluster_config(config):
     status.default_partition = str(cfg.get("default_partition", defaults["default_partition"]) or defaults["default_partition"])
     status.staging_partition = str(cfg.get("staging_partition", defaults["staging_partition"]) or defaults["staging_partition"])
     status.enable_ssd_prompt = _cfg_bool(cfg.get("enable_ssd_prompt"), defaults["enable_ssd_prompt"])
+    status.enable_feature_prompt = _cfg_bool(
+        cfg.get("enable_feature_prompt"), defaults["enable_feature_prompt"]
+    )
     status.ssd_feature_name = str(cfg.get("ssd_feature_name", defaults["ssd_feature_name"]) or "")
+    status.gpfs_io_enable = _cfg_bool(
+        cfg.get("gpfs_io_enable"), defaults["gpfs_io_enable"]
+    )
     status.autogrow_prefer_partitions = _cfg_autogrow_prefer_partitions(
         cfg.get("autogrow_prefer_partitions"),
         defaults["autogrow_prefer_partitions"],
@@ -7385,16 +7410,17 @@ def thread_display_status(gb, status):
                     xav = float((status.sys_cpu_busy * status.total_cpus).sum() / numpy.sum(status.total_cpus))
                 else:
                     xav = 0.0
-                if len(status.gpfs_io_pct) > 0:
-                    gpfs_text = "%.0f" % float(numpy.mean(status.gpfs_io_pct))
-                else:
-                    gpfs_text = "n/a"
-                
-                gb.wcom_status.addstr(11, 1, "CPU/GPFS (%): ")
+                cpu_io_label, cpu_io_text = _cpu_io_display(
+                    xav,
+                    status.gpfs_io_pct,
+                    bool(getattr(status, "gpfs_io_enable", True)),
+                )
+
+                gb.wcom_status.addstr(11, 1, cpu_io_label)
                 gb.wcom_status.addstr(
                     11,
                     18,
-                    "%.0f | %s" % (xav, gpfs_text),
+                    cpu_io_text,
                     curses.color_pair(GREEN),
                 )
 
@@ -8250,6 +8276,7 @@ def main(scr, *args, **kwds):
                 default_partition = str(getattr(status, 'default_partition', 'normal') or 'normal')
                 staging_partition = str(getattr(status, 'staging_partition', 'staging') or 'staging')
                 enable_ssd_prompt = bool(getattr(status, 'enable_ssd_prompt', False))
+                enable_feature_prompt = bool(getattr(status, 'enable_feature_prompt', True))
                 ssd_feature_name = str(getattr(status, 'ssd_feature_name', '') or '')
 
                 partition = enter_command(
@@ -8269,8 +8296,10 @@ def main(scr, *args, **kwds):
                             constraint = ssd_feature_name
                         else:
                             constraint = ""
-                    else:
+                    elif enable_feature_prompt:
                         constraint = enter_command(gb, "Enter feature (default=): ")
+                    else:
+                        constraint = ""
                     default_cores = int(
                         getattr(status, 'default_engine_cores', 0) or 0
                     )

@@ -8,6 +8,9 @@ default_partition: normal
 staging_partition: __disabled__
 staging_autogrow_enable: false
 enable_ssd_prompt: false
+# All normal nodes expose local XFS through TMPDIR; do not ask Spider users for
+# an arbitrary Slurm feature when starting a manual pilot.
+enable_feature_prompt: false
 ssd_feature_name: ssd
 # Spider's Slurm allocation binds node-local XFS to TMPDIR=/tmp. This is
 # intentionally opt-in so a Snellius pilot never mistakes ordinary /tmp for
