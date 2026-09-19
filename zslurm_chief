@@ -56,6 +56,12 @@ from time import gmtime, strftime
 def xtime():
     return (strftime("%Y-%m-%d %H:%M:%S", gmtime()))
 
+
+def retain_completed_job_log(retcode):
+    """Retain every failed child log; successful logs may be discarded."""
+
+    return retcode != 0
+
 STOP_THRESHOLD=60
 
 PING_INTERVAL = 20
@@ -1366,14 +1372,14 @@ def job_monitor(
 
     if not keep_logfiles:
         try:
-            with open(logfile_path, 'r') as logfile:
-                log_insides = logfile.read()
-            if 'error in file' not in log_insides.lower() or retcode == 0:
+            if not retain_completed_job_log(retcode):
                 sys.stderr.write(f'Deleting log file {logfile_path} as there are no errors.\n')
                 sys.stderr.flush()
                 os.remove(logfile_path)
             else:
-                sys.stderr.write(f'Keeping log file {logfile_path} as there are errors.\n')
+                sys.stderr.write(
+                    f'Keeping failed job log {logfile_path} (return code {retcode}).\n'
+                )
                 sys.stderr.flush()
 
         except FileNotFoundError:

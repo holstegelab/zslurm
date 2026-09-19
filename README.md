@@ -879,6 +879,11 @@ ZSlurm writes several useful files in the working directory of the manager or co
 - **`cluster.log`**: manager log output
 - **`node_usage-YYYY-MM-DD_HH-MM.tsv`**: periodic node usage snapshots when node reports are enabled
 
+Unless a chief is started with `--keep`, successful child logs are removed after
+their resource report is recorded. Logs from every nonzero child exit are
+retained regardless of their text, so exceptions and tool failures remain
+available for diagnosis.
+
 ### `report-*.tsv`
 
 This file is written by the manager and contains one row per finished job.
