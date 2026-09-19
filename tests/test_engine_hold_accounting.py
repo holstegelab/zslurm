@@ -264,10 +264,10 @@ class EngineHoldAccountingTests(unittest.TestCase):
         manager.held_engine_cids = {"123_0", "123_1"}
         output = "\n".join(
             [
-                "9000|123|0|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|JobHeldUser",
-                "9001|123|1|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|Priority",
-                "9002|123|2|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|JobHeldAdmin",
-                "9003|123|3|test-instance|5-00:00:00|R|tcn1|genoa|00:00:00|scratch-node|None",
+                "9000|123|0|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|JobHeldUser",
+                "9001|123|1|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|Priority",
+                "9002|123|2|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|JobHeldAdmin",
+                "9003|123|3|test-instance|5-00:00:00|R|tcn1|genoa|00:00:00|scratch-node|192|None",
             ]
         )
 
@@ -308,7 +308,7 @@ class EngineHoldAccountingTests(unittest.TestCase):
         manager.engine_by_clusterid[engine.cluster_id] = engine
         custom_name_row = (
             "777|777|N/A|test-instance-recall-wide|23:45:00|R|worker-1|"
-            "normal|00:00:00|(null)|None\n"
+            "normal|00:00:00|(null)|30|None\n"
         ).encode("utf-8")
 
         with mock.patch.object(

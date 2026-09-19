@@ -378,6 +378,9 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - Slurm partition name used for archive/staging-oriented engines
 - **`enable_ssd_prompt`**
   - whether the interactive UI asks about SSD-capable nodes
+- **`enable_feature_prompt`**
+  - whether the manual-engine dialog asks for an arbitrary Slurm feature;
+    Spider disables this because its normal nodes expose local scratch
 - **`ssd_feature_name`**
   - Slurm feature/constraint string used for SSD-capable nodes
 - **`autogrow_prefer_partitions`**
@@ -388,7 +391,23 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - default CPU count for manually started pilots; `0` requests an exclusive
     node
 - **`autogrow_engine_cores`**
-  - CPU count for automatically started pilots; `0` requests an exclusive node
+  - CPU count for automatically started pilots, or their upper bound when
+    `autogrow_dynamic_engine_cores` is enabled; `0` requests an exclusive node
+- **`autogrow_dynamic_engine_cores`** / **`autogrow_engine_min_cores`**
+  - size partial pilots between the configured minimum and
+    `autogrow_engine_cores` from runnable CPU and memory demand
+- **`autogrow_require_idle_nodes`**
+  - require a wholly idle Slurm node before submitting an autogrow pilot;
+    Spider disables this for partial pilots so Slurm can place them on mixed
+    nodes or queue them until capacity becomes available
+- **`autogrow_engine_memory_mb_per_core`**
+  - hard Slurm memory grant per requested pilot core; required for memory-aware
+    dynamic sizing
+- **`autogrow_engine_memory_headroom_fraction`**,
+  **`autogrow_engine_memory_cap_fraction`** and
+  **`autogrow_engine_memory_static_reserve_mb`**
+  - mirror the chief's advertised-memory envelope while sizing and accounting
+    for queued partial pilots
 - **`autogrow_enable`** / **`autogrow_max_compute_nodes`**
   - whether automatic allocation is initially enabled and its hard fleet cap
 - **`autogrow_require_idle_nodes`**
@@ -495,16 +514,33 @@ staging_autogrow_burst_nodes: 4
 
 ### Spider example
 
-Spider grants schedulable memory through allocated cores
-(`DefMemPerCPU=8000`). The supplied `config/sites/spider.yaml` therefore uses
-30-core/240-GB partial pilots. This is deliberately an allocation profile, not
-the physical 960-GB or 1440-GB node size:
+Spider grants memory through allocated cores (`DefMemPerCPU=8000`). The
+supplied `config/sites/spider.yaml` therefore treats 30 cores/240 GB as a
+partial-pilot upper bound. Autogrow sizes a smaller request when the runnable
+demand fits one such pilot; for example, a 1-core/8-GB logical task needs a
+2-core pilot because the chief retains its configured memory headroom. Larger
+backlogs still use the 30-core ceiling. This is an allocation profile, not the
+physical 960-GB or 1440-GB node size:
 
 ```yaml
 cluster_site: spider
 default_partition: normal
+staging_partition: __disabled__
+staging_autogrow_enable: false
+enable_feature_prompt: false
+ssd_feature_name: ssd
+scratch_use_tmpdir: true
+scratch_capacity_gb_per_core: 100
+gpfs_io_enable: false
 default_engine_cores: 30
 autogrow_engine_cores: 30
+autogrow_dynamic_engine_cores: true
+autogrow_require_idle_nodes: false
+autogrow_engine_min_cores: 2
+autogrow_engine_memory_mb_per_core: 8000
+autogrow_engine_memory_headroom_fraction: 0.08
+autogrow_engine_memory_cap_fraction: 0.99
+autogrow_engine_memory_static_reserve_mb: 100
 node_profiles:
   normal:
     cores: 30
@@ -517,6 +553,21 @@ maintenance_window_enable: false
 The chief derives its final schedulable memory from the Slurm environment and
 cgroup, so a site or partition with a different memory-per-core grant is never
 allowed to advertise the physical node's complete RAM accidentally.
+
+Spider binds node-local XFS to `TMPDIR=/tmp` inside each Slurm allocation.
+`scratch_use_tmpdir` is deliberately site-specific: without it, a chief never
+mistakes ordinary system `/tmp` for schedulable SSD. The chief creates a private
+mode-0700 `.zslurm/jobs/job-<zslurm-id>-<suffix>` directory for every child
+attempt, exports it
+as `ZSLURM_SCRATCH_DIR`, points the standard temp variables there, and removes
+only that directory when the child ends. A per-core capacity cap prevents
+multiple partial pilots on one node from each advertising the complete 12-TiB
+device. The actual filesystem free space remains an additional hard bound.
+
+Spider has no physical `staging` partition and its project filesystem is
+CephFS. The supplied site file therefore disables staging autogrow and GPFS
+RDMA telemetry. Archive-class input jobs require a separately implemented and
+tested Spider backend; dCache and S3 jobs continue to use compute pilots.
 
 ## Storage quotas as a global resource monitor
 
@@ -749,7 +800,9 @@ set each tool's thread arguments consistently with the lease it acquires.
 
 The chief injects `ZSLURM_LEASE_SOCKET`, `ZSLURM_LEASE_TOKEN`,
 `ZSLURM_JOB_ID`, `ZSLURM_LEASE_MAX_CORES`, and
-`ZSLURM_LEASE_MAX_MEM_MB` into every child. The socket is node-local and mode
+`ZSLURM_LEASE_MAX_MEM_MB` into every child. On a scratch-capable pilot it also
+injects `ZSLURM_SCRATCH_ROOT` and the private `ZSLURM_SCRATCH_DIR`, and rewrites
+`TMPDIR`, `TMP`, `TEMP`, and `TEMPDIR` to the latter. The socket is node-local and mode
 `0600`; every request additionally requires the job-specific capability token.
 Jobs should use `zslurm_lease` rather than speaking the JSON protocol directly.
 
@@ -1090,10 +1143,12 @@ Useful options:
 
 This makes `zsnodes` the best tool for checking whether engines are full, idle, unmanaged, stopping, or carrying SSD-constrained work.
 
-The curses status row uses `CPU/GPFS (%)`: the first value is host CPU busy;
-the second is the mean GPFS fabric utilization across reporting compute
-engines. GPFS traffic is measured from the byte counters on the RDMA port that
-Spectrum Scale is configured to use. `GPFS%` is
+When GPFS telemetry is enabled, the curses status row uses `CPU/GPFS (%)`: the
+first value is host CPU busy; the second is the mean GPFS fabric utilization
+across reporting compute engines. When it is disabled (as on Spider), the row
+is labeled `Host CPU (%)` and omits the inapplicable GPFS value. GPFS traffic is
+measured from the byte counters on the RDMA port that Spectrum Scale is
+configured to use. `GPFS%` is
 `max(receive_rate, transmit_rate) / link_rate`, because the fabric is full
 duplex. It is throughput utilization, not Linux IO-wait time. The old
 `sys_iowait_pct` metric remains available through `zsnodes` and node reports.
@@ -1291,6 +1346,43 @@ the interface design and phasing.
   `set_autogrow`, `prioritize`/`deprioritize`, `recompute_inuse_from_running`,
   `grow`/`shrink`. `submit_job` accepts optional `idempotency_key` and `priority`
   arguments for retry-safe, priority-aware submission.
+
+### Temporary job-start filesystem failures
+
+New chiefs retain a granted job and retry startup after temporary filesystem
+errors such as `EDQUOT` (quota exceeded), `ENOSPC`, `EIO` and `ESTALE`. They do
+not fail the job or spend a Snakemake retry merely because its log cannot yet
+be created. Retries back off from 20 seconds to at most 300 seconds, configured
+with `job_start_retry_seconds` and `job_start_retry_max_seconds`.
+
+The chief keeps polling, reporting other completions and handling cancellation.
+Its accounting lock is not held while creating the log. It keeps the job's
+existing CPU/memory/storage/transfer grant exactly once, does not request more
+work while startup is deferred, and retries even when those grants leave zero
+unreserved cores. Actual memory headroom is rechecked before spawn. A cancelled
+waiting start releases its local holding and cannot launch later.
+
+The existing manager protocol labels a granted job `RUNNING` before spawning;
+therefore a deferred start remains `RUNNING` with zero measured usage. Its chief
+log reports `START DEFERRED`, the error and the next retry delay. No new manager
+RPC or manager restart is needed. Invalid commands still fail the individual
+job. This mechanism cannot rescue a computation that has already started and
+then fails while writing its own output files.
+
+Chief diagnostic write/flush errors are best-effort so a full Slurm log cannot
+kill coordination. This does not suppress errors writing child-job outputs.
+Unexpected fatal chief errors release locks and terminate children before
+unregistering, avoiding stranded monitor threads and unsupervised duplicate
+attempts. Deploy the new chief before starting engines; existing chief processes
+retain their already-loaded implementation and are not hot-reloaded.
+
+Regression tests inject quota/disk/I/O errors, exercise a real child after
+recovery, check exact reservation/lease accounting, bounded backoff, cancellation
+during log creation, and failed process/thread creation:
+
+```bash
+python -m pytest -q tests/test_chief_startup.py tests/test_dynamic_leases.py
+```
 
 ### Claude Code skill
 
