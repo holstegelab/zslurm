@@ -142,31 +142,46 @@ except:
 job_name = args.job_name
 
 job_args = args.job_args
+stdin_script = None
 
 if not job_args:
-    job_args = shlex.split(sys.stdin.readline())
+    stdin_script = sys.stdin.read()
     if job_name is None:
         job_name = 'zsbatch'
-    
-        
 
-if not job_args:
+if not job_args and not (stdin_script and stdin_script.strip()):
     print('zsbatch: error: No command given on input')
     sys.exit(1)
 
+if stdin_script is not None:
+    firstline = stdin_script.splitlines()[0]
+    if not firstline.startswith('#!'):
+        print('zsbatch: error: A batch script read from standard input must start with #! followed by the path to an interpreter. For instance #!/bin/sh')
+        sys.exit(1)
+    interpreter = shlex.split(firstline[2:].strip())
+    if not interpreter:
+        print('zsbatch: error: Batch script has an empty #! interpreter')
+        sys.exit(1)
+    # The manager may dispatch long after this client exits, so do not use a
+    # temporary file.  Transport the complete script as one safely quoted -c
+    # argument.  The chief applies shlex.split once before exec, reconstructing
+    # exactly [interpreter..., "-c", script].
+    cmd = shlex.join(interpreter + ['-c', stdin_script])
+else:
+    cmd = shlex.join(job_args)
 
-cmd = " ".join(job_args) # default
-
-if os.path.exists(job_args[0]): #executes file
-    if not os.access(args.job_args[0], os.X_OK): #executes non-executable file: search for interpreter
-        f = open(args.job_args[0],'r')
-        firstline = f.readline()
-        f.close()
+if job_args and os.path.exists(job_args[0]): #executes file
+    if not os.access(job_args[0], os.X_OK): #executes non-executable file: search for interpreter
+        with open(job_args[0], 'r') as f:
+            firstline = f.readline()
         if not firstline.startswith('#!'):
             print('zsbatch: error: This does not look like a bash script. The first line must start with #! followed by the path to an interpreter. For instance #!/bin/sh')
             sys.exit(1)
-        interpreter = firstline[2:]
-        cmd = interpreter + " "  + " ".join(job_args)
+        interpreter = shlex.split(firstline[2:].strip())
+        if not interpreter:
+            print('zsbatch: error: Batch script has an empty #! interpreter')
+            sys.exit(1)
+        cmd = shlex.join(interpreter + job_args)
 
 if job_name is None:
     job_name = os.path.basename(job_args[0])
