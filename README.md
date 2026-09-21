@@ -99,8 +99,10 @@ Inside the `zslurm` curses UI:
 - **`c`**: Stop Slurm engines
 - **`a`**: Toggle automatic consolidation of engines
 - **`o`**: Phase out engines by node name so they stop accepting new jobs
-- **`p`**: Prioritize jobs whose job names match a pattern
-- **`n`**: Deprioritize jobs whose job names match a pattern
+- **`p`**: One-time prioritize jobs whose name or working-directory component matches a pattern
+- **`n`**: One-time deprioritize jobs whose name or working-directory component matches a pattern
+- **`P`**: Set an active numeric priority override for a working-directory pattern
+- **`N`**: Clear an active working-directory priority override
 - **`l`**: Toggle last-in/first-out job preference
 - **`1`**: Set archive staging quota
 - **`2`**: Set active storage quota
@@ -152,6 +154,27 @@ The memory-aware packer may reorder jobs only within the same numeric priority
 band. FIFO remains the default tie-breaker; compute LIFO, when enabled, reverses
 order only within a band. Manual prioritize or deprioritize similarly adjusts
 the legacy order within a numeric band, not across pipeline priorities.
+
+The one-time `p`/`n` selectors match either a job name or a complete working
+directory component. For example, `FUS1` matches jobs submitted from
+`.../exome_runs/FUS1` and its subdirectories, but not `FUS10`.
+
+Use an active cwd override when a pipeline must move across numeric priority
+bands and stay there as it submits more work. In the UI, `P` asks for the
+folder selector and priority; the default is one above the highest current
+effective priority. `N` removes the exact selector and restores each affected
+job's submitted priority (or another still-matching override). Existing
+waiting jobs change immediately, future matching submissions inherit the
+override, and running jobs are never preempted. Later overlapping rules win.
+The rules are runtime manager state and are carried through an explicit live
+handover.
+
+The same controls are available non-interactively:
+
+    zscontrol --instance zslurm_fcn41_ui match FUS1
+    zscontrol --instance zslurm_fcn41_ui priority-override set FUS1 101 --yes
+    zscontrol --instance zslurm_fcn41_ui priority-override list
+    zscontrol --instance zslurm_fcn41_ui priority-override clear FUS1
 
 ### Memory-aware filling
 
@@ -1338,7 +1361,8 @@ the interface design and phasing.
 - **`zscontrol`**: a control plane mirroring the TUI keys. Reads (no token): `status`,
   `whatif`, `match`, `forecast` (will a planned DAG fit the budgets?), `jobs`,
   `autogrow-plan`. Gated writes (require `enable_control_rpc` + `control_token`): `budget`,
-  `transfer-slots`, `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`, `recompute-inuse`,
+  `transfer-slots`, `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`,
+  `priority-override`, `recompute-inuse`,
   `grow`/`shrink`, and `handover-from OLD --yes`.
 - **`--json`** on `zsqueue` and `zsnodes` emits numeric, schema-versioned rows;
   `zsqueue_stats`/`zsoccupancy`/`zsstats` already have `--json`. Exit-code contract across
@@ -1348,7 +1372,9 @@ the interface design and phasing.
   set in `~/.zslurm/config.yaml` or via the `--enable-control`/`--control-token` flags):
   `ping`/`health`, `get_status_json`, `match_jobs`, `whatif_budget`, `forecast_budget`,
   `list_jobs_detailed`, `get_autogrow_plan`, `set_budgets`, `set_transfer_limits`, `set_scheduler_mode`,
-  `set_autogrow`, `prioritize`/`deprioritize`, `recompute_inuse_from_running`,
+  `set_autogrow`, `prioritize`/`deprioritize`, `list_cwd_priority_overrides`,
+  `set_cwd_priority_override`, `clear_cwd_priority_override`,
+  `recompute_inuse_from_running`,
   `grow`/`shrink`. `submit_job` accepts optional `idempotency_key` and `priority`
   arguments for retry-safe, priority-aware submission.
 

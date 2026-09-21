@@ -1082,9 +1082,14 @@ class Job(object):
         self.owner = owner
         try:
             value = DEFAULT_JOB_PRIORITY if priority is None else priority
-            self.priority = int(value)
+            self.base_priority = int(value)
         except (TypeError, ValueError):
-            self.priority = DEFAULT_JOB_PRIORITY
+            self.base_priority = DEFAULT_JOB_PRIORITY
+        # ``base_priority`` is the value supplied by the submitter.  A live
+        # cwd override may temporarily replace the effective priority without
+        # losing the value to restore when that override is removed.
+        self.priority = self.base_priority
+        self.priority_override_pattern = None
         try:
             su = (ssd_use or 'no')
             if isinstance(su, str):
@@ -1239,6 +1244,11 @@ class JobManager(object):
         # so a retried submit_job (e.g. after a socket timeout that actually
         # succeeded) returns the existing jobid instead of double-submitting.
         self.seen_tokens = {}
+
+        # Runtime folder-priority rules.  Later entries win when more than one
+        # rule matches a cwd.  Unlike the legacy one-shot queue reorder, these
+        # rules also apply to jobs submitted after the operator creates them.
+        self.cwd_priority_overrides = OrderedDict()
 
         # Compact terminal outcomes used by dependencies.  Finished Job objects
         # are retained separately for queue/report output and may be trimmed per
@@ -1772,6 +1782,7 @@ class JobManager(object):
                     'autogrow_enable': bool(status.autogrow_enable),
                     'autoconsolidate_enable': bool(status.autoconsolidate_enable),
                     'autogrow_max_compute_nodes': int(cfg.get('autogrow_max_compute_nodes', 0) or 0),
+                    'cwd_priority_overrides': self.list_cwd_priority_overrides(),
                 },
                 'pending_jobs': n_pending,
                 'budgeted_pending_jobs': n_budget_pending,
@@ -1781,17 +1792,197 @@ class JobManager(object):
         finally:
             self.lock.release()
 
-    def match_jobs(self, pattern):
-        """Return [[jobid, name, state, partition], ...] for jobs whose name
-        contains pattern. Dry-run helper before any prioritize/cancel-by-pattern."""
-        pat = str(pattern)
+    @staticmethod
+    def _cwd_matches_pattern(cwd, pattern):
+        """Match an absolute cwd subtree or a relative sequence of components.
+
+        Component matching makes ``FUS1`` select ``.../exome_runs/FUS1`` and
+        its descendants, without accidentally selecting ``FUS10``.  A relative
+        multi-component selector such as ``projectmine2/b2a`` works the same
+        way.  Absolute selectors match that directory and its descendants.
+        """
+        raw_pattern = str(pattern or '').strip()
+        if not raw_pattern:
+            return False
+        try:
+            normalized_cwd = os.path.normpath(os.path.abspath(str(cwd or '')))
+            normalized_pattern = os.path.normpath(raw_pattern)
+        except Exception:
+            return False
+
+        if os.path.isabs(normalized_pattern):
+            try:
+                return os.path.commonpath(
+                    [normalized_cwd, normalized_pattern]
+                ) == normalized_pattern
+            except (TypeError, ValueError):
+                return False
+
+        pattern_parts = tuple(
+            part for part in normalized_pattern.split(os.sep)
+            if part not in ('', '.')
+        )
+        if not pattern_parts or '..' in pattern_parts:
+            return False
+        cwd_parts = tuple(
+            part for part in normalized_cwd.split(os.sep) if part
+        )
+        width = len(pattern_parts)
+        return any(
+            cwd_parts[index:index + width] == pattern_parts
+            for index in range(0, len(cwd_parts) - width + 1)
+        )
+
+    @classmethod
+    def _selector_matches_job(cls, job, pattern):
+        pat = str(pattern or '')
+        return (
+            pat in str(getattr(job, 'job_name', ''))
+            or cls._cwd_matches_pattern(getattr(job, 'cwd', ''), pat)
+        )
+
+    def _effective_priority_locked(self, job):
+        base = getattr(job, 'base_priority', None)
+        if base is None:
+            base = int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY) or 0)
+            job.base_priority = base
+        effective = int(base)
+        matched_pattern = None
+        for pattern, priority in self.cwd_priority_overrides.items():
+            if self._cwd_matches_pattern(getattr(job, 'cwd', ''), pattern):
+                effective = int(priority)
+                matched_pattern = pattern
+        return effective, matched_pattern
+
+    def _apply_priority_override_locked(self, job):
+        effective, pattern = self._effective_priority_locked(job)
+        old_priority = int(getattr(job, 'priority', effective) or 0)
+        job.priority = effective
+        job.priority_override_pattern = pattern
+        return old_priority != effective
+
+    def match_jobs(self, pattern, cwd_only=False):
+        """Return active jobs selected by name and/or working directory.
+
+        The compact legacy row shape is retained for RPC compatibility.  With
+        ``cwd_only`` this is also the read-only blast-radius check for a live
+        folder-priority override.
+        """
+        pat = str(pattern or '')
         out = []
         self.lock.acquire()
         try:
             for jobid, job in self.jobs_by_id.items():
-                if pat in str(getattr(job, 'job_name', '')):
+                if getattr(job, 'state', None) not in active_job_states:
+                    continue
+                matched = self._cwd_matches_pattern(
+                    getattr(job, 'cwd', ''), pat
+                ) if cwd_only else self._selector_matches_job(job, pat)
+                if matched:
                     out.append([jobid, job.job_name, job.state, job.partition])
             return out
+        finally:
+            self.lock.release()
+
+    def list_cwd_priority_overrides(self):
+        self.lock.acquire()
+        try:
+            result = []
+            for pattern, priority in self.cwd_priority_overrides.items():
+                matching = [
+                    job for job in self.jobs_by_id.values()
+                    if getattr(job, 'state', None) in active_job_states
+                    and self._cwd_matches_pattern(getattr(job, 'cwd', ''), pattern)
+                ]
+                result.append({
+                    'pattern': pattern,
+                    'priority': int(priority),
+                    'matching_active_jobs': len(matching),
+                    'matching_waiting_jobs': sum(
+                        1 for job in matching
+                        if getattr(job, 'state', None) in queue_states
+                    ),
+                })
+            return result
+        finally:
+            self.lock.release()
+
+    def suggested_cwd_override_priority(self, pattern=None):
+        self.lock.acquire()
+        try:
+            if pattern in self.cwd_priority_overrides:
+                return int(self.cwd_priority_overrides[pattern])
+            priorities = [
+                int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY) or 0)
+                for job in self.jobs_by_id.values()
+                if getattr(job, 'state', None) in active_job_states
+            ]
+            priorities.extend(int(value) for value in self.cwd_priority_overrides.values())
+            return (max(priorities) if priorities else DEFAULT_JOB_PRIORITY) + 1
+        finally:
+            self.lock.release()
+
+    def set_cwd_priority_override(self, pattern, priority):
+        normalized = str(pattern or '').strip()
+        if not normalized:
+            raise ValueError('empty folder pattern')
+        # Validate the selector before storing it.  ``..`` is deliberately not
+        # meaningful in a relative component selector.
+        if not os.path.isabs(normalized):
+            parts = tuple(
+                part for part in os.path.normpath(normalized).split(os.sep)
+                if part not in ('', '.')
+            )
+            if not parts or '..' in parts:
+                raise ValueError('invalid folder pattern')
+        value = int(priority)
+
+        self.lock.acquire()
+        try:
+            # Re-setting an existing pattern makes it the most recent rule,
+            # which gives it deterministic precedence over broader matches.
+            self.cwd_priority_overrides.pop(normalized, None)
+            self.cwd_priority_overrides[normalized] = value
+            matched = changed = waiting = 0
+            for job in self.jobs_by_id.values():
+                if getattr(job, 'state', None) not in active_job_states:
+                    continue
+                if self._cwd_matches_pattern(getattr(job, 'cwd', ''), normalized):
+                    matched += 1
+                    if getattr(job, 'state', None) in queue_states:
+                        waiting += 1
+                changed += 1 if self._apply_priority_override_locked(job) else 0
+            self._eligible_cache_ts = 0.0
+            return {
+                'pattern': normalized,
+                'priority': value,
+                'matched': matched,
+                'waiting': waiting,
+                'changed': changed,
+                'overrides': self.list_cwd_priority_overrides(),
+            }
+        finally:
+            self.lock.release()
+
+    def clear_cwd_priority_override(self, pattern):
+        normalized = str(pattern or '').strip()
+        self.lock.acquire()
+        try:
+            if normalized not in self.cwd_priority_overrides:
+                raise KeyError(normalized)
+            previous = int(self.cwd_priority_overrides.pop(normalized))
+            changed = 0
+            for job in self.jobs_by_id.values():
+                if getattr(job, 'state', None) not in active_job_states:
+                    continue
+                changed += 1 if self._apply_priority_override_locked(job) else 0
+            self._eligible_cache_ts = 0.0
+            return {
+                'pattern': normalized,
+                'previous_priority': previous,
+                'changed': changed,
+                'overrides': self.list_cwd_priority_overrides(),
+            }
         finally:
             self.lock.release()
 
@@ -2211,17 +2402,17 @@ class JobManager(object):
             ndict = OrderedDict()
             if up:
                 for jobid, job in list(self.jobs_by_id.items()):
-                    if job_pattern in job.job_name:
+                    if self._selector_matches_job(job, job_pattern):
                         ndict[jobid] = job
                 for jobid, job in list(self.jobs_by_id.items()):
-                    if not job_pattern in job.job_name:
+                    if not self._selector_matches_job(job, job_pattern):
                         ndict[jobid] = job
             else:
                 for jobid, job in list(self.jobs_by_id.items()):
-                    if not job_pattern in job.job_name:
+                    if not self._selector_matches_job(job, job_pattern):
                         ndict[jobid] = job
                 for jobid, job in list(self.jobs_by_id.items()):
-                    if job_pattern in job.job_name:
+                    if self._selector_matches_job(job, job_pattern):
                         ndict[jobid] = job
 
             self.jobs_by_id = ndict
@@ -2325,6 +2516,7 @@ class JobManager(object):
                     s3_download_slots
                 )
                 job.dependency_spec = dependency_spec
+                self._apply_priority_override_locked(job)
                 self.jobs_by_id[jobid] = job
                 self.total_jobs[partition] = self.total_jobs.get(partition, 0) + 1
                 self._eligible_cache_ts = 0.0
@@ -3696,6 +3888,7 @@ def ping():
         "submit_job_priority": True,
         "default_job_priority": DEFAULT_JOB_PRIORITY,
         "list_jobs_priority": True,
+        "cwd_priority_overrides": True,
         "targeted_job_status": True,
         "directional_dcache_slots": True,
         "s3_download_slots": True,
@@ -3730,8 +3923,17 @@ def get_status_json():
     return result
 
 
-def match_jobs(pattern):
-    return jobs.match_jobs(pattern)
+def match_jobs(pattern, cwd_only=False):
+    return jobs.match_jobs(pattern, cwd_only)
+
+
+def list_cwd_priority_overrides():
+    if _handover_committed_source():
+        return _handover_proxy(False).list_cwd_priority_overrides()
+    return {
+        'ok': True,
+        'overrides': jobs.list_cwd_priority_overrides(),
+    }
 
 
 def whatif_budget(active_total=None, dcache_total=None, archive_total=None):
@@ -3830,6 +4032,53 @@ def rpc_deprioritize(token=None, pattern=None):
     jobs.deprioritize(pattern)
     add_log_line(gb, f"[agent] deprioritize '{pattern}' ({len(matched)} jobs, lastin_first={status.lastin_first})", CYAN)
     return {"ok": True, "matched": len(matched), "lastin_first": bool(status.lastin_first)}
+
+
+def rpc_set_cwd_priority_override(token=None, pattern=None, priority=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if _handover_committed_source():
+        return _handover_proxy(False).set_cwd_priority_override(
+            token, pattern, priority
+        )
+    try:
+        result = jobs.set_cwd_priority_override(pattern, priority)
+    except (TypeError, ValueError) as error:
+        return {"ok": False, "code": 3, "error": str(error)}
+    add_log_line(
+        gb,
+        f"[agent] active cwd priority '{result['pattern']}' -> "
+        f"{result['priority']} ({result['matched']} active jobs, "
+        f"{result['waiting']} waiting)",
+        CYAN,
+    )
+    return {"ok": True, **result}
+
+
+def rpc_clear_cwd_priority_override(token=None, pattern=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if _handover_committed_source():
+        return _handover_proxy(False).clear_cwd_priority_override(
+            token, pattern
+        )
+    try:
+        result = jobs.clear_cwd_priority_override(pattern)
+    except KeyError:
+        return {
+            "ok": False,
+            "code": 3,
+            "error": "folder priority override not found",
+        }
+    add_log_line(
+        gb,
+        f"[agent] cleared active cwd priority '{result['pattern']}' "
+        f"({result['changed']} active jobs restored/recomputed)",
+        CYAN,
+    )
+    return {"ok": True, **result}
 
 
 # ---- Phase 3: planning / observability (read) -----------------------------
@@ -3946,6 +4195,15 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(set_autogrow, "set_autogrow")
         server.register_function(rpc_prioritize, "prioritize")
         server.register_function(rpc_deprioritize, "deprioritize")
+        server.register_function(
+            list_cwd_priority_overrides, "list_cwd_priority_overrides"
+        )
+        server.register_function(
+            rpc_set_cwd_priority_override, "set_cwd_priority_override"
+        )
+        server.register_function(
+            rpc_clear_cwd_priority_override, "clear_cwd_priority_override"
+        )
         # Phase 3/4: planning, observability, repair, fleet
         server.register_function(forecast_budget, "forecast_budget")
         server.register_function(list_jobs_detailed, "list_jobs_detailed")
@@ -5608,6 +5866,10 @@ def _build_handover_snapshot(
         'running_jobs': jobs.running_jobs,
         'failed_jobs': jobs.failed_jobs,
         'done_jobs': jobs.done_jobs,
+        'cwd_priority_overrides': [
+            [pattern, int(priority)]
+            for pattern, priority in jobs.cwd_priority_overrides.items()
+        ],
     }
     scheduler_values = {
         'lastin_first': bool(status.lastin_first),
@@ -5683,6 +5945,18 @@ def _apply_handover_snapshot(snapshot):
         (str(key), value)
         for key, value in (snapshot.get('dependency_history', []) or [])
     )
+    jobs.cwd_priority_overrides = OrderedDict(
+        (str(pattern), int(priority))
+        for pattern, priority in manager.get(
+            'cwd_priority_overrides', []
+        ) or []
+    )
+    for job in jobs.jobs_by_id.values():
+        if not hasattr(job, 'base_priority'):
+            job.base_priority = int(getattr(
+                job, 'priority', DEFAULT_JOB_PRIORITY
+            ) or 0)
+        jobs._apply_priority_override_locked(job)
     jobs.jobid_counter = int(manager.get('jobid_counter', jobs.jobid_counter))
     for name in (
         'active_total', 'active_inuse', 'dcache_total', 'dcache_inuse',
@@ -7804,8 +8078,9 @@ def init_commands(gb):
             gb.wcom.addstr(3, 1, "Toggle auto consolidate: a")
             gb.wcom.addstr(4, 1, "Toggle phaseout engine: o")
             
-            gb.wcom.addstr(6, 1, "Prioritize jobs: p")
-            gb.wcom.addstr(7, 1, "Deprioritize jobs: n")
+            gb.wcom.addstr(5, 1, "Active folder priority: P; clear: N")
+            gb.wcom.addstr(6, 1, "Prioritize name/folder: p")
+            gb.wcom.addstr(7, 1, "Deprioritize name/folder: n")
             gb.wcom.addstr(8, 1, "Set storage totals: 1/2/3; dCache xfer D/U: 7/8")
             gb.wcom.addstr(9, 1, "Toggle last in/first out: l")
             gb.wcom.addstr(10, 1, "Set memory optimization job search window: m")
@@ -8345,15 +8620,67 @@ def main(scr, *args, **kwds):
                 if not cmd is None and not cores is None:
                     engines.start_slurm(gb, cmd, runtime, partition, constraint, cores)
             elif c == ord("p"):
-                jobpattern = enter_command(gb, "Enter job name pattern to prioritize: ")
+                jobpattern = enter_command(
+                    gb, "Enter job name or folder to prioritize: "
+                )
                 if not jobpattern == "":
                     jobs.prioritize(jobpattern)
             elif c == ord("n"):
                 jobpattern = enter_command(
-                    gb, "Enter job name pattern to deprioritize: "
+                    gb, "Enter job name or folder to deprioritize: "
                 )
                 if not jobpattern == "":
                     jobs.deprioritize(jobpattern)
+            elif c == ord("P"):
+                folder_pattern = enter_command(
+                    gb, "Folder for active priority override: "
+                )
+                if folder_pattern:
+                    default_priority = jobs.suggested_cwd_override_priority(
+                        folder_pattern
+                    )
+                    priority = get_number(
+                        gb,
+                        f"Priority for {folder_pattern} "
+                        f"(default={default_priority}): ",
+                        default_priority,
+                    )
+                    if priority is not None:
+                        try:
+                            result = jobs.set_cwd_priority_override(
+                                folder_pattern, priority
+                            )
+                            add_log_line(
+                                gb,
+                                f"Active folder priority '{folder_pattern}' -> "
+                                f"{priority} ({result['matched']} active, "
+                                f"{result['waiting']} waiting).",
+                                CYAN,
+                            )
+                        except (TypeError, ValueError) as error:
+                            set_status_message(gb, str(error), YELLOW)
+            elif c == ord("N"):
+                folder_pattern = enter_command(
+                    gb, "Exact active folder override to clear: "
+                )
+                if folder_pattern:
+                    try:
+                        result = jobs.clear_cwd_priority_override(
+                            folder_pattern
+                        )
+                        add_log_line(
+                            gb,
+                            f"Cleared active folder priority "
+                            f"'{folder_pattern}' ({result['changed']} jobs "
+                            f"restored/recomputed).",
+                            CYAN,
+                        )
+                    except KeyError:
+                        set_status_message(
+                            gb,
+                            "No active override for: " + folder_pattern,
+                            YELLOW,
+                        )
 
             elif c == ord("1"):
                 archive_total = get_number(
