@@ -624,14 +624,20 @@ def _cluster_defaults(config=None):
         # describes the allocation, not the physical RAM installed in a node.
         defaults.update({
             "default_partition": "normal",
+            "enable_ssd_prompt": True,
             "ssd_feature_name": "ssd",
-            "autogrow_prefer_partitions": [("normal", False)],
+            # Spider exposes allocation-local scratch through $TMPDIR and marks
+            # the corresponding worker nodes with the `ssd` feature. Keep
+            # every automatically created pilot on that capability class.
+            "autogrow_prefer_partitions": [("normal", True)],
             "node_profiles": {
                 "normal": {"cores": 30, "mem_gb": 240},
             },
             "autogrow_fallback_partition": "normal",
             "default_engine_cores": 30,
             "autogrow_engine_cores": 30,
+            "autogrow_enable": True,
+            "autogrow_max_compute_nodes": 15,
         })
     return defaults
 
@@ -6328,7 +6334,9 @@ def compute_autogrow_plan(all_engines, partition):
         }
 
     try:
-        parts_states_by_scratch = zslurm_shared.slurm_partition_state_counts_by_scratch(60)
+        parts_states_by_scratch = zslurm_shared.slurm_partition_state_counts_by_scratch(
+            60, getattr(status, 'ssd_feature_name', 'scratch-node')
+        )
     except Exception:
         parts_states_by_scratch = {}
 
@@ -6356,6 +6364,25 @@ def compute_autogrow_plan(all_engines, partition):
         pinfo = parts_states_by_scratch.get(part, {}) or {}
         grp = pinfo.get('scratch' if scratch else 'no_scratch', {}) or {}
         idle = int((grp.get('states', {}) or {}).get('IDLE', 0))
+
+        # Spider pilots intentionally request only part of a physical node.
+        # A MIXED node can therefore admit another pilot even though it is not
+        # in Slurm's IDLE state. For partial pilots, score allocatable CPU
+        # slots; exclusive Snellius pilots retain the whole-IDLE-node rule.
+        partial_engine_cores = int(
+            getattr(status, 'autogrow_engine_cores', 0) or 0
+        )
+        if partial_engine_cores > 0:
+            per_node = list(grp.get('free_cpus_by_node', []) or [])
+            if per_node:
+                partial_slots = sum(
+                    max(0, int(free_cpus)) // partial_engine_cores
+                    for free_cpus in per_node
+                )
+            else:
+                # Compatibility with older/mocked occupancy payloads.
+                partial_slots = int(grp.get('free_cpus', 0) or 0) // partial_engine_cores
+            idle = max(idle, partial_slots)
 
         ncores = safe_float(prof.get('cores', 0.0), 0.0)
         nmem_mb = safe_float(prof.get('mem_gb', 0.0), 0.0) * 1024.0
@@ -6476,6 +6503,11 @@ def compute_autogrow_plan(all_engines, partition):
 
     if best_nodes > 1 and str(best_part) not in getattr(status, 'autogrow_fat_partitions', []):
         best_nodes = max(int(math.ceil(0.2 * best_nodes)), 1)
+
+    # Do not submit more pilots than the occupancy snapshot can place now.
+    # For Spider, best_idle is the number of 30-core slots across IDLE and
+    # MIXED nodes; for exclusive profiles it remains the IDLE-node count.
+    best_nodes = min(best_nodes, best_idle)
 
     fat_cap_applied = False
     if str(best_part) in getattr(status, 'autogrow_fat_partitions', []) and best_nodes > 1:

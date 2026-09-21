@@ -97,6 +97,32 @@ class QueuedScratchCapacityTests(unittest.TestCase):
         self.assertEqual(plan["raw_best_nodes"], 1)
         self.assertEqual(plan["best_nodes"], 1)
 
+    def test_partial_pilot_can_grow_into_mixed_spider_capacity(self):
+        self.zslurm.status.ssd_feature_name = "ssd"
+        self.zslurm.status.autogrow_engine_cores = 30
+        self.zslurm.engines.cluster_queued_by_partition = {}
+        self.zslurm.engines.queued_engines_detail = []
+        availability = {
+            "genoa": {
+                "scratch": {
+                    "states": {"IDLE": 0, "MIXED": 1},
+                    "free_cpus": 30,
+                    "free_cpus_by_node": [30],
+                },
+                "no_scratch": {"states": {"IDLE": 0}},
+            }
+        }
+        with mock.patch.object(
+            self.zslurm.zslurm_shared,
+            "slurm_partition_state_counts_by_scratch",
+            return_value=availability,
+        ) as occupancy:
+            plan = self.zslurm.compute_autogrow_plan([], "compute")
+
+        occupancy.assert_called_once_with(60, "ssd")
+        self.assertEqual(plan["best_part"], "genoa")
+        self.assertEqual(plan["best_nodes"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,11 +29,17 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertEqual(defaults["default_partition"], "normal")
         self.assertEqual(defaults["default_engine_cores"], 30)
         self.assertEqual(defaults["autogrow_engine_cores"], 30)
+        self.assertEqual(defaults["ssd_feature_name"], "ssd")
+        self.assertTrue(defaults["enable_ssd_prompt"])
+        self.assertEqual(
+            defaults["autogrow_prefer_partitions"], [("normal", True)]
+        )
         self.assertEqual(
             defaults["node_profiles"]["normal"],
             {"cores": 30, "mem_gb": 240},
         )
-        self.assertFalse(defaults["autogrow_enable"])
+        self.assertTrue(defaults["autogrow_enable"])
+        self.assertEqual(defaults["autogrow_max_compute_nodes"], 15)
         self.assertFalse(defaults["maintenance_window_enable"])
 
     def test_snellius_defaults_preserve_exclusive_engines(self):

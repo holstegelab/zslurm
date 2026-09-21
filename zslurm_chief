@@ -462,8 +462,64 @@ def get_effective_available_mb():
 
 
 
-def detect_scratch_path(cluster_jobid):
-    """Return the scratch directory for this job if it exists."""
+def configured_scratch_capacity_gb(config_map=None):
+    """Return this pilot's configured SSD entitlement, or None when uncapped."""
+    cfg = config if config_map is None else config_map
+    raw_value = cfg.get("ssd_capacity_gb")
+    if raw_value is None and str(cfg.get("cluster_site", "")).lower() == "spider":
+        # Spider grants 80 decimal GB of scratch per requested core. Keep a
+        # 30-core pilot below its roughly 2235-GiB entitlement.
+        raw_value = 2200.0
+    try:
+        value = float(raw_value or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def _configured_scratch_paths(config_map=None, environ=None):
+    cfg = config if config_map is None else config_map
+    env = os.environ if environ is None else environ
+    raw = cfg.get("ssd_scratch_root")
+    values = raw if isinstance(raw, (list, tuple)) else [raw]
+    paths = []
+    for value in values:
+        if not value:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(str(value)))
+        # expandvars reads os.environ, so also support an injected/test env.
+        if str(value).strip() in ("$TMPDIR", "${TMPDIR}"):
+            expanded = env.get("TMPDIR", expanded)
+        if expanded:
+            paths.append(expanded)
+    return paths
+
+
+def detect_scratch_path(cluster_jobid, config_map=None, environ=None):
+    """Return this Slurm pilot's writable allocation-local SSD directory."""
+    cfg = config if config_map is None else config_map
+    env = os.environ if environ is None else environ
+
+    # Spider exposes the allocation-local SSD through $TMPDIR. Only accept it
+    # for a real Slurm allocation; a login node's generic /tmp is not SSD.
+    candidates_by_path = _configured_scratch_paths(cfg, env)
+    if (
+        str(cfg.get("cluster_site", "")).strip().lower() == "spider"
+        and env.get("SLURM_JOB_ID")
+        and env.get("TMPDIR")
+    ):
+        candidates_by_path.append(env["TMPDIR"])
+    for path in candidates_by_path:
+        try:
+            if os.path.isdir(path) and os.access(path, os.W_OK):
+                return os.path.realpath(path)
+        except Exception as ex:
+            sys.stderr.write(f"{xtime()} - Scratch path probe failed for {path}: {ex}\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+
     try:
         user = getpass.getuser()
     except Exception as ex:
@@ -476,13 +532,13 @@ def detect_scratch_path(cluster_jobid):
         return None
 
     candidates = []
-    job_id = os.environ.get("SLURM_JOB_ID")
+    job_id = env.get("SLURM_JOB_ID")
     if job_id:
         candidates.append(str(job_id))
-    array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
+    array_job_id = env.get("SLURM_ARRAY_JOB_ID")
     if array_job_id:
         candidates.append(str(array_job_id))
-        array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+        array_task_id = env.get("SLURM_ARRAY_TASK_ID")
         if array_task_id:
             candidates.append(f"{array_job_id}_{array_task_id}")
 
@@ -500,8 +556,8 @@ def detect_scratch_path(cluster_jobid):
         seen.add(candidate)
         path = f"/scratch-node/{user}.{candidate}"
         try:
-            if os.path.isdir(path):
-                return path
+            if os.path.isdir(path) and os.access(path, os.W_OK):
+                return os.path.realpath(path)
         except Exception as ex:
             sys.stderr.write(f"{xtime()} - Scratch path probe failed for {path}: {ex}\n")
             sys.stderr.write(traceback.format_exc())
@@ -510,13 +566,15 @@ def detect_scratch_path(cluster_jobid):
     return None
 
 
-def read_scratch_usage(path):
+def read_scratch_usage(path, capacity_gb=None):
     """Return (total_gb, used_gb) for the scratch path."""
     if not path:
         return 0.0, 0.0
     try:
         usage = shutil.disk_usage(path)
         total_gb = max(0.0, usage.total / (1024.0 ** 3))
+        if capacity_gb is not None:
+            total_gb = min(total_gb, max(0.0, float(capacity_gb)))
         used_gb = max(0.0, (usage.total - usage.free) / (1024.0 ** 3))
         return total_gb, used_gb
     except Exception as ex:
@@ -750,12 +808,13 @@ if not cluster_managed:
 
 ssd_refresh_interval = max(1.0, float(config.get('ssd_usage_refresh_interval_sec', 60.0)))
 scratch_path = detect_scratch_path(clusterid)
+ssd_capacity_limit_gb = configured_scratch_capacity_gb()
 ssd_total_gb = 0.0
 ssd_used_gb = 0.0
 ssd_last_refresh = 0.0
 
 if scratch_path and os.path.isdir(scratch_path):
-    total, used = read_scratch_usage(scratch_path)
+    total, used = read_scratch_usage(scratch_path, ssd_capacity_limit_gb)
     ssd_total_gb = total
     ssd_used_gb = used
     ssd_last_refresh = time.time()
@@ -1535,7 +1594,9 @@ try :
             if now - ssd_last_refresh >= ssd_refresh_interval:
                 if not scratch_path or not os.path.isdir(scratch_path):
                     scratch_path = detect_scratch_path(clusterid)
-                ssd_total_gb, ssd_used_gb = read_scratch_usage(scratch_path)
+                ssd_total_gb, ssd_used_gb = read_scratch_usage(
+                    scratch_path, ssd_capacity_limit_gb
+                )
                 ssd_last_refresh = now
 
             idle_duration = 0.0 if idle_start == 0 else (now - idle_start)

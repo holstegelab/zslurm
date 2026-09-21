@@ -439,6 +439,7 @@ def get_job_url(instance=None, address=None):
 # Scratch-aware Slurm helpers
 _scratch_parts_cache_ts = 0.0
 _scratch_parts_cache = None
+_scratch_parts_cache_feature = None
 
 
 def _canon_state(s):
@@ -523,7 +524,13 @@ def _parse_scontrol_text_nodes(s):
         parts = _parse_partitions_any(nd.get("Partitions"))
         state = _canon_state(nd.get("State"))
         feats = _parse_features_str(nd.get("AvailableFeatures"))
-        out.append({"partitions": parts, "state": state, "features": feats})
+        out.append({
+            "partitions": parts,
+            "state": state,
+            "features": feats,
+            "cpu_alloc": _safe_int(nd.get("CPUAlloc")),
+            "cpu_tot": _safe_int(nd.get("CPUTot")),
+        })
     return out
 
 
@@ -553,36 +560,73 @@ def _parse_scontrol_json_nodes(s):
             feats = set(str(x) for x in f)
         elif isinstance(f, str):
             feats = _parse_features_str(f)
-        out.append({"partitions": parts, "state": _canon_state(st), "features": feats})
+        cpu_alloc = nd.get("alloc_cpus")
+        if cpu_alloc is None:
+            cpu_alloc = nd.get("CPUAlloc")
+        cpu_tot = nd.get("cpus")
+        if cpu_tot is None:
+            cpu_tot = nd.get("CPUTot")
+        out.append({
+            "partitions": parts,
+            "state": _canon_state(st),
+            "features": feats,
+            "cpu_alloc": _safe_int(cpu_alloc),
+            "cpu_tot": _safe_int(cpu_tot),
+        })
     return out
 
 
-def _collect_states_by_scratch(nodes):
+def _safe_int(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_states_by_scratch(nodes, scratch_feature="scratch-node"):
     parts = {}
+    feature = str(scratch_feature or "scratch-node")
     for nd in nodes:
         pset = nd.get("partitions") or []
         if not pset:
             pset = ["(none)"]
-        has_scratch = ("scratch-node" in (nd.get("features") or set()))
+        has_scratch = feature in (nd.get("features") or set())
         key = "scratch" if has_scratch else "no_scratch"
         st = nd.get("state") or "UNKNOWN"
         for p in pset:
             if p not in parts:
                 parts[p] = {
-                    "scratch": {"nodes": 0, "states": {}},
-                    "no_scratch": {"nodes": 0, "states": {}},
+                    "scratch": {
+                        "nodes": 0, "states": {}, "free_cpus": 0,
+                        "free_cpus_by_node": [],
+                    },
+                    "no_scratch": {
+                        "nodes": 0, "states": {}, "free_cpus": 0,
+                        "free_cpus_by_node": [],
+                    },
                 }
             grp = parts[p][key]
             grp["nodes"] = int(grp.get("nodes", 0)) + 1
             stc = grp.get("states")
             stc[st] = int(stc.get(st, 0)) + 1
+            cpu_alloc = nd.get("cpu_alloc")
+            cpu_tot = nd.get("cpu_tot")
+            if st in ("IDLE", "MIXED") and cpu_alloc is not None and cpu_tot is not None:
+                free_cpus = max(0, int(cpu_tot) - int(cpu_alloc))
+                grp["free_cpus"] = int(grp.get("free_cpus", 0)) + free_cpus
+                grp.setdefault("free_cpus_by_node", []).append(free_cpus)
     return parts
 
 
-def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60):
-    global _scratch_parts_cache_ts, _scratch_parts_cache
+def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60, scratch_feature="scratch-node"):
+    global _scratch_parts_cache_ts, _scratch_parts_cache, _scratch_parts_cache_feature
     now = time.time()
-    if _scratch_parts_cache is not None and (now - _scratch_parts_cache_ts) < float(cache_ttl_sec):
+    feature = str(scratch_feature or "scratch-node")
+    if (
+        _scratch_parts_cache is not None
+        and _scratch_parts_cache_feature == feature
+        and (now - _scratch_parts_cache_ts) < float(cache_ttl_sec)
+    ):
         return _scratch_parts_cache
     raw = None
     try:
@@ -604,9 +648,10 @@ def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60):
                 nodes = []
         except Exception:
             nodes = []
-    parts = _collect_states_by_scratch(nodes or [])
+    parts = _collect_states_by_scratch(nodes or [], feature)
     _scratch_parts_cache = parts
     _scratch_parts_cache_ts = now
+    _scratch_parts_cache_feature = feature
     return parts
 
 

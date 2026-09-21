@@ -216,15 +216,16 @@ def parse_scontrol_json(s):
     return out
 
 
-def aggregate(nodes):
+def aggregate(nodes, scratch_feature="scratch-node"):
     parts = {}
     all_states = set()
+    feature = str(scratch_feature or "scratch-node")
     for nd in nodes:
         pset = nd.get("partitions") or []
         if not pset:
             pset = ["(none)"]
         feats = nd.get("features") or set()
-        has_scratch = ("scratch-node" in feats)
+        has_scratch = feature in feats
         for p in pset:
             key = f"{p} (scratch)" if has_scratch else f"{p} (no-scratch)"
             if key not in parts:
@@ -279,7 +280,20 @@ def main():
     ap.add_argument("--input", default=None, help="Path to input text. Use '-' for stdin. Default: call scontrol")
     ap.add_argument("--json", dest="as_json", action="store_true", help="Output JSON instead of table")
     ap.add_argument("--parseable", action="store_true", help="Output TSV table suitable for parsing")
+    ap.add_argument(
+        "--ssd-feature", default=None,
+        help="Slurm feature identifying local SSD nodes (default: ZSlurm config)",
+    )
     args = ap.parse_args()
+
+    feature = args.ssd_feature
+    if not feature:
+        try:
+            feature = zslurm_shared.get_config().get(
+                "ssd_feature_name", "scratch-node"
+            )
+        except Exception:
+            feature = "scratch-node"
 
     raw = _read_input(args)
     nodes = None
@@ -295,7 +309,7 @@ def main():
     if nodes is None:
         nodes = parse_scontrol_text(raw)
 
-    parts, state_cols = aggregate(nodes)
+    parts, state_cols = aggregate(nodes, feature)
     rows = format_rows(parts, state_cols)
 
     if args.as_json:

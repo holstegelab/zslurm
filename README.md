@@ -40,7 +40,7 @@ cp config/sites/spider.yaml ~/.zslurm/config.yaml    # on Spider
 ```
 
 Review autogrow and storage limits before starting the manager. The Spider
-template deliberately leaves autogrow disabled.
+template enables autogrow with a cap of 15 partial 30-core compute pilots.
 
 ZSlurm also supports the original Spider layout where `~/.zslurm` itself is
 a YAML configuration file. In that case the legacy file remains the active
@@ -513,20 +513,32 @@ the physical 960-GB or 1440-GB node size:
 ```yaml
 cluster_site: spider
 default_partition: normal
+ssd_feature_name: ssd
+ssd_scratch_root: "$TMPDIR"
+ssd_capacity_gb: 2200
+enable_ssd_prompt: true
 default_engine_cores: 30
 autogrow_engine_cores: 30
 node_profiles:
   normal:
     cores: 30
     mem_gb: 240
-autogrow_enable: false
-autogrow_max_compute_nodes: 0
+autogrow_prefer_partitions:
+  - [normal, true]
+autogrow_enable: true
+autogrow_max_compute_nodes: 15
 maintenance_window_enable: false
 ```
 
 The chief derives its final schedulable memory from the Slurm environment and
 cgroup, so a site or partition with a different memory-per-core grant is never
 allowed to advertise the physical node's complete RAM accidentally.
+Spider's chief likewise validates the allocation-local `$TMPDIR`, advertises
+at most 2200 GiB per 30-core pilot, and gives each child job a private directory
+below it. This stays just below Spider's documented 80-decimal-GB-per-core
+scratch entitlement. Compute autogrow considers both
+IDLE nodes and 30-core slots remaining on MIXED nodes, and submits pilots with
+`--constraint=ssd`.
 
 ## Storage quotas as a global resource monitor
 
@@ -1160,8 +1172,10 @@ Useful options:
 - **`--input -`**: read from stdin
 - **`--json`**: JSON output
 - **`--parseable`**: TSV output
+- **`--ssd-feature NAME`**: override the configured SSD feature used to split rows
 
-By default it calls `scontrol` directly.
+By default it calls `scontrol` directly and reads `ssd_feature_name` from the
+ZSlurm configuration (`scratch-node` on Snellius, `ssd` on Spider).
 
 ### `zsstats`
 
