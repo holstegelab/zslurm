@@ -86,6 +86,19 @@ class DcacheTransferSlotTests(unittest.TestCase):
         self.assertEqual(self.jobs.dcache_upload_inuse, 4)
         self.assertEqual(transfer_jobs[4].state, "PENDING")
 
+        # Simulate loss of the first request_jobs response. The four grants
+        # already hold all transfer slots but must still be returned for the
+        # acknowledgement retry rather than being double-counted.
+        retried = self.jobs.request_jobs("test-node", 32, 128000, "compute")
+        self.assertEqual(
+            {row[0] for row in retried},
+            {job.jobid for job in transfer_jobs[:4]},
+        )
+
+        for job in transfer_jobs[:4]:
+            self.assertTrue(self.jobs.can_run_assigned_job(
+                "test-node", job.jobid
+            ))
         self.jobs.job_done(transfer_jobs[0].jobid, self.zslurm.RC_SUCCESS)
         assigned = self.jobs.request_jobs("test-node", 28, 127600, "compute")
 
@@ -102,6 +115,10 @@ class DcacheTransferSlotTests(unittest.TestCase):
         assigned = self.jobs.request_jobs("test-node", 32, 128000, "compute")
 
         self.assertEqual(len(assigned), 5)
+        self.assertEqual(normal_job.state, "ASSIGNED")
+        self.assertTrue(self.jobs.can_run_assigned_job(
+            "test-node", normal_job.jobid
+        ))
         self.assertEqual(normal_job.state, "RUNNING")
         self.assertEqual(self.jobs.dcache_download_inuse, 4)
         self.assertEqual(self.jobs.dcache_upload_inuse, 4)
