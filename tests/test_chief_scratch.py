@@ -97,6 +97,13 @@ class ChiefScratchTests(unittest.TestCase):
             2500.0,
         )
 
+    def test_spider_per_core_cap_stays_below_documented_entitlement(self):
+        capacity = self.namespace["configured_scratch_capacity_gb"]
+
+        self.assertEqual(
+            capacity({"scratch_capacity_gb_per_core": 73}, 30), 2190.0
+        )
+
     def test_child_directories_are_unique_and_cleanup_is_scoped(self):
         prepare = self.namespace["prepare_job_scratch"]
         cleanup = self.namespace["cleanup_job_scratch"]

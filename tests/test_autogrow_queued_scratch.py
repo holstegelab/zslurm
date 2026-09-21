@@ -101,6 +101,7 @@ class QueuedScratchCapacityTests(unittest.TestCase):
 
     def test_busy_cluster_still_queues_demand_backed_pilots(self):
         z = self.zslurm
+        z.status.config['autogrow_require_idle_nodes'] = False
         with mock.patch.object(z.zslurm_shared, 'slurm_partition_state_counts_by_scratch', return_value={}):
             plan = z.compute_autogrow_plan([], 'compute')
             self.assertEqual(plan['best_nodes'], 1)
@@ -114,6 +115,7 @@ class QueuedScratchCapacityTests(unittest.TestCase):
         z.status.node_profiles = {'normal': {'cores': 30, 'mem_gb': 240}}
         z.status.autogrow_prefer_partitions = [('normal', False)]
         z.status.autogrow_fallback_partition = 'normal'
+        z.status.config['autogrow_require_idle_nodes'] = False
         self.jobs.jobs_by_id.clear()
         job = z.Job('audit', 'small', 'true', '/tmp', {}, 4, 32000, 3600,
                     0, None, 0, 0, 0, 0, 0, 0, 'compute', 0, None, '')
@@ -137,6 +139,7 @@ class QueuedScratchCapacityTests(unittest.TestCase):
         z.status.node_profiles = {'normal': {'cores': 30, 'mem_gb': 240}}
         z.status.autogrow_prefer_partitions = [('normal', False)]
         z.status.autogrow_fallback_partition = 'normal'
+        z.status.config['autogrow_require_idle_nodes'] = False
         self.jobs.jobs_by_id.clear()
         for i in range(20):
             job = z.Job('pav', str(i), 'true', '/tmp', {}, 9, 69632, 176400,

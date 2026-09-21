@@ -551,9 +551,10 @@ default_partition: normal
 staging_partition: __disabled__
 staging_autogrow_enable: false
 enable_feature_prompt: false
+enable_ssd_prompt: true
 ssd_feature_name: ssd
 scratch_use_tmpdir: true
-scratch_capacity_gb_per_core: 100
+scratch_capacity_gb_per_core: 73
 gpfs_io_enable: false
 default_engine_cores: 30
 autogrow_engine_cores: 30
@@ -568,8 +569,8 @@ node_profiles:
   normal:
     cores: 30
     mem_gb: 240
-autogrow_enable: false
-autogrow_max_compute_nodes: 0
+autogrow_enable: true
+autogrow_max_compute_nodes: 15
 maintenance_window_enable: false
 ```
 
@@ -585,7 +586,15 @@ attempt, exports it
 as `ZSLURM_SCRATCH_DIR`, points the standard temp variables there, and removes
 only that directory when the child ends. A per-core capacity cap prevents
 multiple partial pilots on one node from each advertising the complete 12-TiB
-device. The actual filesystem free space remains an additional hard bound.
+device. The supplied 73-GiB/core cap stays below Spider's documented
+80-decimal-GB/core entitlement; a 30-core pilot advertises at most 2190 GiB.
+The actual filesystem free space remains an additional hard bound.
+
+Manual pilot creation asks whether SSD scratch should be reserved. Enter or
+`yes` supplies `--constraint=ssd`; `no` omits it. Spider currently exposes the
+`ssd` feature on all normal nodes, so this is explicit without narrowing the
+current normal-node pool. Compute autogrow starts enabled and is capped at 15
+running-plus-queued pilots (at most 450 requested cores at the 30-core ceiling).
 
 Spider has no physical `staging` partition and its project filesystem is
 CephFS. The supplied site file therefore disables staging autogrow and GPFS

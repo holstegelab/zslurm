@@ -694,6 +694,7 @@ def _cluster_defaults(config=None):
         defaults.update({
             "default_partition": "normal",
             "staging_partition": "__disabled__",
+            "enable_ssd_prompt": True,
             "enable_feature_prompt": False,
             "ssd_feature_name": "ssd",
             "gpfs_io_enable": False,
@@ -717,6 +718,8 @@ def _cluster_defaults(config=None):
             # Every current Spider normal node has the configured SSD feature,
             # so non-SSD moderation is irrelevant for this one-class fleet.
             "autogrow_max_nonssd_fraction": 1.0,
+            "autogrow_enable": True,
+            "autogrow_max_compute_nodes": 15,
         })
     return defaults
 
