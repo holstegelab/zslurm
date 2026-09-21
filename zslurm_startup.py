@@ -1,8 +1,8 @@
 """Retry child startup without losing the engine or double-reserving resources.
 
-The existing manager protocol grants RUNNING before Popen. Pending starts keep
-that grant (including storage/transfer reservations), report zero usage, and do
-not consume a workflow retry. No new manager RPC is required.
+After the chief acknowledges an ASSIGNED grant, pending starts retain the
+resulting RUNNING reservation (including storage/transfer reservations), report
+zero usage, and do not consume a workflow retry.
 """
 import errno
 import os

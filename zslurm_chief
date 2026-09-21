@@ -1588,11 +1588,14 @@ try :
                         continue
                     if state == 'ASSIGNED':
                         if status.current_cpu >= ncpu and min(status.current_mem, mb_memory_available) >= mem:
-                            status.assigned_jobs.pop(jobid, None)
+                            # Retain the grant until the acknowledgement reply
+                            # arrives. A lost reply can then be retried safely.
+                            status.assigned_jobs[jobid] = job
                             try:
                                 permission = s.can_run_assigned_job(myid, jobid)
                             except MANAGER_RPC_ERRORS:
                                 continue
+                            status.assigned_jobs.pop(jobid, None)
                             if not permission:
                                 continue
                             job = tuple(job[:-1]) + ('RUNNING',)

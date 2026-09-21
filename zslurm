@@ -2835,14 +2835,18 @@ class JobManager(object):
                     return False
                 if not _ssd_ok(job, e):
                     return False
-                if job.active_start_use_add > 0 and (self.active_inuse + job.active_start_use_add) > self.active_total:
-                    return False
-                if job.dcache_start_use_add > 0 and (self.dcache_inuse + job.dcache_start_use_add) > self.dcache_total:
-                    return False
-                if job.archive_start_use_add > 0 and (self.archive_inuse + job.archive_start_use_add) > self.archive_total:
-                    return False
-                if job.state != 'ASSIGNED' and not self._dcache_transfer_fits_locked(job):
-                    return False
+                if job.state != 'ASSIGNED':
+                    # ASSIGNED grants already hold their durable and transfer
+                    # reservations. Rechecking start-use here would double
+                    # count them and can block recovery after a lost RPC reply.
+                    if job.active_start_use_add > 0 and (self.active_inuse + job.active_start_use_add) > self.active_total:
+                        return False
+                    if job.dcache_start_use_add > 0 and (self.dcache_inuse + job.dcache_start_use_add) > self.dcache_total:
+                        return False
+                    if job.archive_start_use_add > 0 and (self.archive_inuse + job.archive_start_use_add) > self.archive_total:
+                        return False
+                    if not self._dcache_transfer_fits_locked(job):
+                        return False
                 return True
 
 
@@ -2970,44 +2974,18 @@ class JobManager(object):
                     self.archive_inuse += job.archive_start_use_add
                     self._reserve_dcache_transfer_locked(job)
 
-                    if not (job.ncpu <= current_cpu and job.mem <= current_mem):
-                        add_log_line(
-                            gb,
-                            f"Job {job.job_name} (id: {job.jobid}) assigned to node {myid} ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
-                            BLUE,
-                        )
-                        job.assigned(myid)
-                    else:
-                        add_log_line(
-                            gb,
-                            f"Job {job.job_name} (id: {job.jobid}) started on node {myid} ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
-                            BLUE,
-                        )
-                        job.started(myid)
-                        self._eligible_cache_ts = 0.0
-                        self.running_jobs[job.partition] = (
-                            self.running_jobs.get(job.partition, 0) + 1
-                        )
+                    add_log_line(
+                        gb,
+                        f"Job {job.job_name} (id: {job.jobid}) granted to node {myid} (ASSIGNED; awaiting start acknowledgement) ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
+                        BLUE,
+                    )
+                    # A slow request_jobs response can be lost after this
+                    # method commits. Publish only ASSIGNED here; RUNNING is
+                    # committed by the chief's idempotent acknowledgement.
+                    job.assigned(myid)
 
                     current_cpu -= job.ncpu
                     current_mem -= job.mem
-
-                    if job.state == "RUNNING": #set by job.started
-                        e = engines.engine_by_id.get(myid, None)
-                        if e is not None:
-                            e.res_cpu_reserved += float(job.held_ncpu)
-                            e.res_mem_reserved_mb += float(job.held_mem)
-                            try:
-                                if getattr(job, 'ssd_use', 'no') != 'no' and getattr(e, 'has_ssd', False):
-                                    need = float(getattr(job, 'ssd_gb', 0.0))
-                                    if need > 0.0:
-                                        cap = max(0.0, float(getattr(e, 'ssd_total_gb', 0.0)) - float(getattr(e, 'res_ssd_reserved_gb', 0.0)))
-                                        if cap >= need:
-                                            e.res_ssd_reserved_gb += need
-                                            job.ssd_alloc_gb = need
-                            except Exception:
-                                import traceback
-                                traceback.print_exc()
 
                     res = (
                         job.jobid,
@@ -3183,6 +3161,10 @@ class JobManager(object):
                             pass
                         job.node_id = None
                         job.state = "PENDING"
+                elif job.state == "RUNNING" and job.node_id == nodeid:
+                    # If the first acknowledgement response was lost, the
+                    # same chief may retry without starting or reserving twice.
+                    res = True
         finally:
             self.lock.release()
         return res

@@ -667,6 +667,8 @@ class ManagerLeaseAccountingTests(unittest.TestCase):
             "test-node", 32, 128000, "compute"
         )
         self.assertEqual(len(assigned), 1)
+        self.assertEqual(job.state, "ASSIGNED")
+        self.assertTrue(self.jobs.can_run_assigned_job("test-node", job.jobid))
         self.assertEqual(job.state, "RUNNING")
         self.assertEqual(self.engine.res_cpu_reserved, 8)
         self.assertEqual(self.engine.res_mem_reserved_mb, 32000)
@@ -691,6 +693,7 @@ class ManagerLeaseAccountingTests(unittest.TestCase):
     def test_manager_target_is_idempotent_and_bounded(self):
         job = self.add_job()
         self.jobs.request_jobs("test-node", 32, 128000, "compute")
+        self.assertTrue(self.jobs.can_run_assigned_job("test-node", job.jobid))
 
         first = self.jobs.resize_running_job(
             "test-node", job.jobid, 2, 8000
@@ -886,6 +889,10 @@ class SchedulerPriorityTests(unittest.TestCase):
         assigned = self.dispatch_one()
 
         self.assertEqual(assigned[0][0], high.jobid)
+        self.assertEqual(high.state, "ASSIGNED")
+        self.assertTrue(self.jobs.can_run_assigned_job(
+            self.engine.engine_id, high.jobid
+        ))
         self.assertEqual(high.state, "RUNNING")
         self.assertEqual(low.state, "PENDING")
 

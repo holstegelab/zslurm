@@ -1367,12 +1367,13 @@ work while startup is deferred, and retries even when those grants leave zero
 unreserved cores. Actual memory headroom is rechecked before spawn. A cancelled
 waiting start releases its local holding and cannot launch later.
 
-The existing manager protocol labels a granted job `RUNNING` before spawning;
-therefore a deferred start remains `RUNNING` with zero measured usage. Its chief
-log reports `START DEFERRED`, the error and the next retry delay. No new manager
-RPC or manager restart is needed. Invalid commands still fail the individual
-job. This mechanism cannot rescue a computation that has already started and
-then fails while writing its own output files.
+The manager first returns a grant as `ASSIGNED`; the chief acknowledges it
+before retaining it as a deferred `RUNNING` start with zero measured usage. Its
+log reports `START DEFERRED`, the error and the next retry delay. The existing
+`can_run_assigned_job` RPC is idempotent, so a lost acknowledgement response can
+be retried safely. Invalid commands still fail the individual job. This
+mechanism cannot rescue a computation that has already started and then fails
+while writing its own output files.
 
 Chief diagnostic write/flush errors are best-effort so a full Slurm log cannot
 kill coordination. This does not suppress errors writing child-job outputs.
