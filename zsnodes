@@ -19,7 +19,7 @@ NODE_FIELDS = ["partition", "engine_id", "cluster_id", "cores", "totmem_mb",
                "res_cpu_reserved", "res_mem_reserved_mb", "has_ssd",
                "ssd_total_gb", "ssd_used_gb", "res_ssd_reserved_gb",
                "gpfs_rx_mib_s", "gpfs_tx_mib_s", "gpfs_io_pct",
-               "gpfs_io_available"]
+               "gpfs_io_available", "chief_version"]
 
 parser = argparse.ArgumentParser(description='ZSlurm node listing')
 parser.add_argument('--all', action='store_true', help='Show also queued nodes.')
@@ -72,7 +72,8 @@ if args.as_json:
     for instance in instances:
         rows = []
         for node in _fetch_nodes(instance):
-            n = list(node) + [0.0] * (24 - len(node))  # pad for older managers
+            n = list(node) + [0.0] * max(0, 24 - len(node))
+            n += [None] * max(0, 25 - len(n))  # no version on older managers
             rows.append({
                 "partition": n[0], "engine_id": n[1], "cluster_id": n[2],
                 "cores": float(n[3]), "totmem_mb": float(n[4]),
@@ -88,6 +89,7 @@ if args.as_json:
                 "gpfs_tx_mib_s": float(n[21]),
                 "gpfs_io_pct": float(n[22]),
                 "gpfs_io_available": bool(n[23]),
+                "chief_version": n[24],
             })
         out["instances"][instance] = rows
     print(json.dumps(out, indent=2, sort_keys=True))

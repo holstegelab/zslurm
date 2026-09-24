@@ -31,6 +31,21 @@ a relocated environment whose `bin` directory is not inherited by `sbatch`,
 export `ZSLURM_ENGINE_ENV_BIN=/path/to/environment/bin` before starting the
 manager.
 
+Check the installed manager and pilot binaries before starting an instance:
+
+```bash
+zslurm --version
+zslurm_chief --version
+```
+
+The manager reports its version in its health response and each chief's
+version in `zsnodes --json`. At registration it warns in `cluster.log` and
+the UI if a chief reports a different version or no version at all. A new
+chief also warns when connected to an older manager without versioned
+registration. These warnings do not stop pilots; replace old pilots during a
+planned drain. Bump `VERSION` in `zslurm_version.py` when deploying changed
+manager or chief code.
+
 Site templates are available under `config/sites/`:
 
 ```bash
