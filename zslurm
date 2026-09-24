@@ -33,6 +33,7 @@ import getpass
 import traceback
 
 import zslurm_shared
+from zslurm_version import VERSION
 import atexit
 try:
     import ipyparallel
@@ -3881,6 +3882,7 @@ def ping():
     return {
         "ok": True,
         "schema_version": SCHEMA_VERSION,
+        "version": VERSION,
         "instance": getattr(status, 'instance_name', None),
         "uptime_s": up,
         "job_server_alive": Servers.job_server is not None,
@@ -4287,6 +4289,7 @@ class Engine(object):
         self.ssd_total_gb = 0.0
         self.ssd_used_gb = 0.0        
         self.res_ssd_reserved_gb = 0.0
+        self.chief_version = None
 
 
 class EngineManager(object):
@@ -4461,6 +4464,7 @@ class EngineManager(object):
                     float(getattr(e, 'gpfs_tx_mib_s', 0.0)),
                     float(getattr(e, 'gpfs_io_pct', 0.0)),
                     bool(getattr(e, 'gpfs_io_available', False)),
+                    getattr(e, 'chief_version', None),
                 )
             )
         return result
@@ -5343,6 +5347,7 @@ class EngineManager(object):
         ssd_total_gb,
         ssd_used_gb,
         logical_instance=None,
+        chief_version=None,
     ):
         self.lock.acquire()
         try:
@@ -5390,6 +5395,26 @@ class EngineManager(object):
             e.instance = (
                 logical_instance or getattr(e, 'instance', None)
                 or status.instance_name)
+
+            e.chief_version = str(chief_version).strip() if chief_version else None
+            if e.chief_version != VERSION:
+                warning_key = e.chief_version or "unversioned"
+                if getattr(e, '_chief_version_warning', None) != warning_key:
+                    if e.chief_version:
+                        detail = (f"chief version {e.chief_version} differs from "
+                                  f"manager version {VERSION}")
+                    else:
+                        detail = (f"chief did not report a version; manager is "
+                                  f"{VERSION}")
+                    add_log_line(
+                        gb,
+                        f"WARNING: engine {myid} (Slurm {cluster_jobid}) {detail}. "
+                        "Check that zslurm_chief and the manager use the same installation.",
+                        YELLOW,
+                    )
+                    e._chief_version_warning = warning_key
+            else:
+                e._chief_version_warning = None
 
             preserve_handover_reservation = bool(
                 prev is not None
@@ -5719,6 +5744,11 @@ def register(*args):
             myid, zslurm_shared.MIGRATE_MANAGER,
             _migration_command_payload())
     return myid
+
+
+def register_versioned(*args):
+    """Register a chief carrying a release identity; legacy register stays valid."""
+    return register(*args)
 
 
 def unregister(*args):
@@ -7325,6 +7355,7 @@ def thread_start_manager_server(port, rpc_path):
     server.register_introspection_functions()
 
     server.register_function(register, "register")
+    server.register_function(register_versioned, "register_versioned")
     server.register_function(failed_node, "failed_node")
     server.register_function(unregister, "unregister")
     server.register_function(poll, "poll")
@@ -9055,6 +9086,7 @@ def _cli_main():
     parser = argparse.ArgumentParser(
         prog="zslurm",
         description="zslurm pilot-job meta-scheduler manager")
+    parser.add_argument("--version", action="version", version=f"zslurm {VERSION}")
     parser.add_argument("--headless", action="store_true",
                         help="run without the curses UI (RPC servers + controller only); "
                              "for autonomous/agent operation")
