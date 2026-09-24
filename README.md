@@ -44,25 +44,32 @@ version in `zsnodes --json`. At registration it warns in `cluster.log` and
 the UI if a chief reports a different version or no version at all. A new
 chief also warns when connected to an older manager without versioned
 registration. These warnings do not stop pilots; replace old pilots during a
-planned drain. Bump `VERSION` in `zslurm_version.py` when deploying changed
-manager or chief code.
+planned drain. Bump both `VERSION` in `zslurm_version.py` and the package
+version in `setup.py` when deploying changed manager or chief code; a test
+requires them to match.
 
-Site templates are available under `config/sites/`:
+On Spider, preview and add missing site settings without overwriting existing
+values or comments:
 
 ```bash
-mkdir -p ~/.zslurm
-cp config/sites/spider.yaml ~/.zslurm/config.yaml    # on Spider
-# or: cp config/sites/snellius.yaml ~/.zslurm/config.yaml
+zslurm --update-config spider --dry-run
+zslurm --update-config spider
 ```
 
-Review autogrow and storage limits before starting the manager. The Spider
-template deliberately leaves autogrow disabled.
+The command uses `~/.zslurm/config.yaml`, or the legacy `~/.zslurm` YAML file
+when present. It makes a timestamped backup before changing an existing file,
+keeps existing values even when they differ from the template, and reports
+those key names without printing their values. Review conflicts manually;
+rerunning the command will not override them. It does not restart or reconfigure
+a running manager. The Spider template enables autogrow with a cap of 15
+partial 30-core compute pilots on the next manager start, so review those
+settings first.
 
-ZSlurm also supports the original Spider layout where `~/.zslurm` itself is
-a YAML configuration file. In that case the legacy file remains the active
-configuration and per-instance/runtime state is written to `~/.zslurm.d/`.
-Merge the relevant values from `config/sites/spider.yaml` into the existing
-file; do not replace it with a directory.
+Site templates remain available under `config/sites/` for manual review. For
+Snellius, copy or merge `config/sites/snellius.yaml` into
+`~/.zslurm/config.yaml` as appropriate. In the original Spider layout where
+`~/.zslurm` itself is a YAML file, it remains the active configuration and
+per-instance/runtime state is written to `~/.zslurm.d/`.
 
 The environment file includes the base runtime dependencies for ZSlurm,
 including `pyyaml` and `tabulate`, plus `setuptools` as an explicit build

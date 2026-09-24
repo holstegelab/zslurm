@@ -9087,6 +9087,12 @@ def _cli_main():
         prog="zslurm",
         description="zslurm pilot-job meta-scheduler manager")
     parser.add_argument("--version", action="version", version=f"zslurm {VERSION}")
+    parser.add_argument(
+        "--update-config", choices=("spider",), metavar="SITE",
+        help="add missing site settings to the persistent ZSlurm config and exit")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="with --update-config, report changes without writing")
     parser.add_argument("--headless", action="store_true",
                         help="run without the curses UI (RPC servers + controller only); "
                              "for autonomous/agent operation")
@@ -9107,6 +9113,36 @@ def _cli_main():
         help="explicitly restart an unreachable local instance on its existing "
              "ports and RPC path so surviving chiefs can reconnect")
     args, _unknown = parser.parse_known_args()
+    if args.dry_run and not args.update_config:
+        parser.error("--dry-run requires --update-config")
+    if args.update_config:
+        if _unknown or args.headless or args.recover_instance or args.instance_name:
+            parser.error("--update-config cannot be combined with manager options")
+        from zslurm_config import update_site_config
+        try:
+            result = update_site_config(args.update_config, dry_run=args.dry_run)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(2, f"zslurm: config update failed: {error}\n")
+        action = "Would add" if args.dry_run else "Added"
+        print(f"Config: {result['path']}")
+        print(f"{action} {len(result['added'])} missing site keys"
+              + (": " + ", ".join(result["added"]) if result["added"] else "."))
+        if result["backup"]:
+            print(f"Backup: {result['backup']}")
+        if result["conflicts"]:
+            print(
+                "WARNING: kept existing values for conflicting keys: "
+                + ", ".join(result["conflicts"]),
+                file=sys.stderr,
+            )
+        if "autogrow_enable" in result["added"]:
+            print(
+                "NOTE: the Spider template enables autogrow (maximum 15 pilots) "
+                "when the manager is next started.",
+                file=sys.stderr,
+            )
+        print("No running manager was changed; restart it when safe to load the config.")
+        return
     if args.headless:
         main_headless(args)
     else:
