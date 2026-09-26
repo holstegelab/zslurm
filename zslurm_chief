@@ -344,8 +344,15 @@ def _slurm_allocation_memory_mb(cpu_count, environ):
         result = subprocess.run(['scontrol', 'show', 'job', job_id, '-o'],
                                 capture_output=True, text=True, check=True,
                                 timeout=5, env=environ)
-        fields = dict(word.split('=', 1) for word in result.stdout.split() if '=' in word)
-        if fields.get('JobId') != job_id or fields.get('NumNodes') != '1':
+        records = [dict(word.split('=', 1) for word in line.split() if '=' in word)
+                   for line in result.stdout.splitlines()]
+        matches = [record for record in records if record.get('JobId') == job_id]
+        # An array's final instantiated task may retain the base JobId. Querying
+        # it can return every array sibling; never combine fields across jobs.
+        if len(matches) != 1:
+            return None
+        fields = matches[0]
+        if fields.get('NumNodes') != '1':
             return None
         granted_cpus = float(fields['NumCPUs'])
         if not math.isfinite(granted_cpus) or granted_cpus < cpu_count:

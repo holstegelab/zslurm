@@ -82,6 +82,13 @@ class ChiefMemoryCapacityTests(unittest.TestCase):
         with mock.patch.object(subprocess, 'run', return_value=reply):
             self.assertEqual(get_limit(192, env), 344064)
 
+    def test_base_array_job_selects_its_exact_record_not_last_sibling(self):
+        env = dict(SLURM_JOB_ID='123', SLURM_MEM_PER_NODE='8192', SLURM_MEM_PER_CPU='8000')
+        reply = mock.Mock(stdout='JobId=123 NumNodes=1 NumCPUs=8 MinMemoryCPU=8000M\n'
+                         'JobId=124 NumNodes=1 NumCPUs=32 MinMemoryNode=256G\n')
+        with mock.patch.object(subprocess, 'run', return_value=reply):
+            self.assertEqual(self.namespace['get_slurm_memory_limit_mb'](8, env), 64000)
+
     def test_conflicting_modes_fail_conservatively_when_lookup_unavailable(self):
         get_limit = self.namespace['get_slurm_memory_limit_mb']
         for node, cpu, expected in [('8192', '8000', 8192), ('64000', '512', 4096)]:
