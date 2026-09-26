@@ -2571,9 +2571,18 @@ class JobManager(object):
             )
         return jobid
 
-    def cancel_job(self, jobid, requeue=False):
+    def cancel_job(self, jobid, requeue=False, expected_state=None):
+        # Compare-and-cancel under the dispatch lock. An earlier PENDING
+        # observation must never accidentally authorize killing started work.
+        if expected_state not in (None, 'PENDING') or (expected_state is not None and requeue):
+            raise ValueError('conditional cancellation supports PENDING without requeue only')
         self.lock.acquire()
         try:
+            if expected_state is not None:
+                observed = self.jobs_by_id.get(jobid)
+                state = getattr(observed, 'state', None)
+                if state != expected_state:
+                    return {'cancelled': False, 'jobid': str(jobid), 'state': state}
             job = None
             if jobid in self.jobs_by_id:
                 job = self.jobs_by_id[jobid]
@@ -2623,6 +2632,8 @@ class JobManager(object):
                 add_log_line(
                     gb, "Attempt to cancel unknown job (id: %s)." % jobid, YELLOW
                 )
+            if expected_state is not None:
+                return {'cancelled': True, 'jobid': str(jobid), 'state': 'CANCELLED'}
         finally:
             self.lock.release()
 
@@ -3914,6 +3925,7 @@ def ping():
         "list_jobs_priority": True,
         "cwd_priority_overrides": True,
         "targeted_job_status": True,
+        "conditional_pending_cancel": True,
         "directional_dcache_slots": True,
         "s3_download_slots": True,
         "gpfs_io_metrics": True,
