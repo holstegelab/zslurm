@@ -32,3 +32,20 @@ backport contains only the memory resolver/import; no unrelated worker behavior
 is silently deployed. The live manager need not lose/recreate its logical queue.
 Its submission sanitization takes effect on a later orderly manager upgrade;
 the chief-side resolver covers its pilots in the meantime.
+
+After merging current upstream main (through 156f678), its scratch-test updates
+resolve the first three baseline failures. Preserving the existing user-site
+packages in the subprocess PYTHONPATH resolves the isolated-HOME test's numpy
+dependency without changing test or production behavior. The merged full suite
+passed **212 tests and 15 subtests** before the following additional guard.
+
+## Separate startup walltime race
+
+Live startup exposed another issue: before the first Slurm observation, an
+engine's five-day placeholder could admit a 48-hour task on a 30-hour pilot.
+The manager now waits for the actual Slurm RUNNING observation before assigning
+work to a cluster-backed engine. Local non-Slurm engines are unaffected. A
+regression demonstrates unknown-state refusal, rejection of a 48-hour job on
+the observed 30-hour allocation, and admission of a fitting one-hour job.
+This manager-side correction requires an orderly manager upgrade; the minimal
+chief backport does not change code already loaded by a live manager.

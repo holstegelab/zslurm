@@ -2850,6 +2850,12 @@ class JobManager(object):
             totmem = 64000
         else:
             engine = engines.engine_by_id[myid]
+            # A newly registered Slurm pilot still has the historical five-day
+            # placeholder until squeue observes its actual allocation. Do not
+            # dispatch a long job during that startup window on a shorter pilot.
+            if (engine.cluster_id not in (None, False, '')
+                    and getattr(engine, 'slurm_state', None) != 'R'):
+                return []
             phaseout_window = None
             if engine.status == PHASING_OUT:
                 # Not a flat refusal any more: an engine waiting on one long job can
