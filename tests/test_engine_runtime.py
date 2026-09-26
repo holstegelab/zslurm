@@ -59,6 +59,16 @@ def test_explicit_engine_runtime_overrides_remain_authoritative(tmp_path):
     assert env["ZSLURM_ENGINE_ENV_BIN"] == "/configured/bin"
 
 
+def test_nested_submission_strips_only_parent_slurm_memory_modes():
+    zslurm = load_zslurm()
+    env = dict(PATH='/bin', SLURM_MEM_PER_NODE='8192', SLURM_MEM_PER_CPU='8000',
+               SLURM_MEM_PER_GPU='32000', ZSLURM_CHIEF_PATH='/bin/chief',
+               SBATCH_MEM_PER_NODE='64000')
+    result = zslurm._engine_submission_environment(env)
+    assert result == dict(PATH='/bin', ZSLURM_CHIEF_PATH='/bin/chief', SBATCH_MEM_PER_NODE='64000')
+    assert env['SLURM_MEM_PER_NODE'] == '8192'
+
+
 def test_launcher_uses_pinned_python_for_copied_chief(tmp_path):
     chief = tmp_path / "chief.sh"
     chief.write_text("printf '%s\\n' \"$1\"\n")

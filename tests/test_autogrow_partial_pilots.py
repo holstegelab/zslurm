@@ -195,6 +195,8 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].cores, 2.0)
         self.assertEqual(started[0].totmem, 14628.0)
+        self.assertNotIn('SLURM_MEM_PER_NODE', popen.call_args.kwargs['env'])
+        self.assertNotIn('SLURM_MEM_PER_CPU', popen.call_args.kwargs['env'])
 
     def test_feature_is_opt_in_outside_spider(self):
         z = self.zslurm

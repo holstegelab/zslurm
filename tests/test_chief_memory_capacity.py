@@ -2,7 +2,10 @@ import ast
 import math
 import os
 import pathlib
+import re
+import subprocess
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -17,7 +20,7 @@ def load_selected_functions(*names):
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
     module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
-    namespace = {"math": math, "os": os}
+    namespace = {"math": math, "os": os, "re": re, "subprocess": subprocess}
     exec(compile(module, str(CHIEF_PATH), "exec"), namespace)
     return namespace
 
@@ -27,6 +30,7 @@ class ChiefMemoryCapacityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.namespace = load_selected_functions(
             "parse_slurm_memory_mb",
+            "_slurm_allocation_memory_mb",
             "get_slurm_memory_limit_mb",
             "compute_engine_memory_capacity_mb",
         )
@@ -61,6 +65,38 @@ class ChiefMemoryCapacityTests(unittest.TestCase):
             get_limit(192, {"SLURM_MEM_PER_CPU": "1792"}),
             344064.0,
         )
+
+    def test_nested_spider_per_node_manager_limit_is_not_pilot_limit(self):
+        get_limit = self.namespace['get_slurm_memory_limit_mb']
+        env = dict(SLURM_JOB_ID='123', SLURM_MEM_PER_NODE='8192', SLURM_MEM_PER_CPU='8000')
+        reply = mock.Mock(stdout='JobId=123 NumNodes=1 NumCPUs=8 MinMemoryCPU=8000M')
+        with mock.patch.object(subprocess, 'run', return_value=reply) as run:
+            self.assertEqual(get_limit(8, env), 64000)
+        self.assertEqual(run.call_args.kwargs['timeout'], 5)
+        self.assertEqual(env['SLURM_MEM_PER_NODE'], '8192')
+
+    def test_nested_snellius_per_cpu_parent_does_not_override_node_grant(self):
+        get_limit = self.namespace['get_slurm_memory_limit_mb']
+        env = dict(SLURM_JOB_ID='456', SLURM_MEM_PER_NODE='344064', SLURM_MEM_PER_CPU='8000')
+        reply = mock.Mock(stdout='JobId=456 NumNodes=1 NumCPUs=192 MinMemoryNode=336G')
+        with mock.patch.object(subprocess, 'run', return_value=reply):
+            self.assertEqual(get_limit(192, env), 344064)
+
+    def test_conflicting_modes_fail_conservatively_when_lookup_unavailable(self):
+        get_limit = self.namespace['get_slurm_memory_limit_mb']
+        for node, cpu, expected in [('8192', '8000', 8192), ('64000', '512', 4096)]:
+            env = dict(SLURM_JOB_ID='123', SLURM_MEM_PER_NODE=node, SLURM_MEM_PER_CPU=cpu)
+            with mock.patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('scontrol', 5)):
+                self.assertEqual(get_limit(8, env), expected)
+
+    def test_wrong_or_multinode_allocation_cannot_inflate_memory(self):
+        get_limit = self.namespace['get_slurm_memory_limit_mb']
+        env = dict(SLURM_JOB_ID='123', SLURM_MEM_PER_NODE='8192', SLURM_MEM_PER_CPU='8000')
+        for fields in ('JobId=999 NumNodes=1 NumCPUs=8 MinMemoryCPU=8000M',
+                       'JobId=123 NumNodes=2 NumCPUs=16 MinMemoryCPU=8000M',
+                       'JobId=123 NumNodes=1 NumCPUs=4 MinMemoryCPU=8000M'):
+            with mock.patch.object(subprocess, 'run', return_value=mock.Mock(stdout=fields)):
+                self.assertEqual(get_limit(8, env), 8192)
 
     def test_incident_shape_is_capped_below_slurm_cgroup(self):
         compute = self.namespace["compute_engine_memory_capacity_mb"]

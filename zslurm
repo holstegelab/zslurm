@@ -112,6 +112,19 @@ def _prepare_engine_runtime(runtime_dir=None, python_executable=None,
             env["ZSLURM_CHIEF_PATH"] = chief
     return launcher
 
+
+def _engine_submission_environment(environ=None):
+    """Do not export a parent allocation's memory limits into nested sbatch.
+
+    Slurm sets the requested memory mode for the child but can leave the other
+    inherited mode untouched (per-node manager -> per-CPU Spider pilot, or the
+    reverse on Snellius). Keep the manager's own environment unchanged.
+    """
+    env = dict(os.environ if environ is None else environ)
+    for key in ('SLURM_MEM_PER_NODE', 'SLURM_MEM_PER_CPU', 'SLURM_MEM_PER_GPU'):
+        env.pop(key, None)
+    return env
+
 # On a non-SSD engine, let an ssd_use=no job absorb up to ten percent of a
 # node-equivalent more CPU/memory packing imbalance than ssd_use=possible work.
 # Priority, immediate fit, and overcommit remain strict tuple fields.
@@ -4742,7 +4755,8 @@ class EngineManager(object):
                     args.extend(["-c", str(int(cores))])
 
                 stdout, stderr = Popen(
-                    args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                    args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env=_engine_submission_environment(),
                 ).communicate()
                 if isinstance(stdout, bytes):
                     stdout = stdout.decode("utf-8", errors="replace")

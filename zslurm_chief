@@ -11,6 +11,7 @@ import threading
 import traceback
 import getpass
 import math
+import re
 import tempfile
 import zslurm_shared
 import zslurm_lease
@@ -325,22 +326,59 @@ def parse_slurm_memory_mb(value):
     return result
 
 
-def get_slurm_memory_limit_mb(cpu_count, environ=None):
+def _slurm_allocation_memory_mb(cpu_count, environ):
+    """Resolve conflicting inherited memory modes from this actual allocation.
+
+    Only a one-node pilot with a matching numeric job ID may use this result.
+    Failure is bounded and falls back conservatively in the caller.
+    """
+    job_id = str(environ.get('SLURM_JOB_ID', ''))
+    if not re.fullmatch(r'[0-9]+(?:_[0-9]+)?', job_id):
+        return None
+    try:
+        result = subprocess.run(['scontrol', 'show', 'job', job_id, '-o'],
+                                capture_output=True, text=True, check=True,
+                                timeout=5, env=environ)
+        fields = dict(word.split('=', 1) for word in result.stdout.split() if '=' in word)
+        if fields.get('JobId') != job_id or fields.get('NumNodes') != '1':
+            return None
+        granted_cpus = float(fields['NumCPUs'])
+        if not math.isfinite(granted_cpus) or granted_cpus < cpu_count:
+            return None
+        per_cpu = parse_slurm_memory_mb(fields.get('MinMemoryCPU'))
+        per_node = parse_slurm_memory_mb(fields.get('MinMemoryNode'))
+        if per_cpu is not None and per_node is None:
+            return per_cpu * cpu_count
+        if per_node is not None and per_cpu is None:
+            return per_node
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        pass
+    return None
+
+
+def get_slurm_memory_limit_mb(cpu_count, environ=None, allocation_lookup=None):
     """Return the memory granted to this Slurm allocation, when advertised."""
     env = os.environ if environ is None else environ
     per_node = parse_slurm_memory_mb(env.get('SLURM_MEM_PER_NODE'))
-    if per_node is not None:
-        return per_node
     per_cpu = parse_slurm_memory_mb(env.get('SLURM_MEM_PER_CPU'))
     if per_cpu is None:
-        return None
+        return per_node
     try:
         advertised_cpu = max(0.0, float(cpu_count))
     except (TypeError, ValueError):
-        return None
+        return per_node
     if not math.isfinite(advertised_cpu) or advertised_cpu <= 0.0:
-        return None
-    return per_cpu * advertised_cpu
+        return per_node
+    cpu_limit = per_cpu * advertised_cpu
+    if per_node is None or per_node == cpu_limit:
+        return cpu_limit
+    # Nested sbatch can retain the parent's opposite memory-mode variable.
+    # Never choose the larger limit from conflicting environment values alone.
+    lookup = allocation_lookup or _slurm_allocation_memory_mb
+    resolved = lookup(advertised_cpu, env)
+    if resolved is not None:
+        return resolved
+    return min(per_node, cpu_limit)
 
 
 def compute_engine_memory_capacity_mb(
