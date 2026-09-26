@@ -312,9 +312,8 @@ def _host_aliases():
 def resolve_instance_name(instance=None):
     names = get_instance_names()
     if instance:
-        if instance in names:
-            return instance        
-    # No instance provided: prefer env var; else single discovered instance    
+        return instance if instance in names else None
+    # Only an omitted name may select the sole discovered instance.
     if len(names) == 1:
         return names[0]
     return None

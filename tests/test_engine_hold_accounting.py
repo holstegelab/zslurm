@@ -294,6 +294,25 @@ class EngineHoldAccountingTests(unittest.TestCase):
             [row[0] for row in manager.queued_engines_detail], ["123_1"]
         )
 
+    def test_pending_array_siblings_keep_distinct_capacity_and_cancel_targets(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        # Spider returns the shared base JobID for unmaterialized array tasks.
+        rows = [f"123|123|{task}|test-instance|5-00:00:00|PD||normal|60|(null)|30|Priority"
+                for task in range(18)]
+        # Name and exact-ID selectors may return the same allocation twice.
+        output = ("\n".join(rows + rows) + "\n").encode()
+        with mock.patch.object(z, "Popen", return_value=fake_process(stdout=output)):
+            manager._check_cluster_engines()
+        self.assertEqual(manager.cluster_queued_engines, 18)
+        self.assertEqual(len(manager.queued_engine_capacity_by_cid), 18)
+        self.assertEqual(set(manager.engine_by_clusterid), {f"123_{i}" for i in range(18)})
+        for cid, engine in manager.engine_by_clusterid.items():
+            self.assertEqual(engine.slurm_job_id, cid)
+        with mock.patch.object(z, "Popen", return_value=fake_process()) as popen:
+            self.assertTrue(manager.cancel_cid("123_7", unregister_after=False))
+        self.assertEqual(popen.call_args.args[0], ["scancel", "123_7"])
+
     def test_registered_pilot_is_observed_by_id_when_slurm_name_has_suffix(self):
         z = self.zslurm
         manager = z.EngineManager()

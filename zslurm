@@ -4570,12 +4570,15 @@ class EngineManager(object):
             )
 
         # A manager-named registered pilot is returned by both selectors.  The
-        # instantiated Slurm job id is stable and therefore a safe union key.
+        # Pending array siblings can share the raw JobID (their array base).
+        # Use ArrayJobID + ArrayTaskID when present, not raw JobID alone.
         output = []
         seen_slurm_job_ids = set()
         for line in output_lines:
             fields = line.split("|")
-            slurm_job_id = fields[0].strip() if fields else ""
+            task = fields[2].strip() if len(fields) > 2 else ""
+            slurm_job_id = (f"{fields[1].strip()}_{task}"
+                            if task and task != "N/A" else fields[0].strip())
             if slurm_job_id in seen_slurm_job_ids:
                 continue
             seen_slurm_job_ids.add(slurm_job_id)
@@ -4639,7 +4642,10 @@ class EngineManager(object):
                     self.engine_by_clusterid[cid] = engine
                 engine.slurm_partition = cpartition
                 engine.slurm_state = cstate
-                engine.slurm_job_id = str(slurm_job_id or "").strip() or cid
+                raw_id = str(slurm_job_id or "").strip()
+                # Never use the shared array base as a single-pilot cancel/
+                # hold/query target. Materialized unique job IDs remain valid.
+                engine.slurm_job_id = cid if raw_id == jid_raw and task and task != "N/A" else (raw_id or cid)
                 expected_cores, expected_mem_mb = _autogrow_engine_capacity(
                     cpartition, cnumcpus
                 )
