@@ -20,9 +20,10 @@ Subcommands:
   lifo     on|off                                                        depth-first/LIFO toggle
   context  N                                                             greedy memory window (>=1)
   autogrow on|off [--max-nodes N]                                        autoscale + node cap
-  prioritize   PATTERN [--yes]                                           move matching jobs first
-  deprioritize PATTERN [--yes]                                           move matching jobs last
-  match    PATTERN                                                       dry-run: list matching jobs (read)
+  prioritize   PATTERN [--yes]                                           move matching name/folder first
+  deprioritize PATTERN [--yes]                                           move matching name/folder last
+  priority-override list|set|clear ...                                   active cwd priority rules
+  match    PATTERN                                                       dry-run: match name or cwd (read)
   whatif   [--active GB --dcache GB --archive GB]                        budget what-if (read)
   status                                                                 get_status_json (read)
   handover-from OLD --yes                                                explicitly take over OLD into this instance
@@ -107,15 +108,21 @@ def main():
     sp.add_argument("state", choices=["on", "off"], nargs="?", default=None)
     sp.add_argument("--max-nodes", dest="max_nodes", type=int, default=None)
 
-    sp = sub.add_parser("prioritize", help="move jobs whose name contains PATTERN to run first")
+    sp = sub.add_parser("prioritize", help="move jobs matching a name or cwd folder to run first")
     sp.add_argument("pattern")
     sp.add_argument("--yes", action="store_true", help="confirm even if many jobs match")
 
-    sp = sub.add_parser("deprioritize", help="move jobs whose name contains PATTERN to run last")
+    sp = sub.add_parser("deprioritize", help="move jobs matching a name or cwd folder to run last")
     sp.add_argument("pattern")
     sp.add_argument("--yes", action="store_true", help="confirm even if many jobs match")
 
-    sp = sub.add_parser("match", help="dry-run: list jobs whose name contains PATTERN (read)")
+    sp = sub.add_parser("priority-override", help="manage active cwd priority overrides")
+    sp.add_argument("action", choices=["list", "set", "clear"])
+    sp.add_argument("pattern", nargs="?", help="folder component/path (required for set/clear)")
+    sp.add_argument("priority", nargs="?", type=int, help="numeric priority (required for set)")
+    sp.add_argument("--yes", action="store_true", help="confirm even if many active jobs match")
+
+    sp = sub.add_parser("match", help="dry-run: list jobs matching a name or cwd folder (read)")
     sp.add_argument("pattern")
 
     sp = sub.add_parser("whatif", help="what-if: budget-eligible pending jobs at proposed totals (read)")
@@ -168,6 +175,53 @@ def main():
             print(json.dumps({"ok": True, "pattern": args.pattern, "matched": len(rows),
                               "jobs": rows}, indent=2, sort_keys=True))
             sys.exit(0)
+
+        if args.cmd == "priority-override":
+            if args.action == "list":
+                if args.pattern is not None or args.priority is not None:
+                    sys.stderr.write(
+                        "zscontrol: priority-override list takes no pattern or priority\n"
+                    )
+                    sys.exit(3)
+                _finish(proxy.list_cwd_priority_overrides())
+
+            if not args.pattern:
+                sys.stderr.write(
+                    f"zscontrol: priority-override {args.action} needs a folder pattern\n"
+                )
+                sys.exit(3)
+
+            if args.action == "clear":
+                if args.priority is not None:
+                    sys.stderr.write(
+                        "zscontrol: priority-override clear takes no priority\n"
+                    )
+                    sys.exit(3)
+                _finish(proxy.clear_cwd_priority_override(token, args.pattern))
+
+            if args.priority is None:
+                sys.stderr.write(
+                    "zscontrol: priority-override set needs a numeric priority\n"
+                )
+                sys.exit(3)
+            matched = proxy.match_jobs(args.pattern, True)
+            n = len(matched)
+            if n > PATTERN_CONFIRM_THRESHOLD and not args.yes:
+                sys.stderr.write(
+                    f"zscontrol: folder '{args.pattern}' matches {n} active jobs "
+                    f"(> {PATTERN_CONFIRM_THRESHOLD}); re-run with --yes to confirm\n"
+                )
+                print(json.dumps({
+                    "ok": False,
+                    "code": 3,
+                    "error": "too many matches; pass --yes",
+                    "pattern": args.pattern,
+                    "matched": n,
+                }, indent=2))
+                sys.exit(3)
+            _finish(proxy.set_cwd_priority_override(
+                token, args.pattern, args.priority
+            ))
 
         if args.cmd == "whatif":
             _finish(proxy.whatif_budget(args.active, args.dcache, args.archive))

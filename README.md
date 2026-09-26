@@ -32,22 +32,44 @@ spool directory. `ZSLURM_ENGINE_LAUNCHER`, `ZSLURM_CHIEF_PATH`,
 `ZSLURM_ENGINE_PYTHON`, and `ZSLURM_ENGINE_ENV_BIN` remain explicit overrides
 for relocated or deliberately split installations.
 
-Site templates are available under `config/sites/`:
+Check the installed manager and pilot binaries before starting an instance:
 
 ```bash
-mkdir -p ~/.zslurm
-cp config/sites/spider.yaml ~/.zslurm/config.yaml    # on Spider
-# or: cp config/sites/snellius.yaml ~/.zslurm/config.yaml
+zslurm --version
+zslurm_chief --version
 ```
 
-Review autogrow and storage limits before starting the manager. The Spider
-template deliberately leaves autogrow disabled.
+The manager reports its version in its health response and each chief's
+version in `zsnodes --json`. At registration it warns in `cluster.log` and
+the UI if a chief reports a different version or no version at all. A new
+chief also warns when connected to an older manager without versioned
+registration. These warnings do not stop pilots; replace old pilots during a
+planned drain. Bump both `VERSION` in `zslurm_version.py` and the package
+version in `setup.py` when deploying changed manager or chief code; a test
+requires them to match.
 
-ZSlurm also supports the original Spider layout where `~/.zslurm` itself is
-a YAML configuration file. In that case the legacy file remains the active
-configuration and per-instance/runtime state is written to `~/.zslurm.d/`.
-Merge the relevant values from `config/sites/spider.yaml` into the existing
-file; do not replace it with a directory.
+On Spider, preview and add missing site settings without overwriting existing
+values or comments:
+
+```bash
+zslurm --update-config spider --dry-run
+zslurm --update-config spider
+```
+
+The command uses `~/.zslurm/config.yaml`, or the legacy `~/.zslurm` YAML file
+when present. It makes a timestamped backup before changing an existing file,
+keeps existing values even when they differ from the template, and reports
+those key names without printing their values. Review conflicts manually;
+rerunning the command will not override them. It does not restart or reconfigure
+a running manager. The Spider template enables autogrow with a cap of 15
+partial 30-core compute pilots on the next manager start, so review those
+settings first.
+
+Site templates remain available under `config/sites/` for manual review. For
+Snellius, copy or merge `config/sites/snellius.yaml` into
+`~/.zslurm/config.yaml` as appropriate. In the original Spider layout where
+`~/.zslurm` itself is a YAML file, it remains the active configuration and
+per-instance/runtime state is written to `~/.zslurm.d/`.
 
 The environment file includes the base runtime dependencies for ZSlurm,
 including `pyyaml` and `tabulate`, plus `setuptools` as an explicit build
@@ -99,8 +121,10 @@ Inside the `zslurm` curses UI:
 - **`c`**: Stop Slurm engines
 - **`a`**: Toggle automatic consolidation of engines
 - **`o`**: Phase out engines by node name so they stop accepting new jobs
-- **`p`**: Prioritize jobs whose job names match a pattern
-- **`n`**: Deprioritize jobs whose job names match a pattern
+- **`p`**: One-time prioritize jobs whose name or working-directory component matches a pattern
+- **`n`**: One-time deprioritize jobs whose name or working-directory component matches a pattern
+- **`P`**: Set an active numeric priority override for a working-directory pattern
+- **`N`**: Clear an active working-directory priority override
 - **`l`**: Toggle last-in/first-out job preference
 - **`1`**: Set archive staging quota
 - **`2`**: Set active storage quota
@@ -152,6 +176,27 @@ The memory-aware packer may reorder jobs only within the same numeric priority
 band. FIFO remains the default tie-breaker; compute LIFO, when enabled, reverses
 order only within a band. Manual prioritize or deprioritize similarly adjusts
 the legacy order within a numeric band, not across pipeline priorities.
+
+The one-time `p`/`n` selectors match either a job name or a complete working
+directory component. For example, `FUS1` matches jobs submitted from
+`.../exome_runs/FUS1` and its subdirectories, but not `FUS10`.
+
+Use an active cwd override when a pipeline must move across numeric priority
+bands and stay there as it submits more work. In the UI, `P` asks for the
+folder selector and priority; the default is one above the highest current
+effective priority. `N` removes the exact selector and restores each affected
+job's submitted priority (or another still-matching override). Existing
+waiting jobs change immediately, future matching submissions inherit the
+override, and running jobs are never preempted. Later overlapping rules win.
+The rules are runtime manager state and are carried through an explicit live
+handover.
+
+The same controls are available non-interactively:
+
+    zscontrol --instance zslurm_fcn41_ui match FUS1
+    zscontrol --instance zslurm_fcn41_ui priority-override set FUS1 101 --yes
+    zscontrol --instance zslurm_fcn41_ui priority-override list
+    zscontrol --instance zslurm_fcn41_ui priority-override clear FUS1
 
 ### Memory-aware filling
 
@@ -528,9 +573,10 @@ default_partition: normal
 staging_partition: __disabled__
 staging_autogrow_enable: false
 enable_feature_prompt: false
+enable_ssd_prompt: true
 ssd_feature_name: ssd
 scratch_use_tmpdir: true
-scratch_capacity_gb_per_core: 100
+scratch_capacity_gb_per_core: 73
 gpfs_io_enable: false
 default_engine_cores: 30
 autogrow_engine_cores: 30
@@ -545,8 +591,8 @@ node_profiles:
   normal:
     cores: 30
     mem_gb: 240
-autogrow_enable: false
-autogrow_max_compute_nodes: 0
+autogrow_enable: true
+autogrow_max_compute_nodes: 15
 maintenance_window_enable: false
 ```
 
@@ -562,7 +608,15 @@ attempt, exports it
 as `ZSLURM_SCRATCH_DIR`, points the standard temp variables there, and removes
 only that directory when the child ends. A per-core capacity cap prevents
 multiple partial pilots on one node from each advertising the complete 12-TiB
-device. The actual filesystem free space remains an additional hard bound.
+device. The supplied 73-GiB/core cap stays below Spider's documented
+80-decimal-GB/core entitlement; a 30-core pilot advertises at most 2190 GiB.
+The actual filesystem free space remains an additional hard bound.
+
+Manual pilot creation asks whether SSD scratch should be reserved. Enter or
+`yes` supplies `--constraint=ssd`; `no` omits it. Spider currently exposes the
+`ssd` feature on all normal nodes, so this is explicit without narrowing the
+current normal-node pool. Compute autogrow starts enabled and is capped at 15
+running-plus-queued pilots (at most 450 requested cores at the 30-core ceiling).
 
 Spider has no physical `staging` partition and its project filesystem is
 CephFS. The supplied site file therefore disables staging autogrow and GPFS
@@ -1338,7 +1392,8 @@ the interface design and phasing.
 - **`zscontrol`**: a control plane mirroring the TUI keys. Reads (no token): `status`,
   `whatif`, `match`, `forecast` (will a planned DAG fit the budgets?), `jobs`,
   `autogrow-plan`. Gated writes (require `enable_control_rpc` + `control_token`): `budget`,
-  `transfer-slots`, `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`, `recompute-inuse`,
+  `transfer-slots`, `lifo`, `context`, `autogrow`, `prioritize`/`deprioritize`,
+  `priority-override`, `recompute-inuse`,
   `grow`/`shrink`, and `handover-from OLD --yes`.
 - **`--json`** on `zsqueue` and `zsnodes` emits numeric, schema-versioned rows;
   `zsqueue_stats`/`zsoccupancy`/`zsstats` already have `--json`. Exit-code contract across
@@ -1348,7 +1403,9 @@ the interface design and phasing.
   set in `~/.zslurm/config.yaml` or via the `--enable-control`/`--control-token` flags):
   `ping`/`health`, `get_status_json`, `match_jobs`, `whatif_budget`, `forecast_budget`,
   `list_jobs_detailed`, `get_autogrow_plan`, `set_budgets`, `set_transfer_limits`, `set_scheduler_mode`,
-  `set_autogrow`, `prioritize`/`deprioritize`, `recompute_inuse_from_running`,
+  `set_autogrow`, `prioritize`/`deprioritize`, `list_cwd_priority_overrides`,
+  `set_cwd_priority_override`, `clear_cwd_priority_override`,
+  `recompute_inuse_from_running`,
   `grow`/`shrink`. `submit_job` accepts optional `idempotency_key` and `priority`
   arguments for retry-safe, priority-aware submission.
 
@@ -1367,12 +1424,13 @@ work while startup is deferred, and retries even when those grants leave zero
 unreserved cores. Actual memory headroom is rechecked before spawn. A cancelled
 waiting start releases its local holding and cannot launch later.
 
-The existing manager protocol labels a granted job `RUNNING` before spawning;
-therefore a deferred start remains `RUNNING` with zero measured usage. Its chief
-log reports `START DEFERRED`, the error and the next retry delay. No new manager
-RPC or manager restart is needed. Invalid commands still fail the individual
-job. This mechanism cannot rescue a computation that has already started and
-then fails while writing its own output files.
+The manager first returns a grant as `ASSIGNED`; the chief acknowledges it
+before retaining it as a deferred `RUNNING` start with zero measured usage. Its
+log reports `START DEFERRED`, the error and the next retry delay. The existing
+`can_run_assigned_job` RPC is idempotent, so a lost acknowledgement response can
+be retried safely. Invalid commands still fail the individual job. This
+mechanism cannot rescue a computation that has already started and then fails
+while writing its own output files.
 
 Chief diagnostic write/flush errors are best-effort so a full Slurm log cannot
 kill coordination. This does not suppress errors writing child-job outputs.

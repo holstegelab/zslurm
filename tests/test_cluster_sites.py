@@ -4,6 +4,8 @@ import pathlib
 import unittest
 from unittest import mock
 
+import yaml
+
 
 ZSLURM_PATH = pathlib.Path(__file__).resolve().parents[1] / "zslurm"
 
@@ -28,7 +30,7 @@ class ClusterSiteTests(unittest.TestCase):
 
         self.assertEqual(defaults["default_partition"], "normal")
         self.assertEqual(defaults["staging_partition"], "__disabled__")
-        self.assertFalse(defaults["enable_ssd_prompt"])
+        self.assertTrue(defaults["enable_ssd_prompt"])
         self.assertFalse(defaults["enable_feature_prompt"])
         self.assertFalse(defaults["gpfs_io_enable"])
         self.assertEqual(defaults["default_engine_cores"], 30)
@@ -45,8 +47,20 @@ class ClusterSiteTests(unittest.TestCase):
             defaults["node_profiles"]["normal"],
             {"cores": 30, "mem_gb": 240},
         )
-        self.assertFalse(defaults["autogrow_enable"])
+        self.assertTrue(defaults["autogrow_enable"])
+        self.assertEqual(defaults["autogrow_max_compute_nodes"], 15)
         self.assertFalse(defaults["maintenance_window_enable"])
+
+    def test_spider_site_file_enables_bounded_ssd_autogrow(self):
+        path = pathlib.Path(__file__).resolve().parents[1] / "config/sites/spider.yaml"
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(config["enable_ssd_prompt"])
+        self.assertEqual(config["ssd_feature_name"], "ssd")
+        self.assertTrue(config["scratch_use_tmpdir"])
+        self.assertEqual(config["scratch_capacity_gb_per_core"], 73)
+        self.assertTrue(config["autogrow_enable"])
+        self.assertEqual(config["autogrow_max_compute_nodes"], 15)
 
     def test_snellius_defaults_preserve_exclusive_engines(self):
         defaults = self.zslurm._cluster_defaults(

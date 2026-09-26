@@ -1,5 +1,5 @@
-# Spider pilot defaults. Copy to ~/.zslurm/config.yaml and review the engine
-# cap before enabling autogrow.
+# Spider pilot defaults. Copy or merge into ~/.zslurm/config.yaml and review
+# the enabled engine cap before starting the manager.
 cluster_site: spider
 default_partition: normal
 # Spider has no physical staging partition. Archive-source workflows require a
@@ -7,18 +7,20 @@ default_partition: normal
 # compute pilots.
 staging_partition: __disabled__
 staging_autogrow_enable: false
-enable_ssd_prompt: false
-# All normal nodes expose local XFS through TMPDIR; do not ask Spider users for
-# an arbitrary Slurm feature when starting a manual pilot.
+enable_ssd_prompt: true
+# All normal nodes expose local XFS through TMPDIR. The dedicated SSD prompt
+# maps an affirmative answer to --constraint=ssd; suppress the arbitrary
+# free-form feature prompt on Spider.
 enable_feature_prompt: false
 ssd_feature_name: ssd
 # Spider's Slurm allocation binds node-local XFS to TMPDIR=/tmp. This is
 # intentionally opt-in so a Snellius pilot never mistakes ordinary /tmp for
 # schedulable scratch.
 scratch_use_tmpdir: true
-# Local XFS is shared by partial pilots on a node. A conservative 100 GiB/core
-# cap prevents every pilot from advertising the entire 12-TiB device.
-scratch_capacity_gb_per_core: 100
+# Spider grants 80 decimal GB of scratch per requested core, or about 74.5 GiB.
+# Advertise 73 GiB/core to retain a small margin while scaling with dynamic
+# 2-30-core partial pilots (2190 GiB for a 30-core pilot).
+scratch_capacity_gb_per_core: 73
 # Spider project storage is CephFS; Snellius GPFS RDMA counters are not a
 # meaningful I/O signal here.
 gpfs_io_enable: false
@@ -45,8 +47,8 @@ autogrow_prefer_partitions:
 autogrow_fallback_partition: normal
 autogrow_fat_partitions: []
 
-# Start capacity deliberately with `d` or `zscontrol grow`; only enable this
-# after choosing a project-appropriate node cap.
-autogrow_enable: false
-autogrow_max_compute_nodes: 0
+# Autogrow is demand-backed and counts running plus queued compute pilots
+# against this cap. At the 30-core ceiling, 15 pilots request at most 450 cores.
+autogrow_enable: true
+autogrow_max_compute_nodes: 15
 maintenance_window_enable: false

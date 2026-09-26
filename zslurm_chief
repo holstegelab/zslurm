@@ -14,9 +14,14 @@ import math
 import re
 import tempfile
 import zslurm_shared
+from zslurm_version import VERSION
 import zslurm_lease
 from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts
 import socket
+
+if "--version" in sys.argv[1:]:
+    print(f"zslurm_chief {VERSION}")
+    sys.exit(0)
 
 sys.stdout = BestEffortDiagnosticStream(sys.stdout)
 sys.stderr = BestEffortDiagnosticStream(sys.stderr)
@@ -987,10 +992,29 @@ def manager_supports_method(proxy, method_name):
         return False
 
 
+_warned_legacy_manager = False
+
+
+def register_with_manager(proxy, *registration_args):
+    """Send the chief version when supported without breaking old managers."""
+    global _warned_legacy_manager
+    if manager_supports_method(proxy, "register_versioned"):
+        return proxy.register_versioned(*(registration_args + (VERSION,)))
+    if not _warned_legacy_manager:
+        sys.stderr.write(
+            f"WARNING: this zslurm_chief is {VERSION}, but the manager does "
+            "not support versioned registration. Check that both use the "
+            "same ZSlurm installation.\n"
+        )
+        sys.stderr.flush()
+        _warned_legacy_manager = True
+    return proxy.register(*registration_args)
+
+
 def register_at_manager(manager_uri):
     proxy = zslurm_shared.TimeoutServerProxy(
         str(manager_uri), timeout=REQUEST_TIMEOUT, allow_none=True)
-    engine_id = proxy.register(
+    engine_id = register_with_manager(proxy,
         myip,
         e_ncpu,
         e_memtot_buffer,
@@ -1053,7 +1077,7 @@ while attempt > 0 :
             s.failed_node(myip, partition, clusterid)
             sys.exit()
         else:
-            myid = s.register(
+            myid = register_with_manager(s,
                 myip,
                 e_ncpu,
                 e_memtot_buffer,
@@ -1626,11 +1650,14 @@ try :
                         continue
                     if state == 'ASSIGNED':
                         if status.current_cpu >= ncpu and min(status.current_mem, mb_memory_available) >= mem:
-                            status.assigned_jobs.pop(jobid, None)
+                            # Retain the grant until the acknowledgement reply
+                            # arrives. A lost reply can then be retried safely.
+                            status.assigned_jobs[jobid] = job
                             try:
                                 permission = s.can_run_assigned_job(myid, jobid)
                             except MANAGER_RPC_ERRORS:
                                 continue
+                            status.assigned_jobs.pop(jobid, None)
                             if not permission:
                                 continue
                             job = tuple(job[:-1]) + ('RUNNING',)
@@ -1789,7 +1816,7 @@ try :
             elif (cmd == zslurm_shared.REREGISTER):
                 print(('[%s] Received command to reregister.' % myid))
                 try:
-                    myid = s.register(
+                    myid = register_with_manager(s,
                         myip,
                         e_ncpu,
                         e_memtot_buffer,
