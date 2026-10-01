@@ -105,7 +105,8 @@ if args.limit_threads >= 1:
     env["VECLIB_MAXIMUM_THREADS"] = t
     env["NUMEXPR_NUM_THREADS"] = t
 
-#parse time format
+# Parse Slurm-style durations, but submit SECONDS to the manager RPC. The
+# old minute value made a 48-hour request look like 48 minutes to dispatch.
 try:
     atime = args.time.split('-')
 
@@ -119,25 +120,32 @@ try:
         raise RuntimeError
     
     atime = atime.split(':')
-    if len(atime) == 3:
+    if len(args.time.split('-')) == 2:
+        if not 1 <= len(atime) <= 3:
+            raise ValueError('invalid day-time duration')
         hours = int(atime[0])
-        atime = atime[1:]
-    else:
+        minutes = int(atime[1]) if len(atime) >= 2 else 0
+        seconds = int(atime[2]) if len(atime) == 3 else 0
+    elif len(atime) == 3:
+        hours = int(atime[0])
+        minutes = int(atime[1])
+        seconds = int(atime[2])
+    elif len(atime) in (1, 2):
         hours = 0
-
-    minutes = int(atime[0])
-    if len(atime) == 2:
-        seconds = int(atime[1])
-    elif len(atime) == 1:
-        seconds = 0
+        minutes = int(atime[0])
+        seconds = int(atime[1]) if len(atime) == 2 else 0
     else:
-        raise RuntimeError
-    
-    reqtime = days * 24 * 60 + hours * 60 + minutes + (seconds > 0)
+        raise ValueError('invalid time duration')
+    if min(days, hours, minutes, seconds) < 0 or seconds >= 60:
+        raise ValueError('invalid duration components')
+    if (len(args.time.split('-')) == 2 or len(atime) == 3) and minutes >= 60:
+        raise ValueError('minutes must be below 60 in an hour-time duration')
+    reqtime = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+    if reqtime <= 0:
+        raise ValueError('positive time duration required')
 
-except: 
-    print('zsbatch: error: Incorrect time format: %s' % args.time)
-    raise
+except (ValueError, RuntimeError):
+    parser.error('Incorrect time format: %s' % args.time)
 
 job_name = args.job_name
 
