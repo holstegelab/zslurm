@@ -148,6 +148,19 @@ class HandoverSnapshotTests(unittest.TestCase):
             z.engines.engine_by_clusterid["12345"].instance, "source"
         )
         self.assertEqual(z.status.handover_expected_cluster_ids, {"12345"})
+        evidence = z.status.handover_import_job_evidence
+        self.assertEqual(evidence['handover_id'], 'handover-1')
+        self.assertEqual(evidence['source_instance'], 'source')
+        self.assertEqual(evidence['source_uuid'], 'source-uuid')
+        self.assertEqual(evidence['target_instance'], 'target')
+        self.assertEqual(evidence['jobs'], [
+            {'jobid':'1','name':'job-1','state':'RUNNING'},
+            {'jobid':'2','name':'job-2','state':'PENDING'},
+        ])
+        # Later queue mutations must not change this transaction's membership.
+        z.jobs.jobs_by_id['1'].state = 'COMPLETED'
+        self.assertEqual(evidence['jobs'][0]['state'], 'RUNNING')
+        self.assertNotIn('env', evidence['jobs'][0])
 
     def test_committed_source_poll_only_retries_migration(self):
         z = self.zslurm
@@ -234,6 +247,46 @@ class HandoverSnapshotTests(unittest.TestCase):
         self.assertEqual(
             z.engines.engine_by_id[engine_id].instance, "old-instance"
         )
+
+    def test_abort_clears_import_membership(self):
+        z = self.zslurm
+        z.status.handover_mode = 'TARGET_IMPORTED'
+        z.status.handover_import_job_evidence = {'handover_id':'previous'}
+        result = z.abort_received_handover(z.status.handover_secret, 'previous')
+        self.assertTrue(result['ok'])
+        self.assertIsNone(z.status.handover_import_job_evidence)
+
+    def test_target_never_attaches_cached_membership_of_another_transaction(self):
+        z = self.zslurm
+        z.status.instance_name = 'target'
+        z.status.handover_import_job_evidence = {'handover_id':'previous'}
+        proxy = mock.Mock()
+        proxy.handover_to.return_value = dict(ok=True, handover_id='current')
+        with mock.patch.object(z.zslurm_shared, 'get_instance_config',
+                               return_value={'handover_secret':'test-secret'}), \
+                mock.patch.object(z.zslurm_shared, 'get_job_url', return_value='http://test'), \
+                mock.patch.object(z.zslurm_shared, 'TimeoutServerProxy', return_value=proxy), \
+                mock.patch.object(z, '_manager_descriptor', return_value={}):
+            result = z.initiate_handover('source')
+        self.assertNotIn('source_job_evidence', result)
+
+    def test_large_queue_atomic_membership_retains_every_id(self):
+        z = self.zslurm
+        for i in range(10000):
+            self.add_job(str(i), ['RUNNING','ASSIGNED','PENDING','REQUEUED'][i % 4], 0)
+        with mock.patch.object(z, '_manager_descriptor', return_value={
+                'instance':'source', 'manager_uuid':'source-uuid'}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=['source']):
+            snapshot = z._build_handover_snapshot('large-transfer', {'manager_uuid':'target-uuid'})
+        z.status.instance_name = 'target'
+        z.status.manager_uuid = 'target-uuid'
+        z._apply_handover_snapshot(snapshot)
+        evidence = z.status.handover_import_job_evidence
+        self.assertEqual(len(evidence['jobs']), 10000)
+        self.assertEqual({r['jobid'] for r in evidence['jobs']}, {str(i) for i in range(10000)})
+        self.assertEqual(evidence['source_uuid'], 'source-uuid')
+        self.assertEqual(evidence['target_uuid'], 'target-uuid')
+        self.assertEqual(evidence['jobs'][1]['state'], 'PENDING')
 
 
 class HeadlessHandoverIntegrationTests(unittest.TestCase):
@@ -380,6 +433,13 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
         self.assertEqual(result["source_instance"], source_name)
         self.assertEqual(result["target_instance"], target_name)
         self.assertEqual(result["chiefs"], 1)
+        evidence = result['source_job_evidence']
+        self.assertEqual(evidence['handover_id'], result['handover_id'])
+        self.assertEqual(evidence['source_uuid'], source_config['manager_uuid'])
+        self.assertEqual(evidence['target_uuid'], target_config['manager_uuid'])
+        self.assertEqual(evidence['jobs'], [
+            {'jobid': jobid, 'name':'handover-job', 'state':'PENDING'},
+        ])
         self.assertEqual(target.list_jobs()[0][0], jobid)
         self.assertEqual(target.health()["handover_mode"], "TARGET_MIGRATING")
 

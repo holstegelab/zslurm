@@ -460,6 +460,7 @@ class Status(object):
         self.handover_secret = secrets.token_urlsafe(32)
         self.handover_mode = "ACTIVE"
         self.handover_source_instance = None
+        self.handover_import_job_evidence = None
         self.handover_target = None
         self.handover_preserve_engines = False
         self.handover_saved_autogrow = None
@@ -6009,6 +6010,22 @@ def _apply_handover_snapshot(snapshot):
     for data in snapshot.get('jobs', []) or []:
         job = _job_from_handover(data)
         jobs.jobs_by_id[str(job.jobid)] = job
+    # Public, immutable membership from the lock-protected source snapshot.
+    # A pre-handover list_jobs observation can race with new submissions or
+    # completions; it cannot attest to the set that was actually imported.
+    source = snapshot.get('source', {}) or {}
+    status.handover_import_job_evidence = {
+        'schema_version': 1,
+        'handover_id': str(snapshot.get('handover_id', '')),
+        'source_instance': source.get('instance'),
+        'source_uuid': source.get('manager_uuid'),
+        'target_instance': status.instance_name,
+        'target_uuid': status.manager_uuid,
+        'jobs': [
+            {'jobid': str(job.jobid), 'name': job.job_name, 'state': job.state}
+            for job in jobs.jobs_by_id.values()
+        ],
+    }
     jobs.finished_jobs_by_owner = {}
     for owner_record in snapshot.get('finished_jobs', []) or []:
         owner = owner_record.get('owner')
@@ -6194,6 +6211,7 @@ def abort_received_handover(secret, handover_id):
     engines = EngineManager()
     status.handover_mode = 'ACTIVE'
     status.handover_source_instance = None
+    status.handover_import_job_evidence = None
     status.handover_owned_aliases = set()
     status.handover_expected_cluster_ids = set()
     status.handover_registered_cluster_ids = set()
@@ -6372,9 +6390,15 @@ def initiate_handover(old_instance):
         source_proxy = zslurm_shared.TimeoutServerProxy(
             zslurm_shared.get_job_url(instance=old_name),
             timeout=300, allow_none=True)
-        return source_proxy.handover_to(
+        result = source_proxy.handover_to(
             str(old_secret), _manager_descriptor(
                 status.instance_name, include_secret=True))
+        evidence = getattr(status, 'handover_import_job_evidence', None)
+        if (isinstance(result, dict) and result.get('ok')
+                and isinstance(evidence, dict)
+                and evidence.get('handover_id') == result.get('handover_id')):
+            result['source_job_evidence'] = copy.deepcopy(evidence)
+        return result
     except Exception as error:
         return {'ok': False, 'code': 2,
                 'error': f"could not contact old instance {old_name}: {error}"}
