@@ -4682,7 +4682,10 @@ class EngineManager(object):
                         f"Engine {engine.engine_id} @ {engine.cluster_id} is managed again after {engine.observed_hits} observations.",
                         CYAN,
                     )
-                if cstate == "R":
+                if cstate in {"R", "PD"}:
+                    # For queued pilots this is the planned allocation limit.
+                    # Treating a one-day request as the five-day default can
+                    # mask long-job demand just as much as an expiring pilot.
                     engine.timeleft = parse_timeleft(ctime)
 
                 try:
@@ -5076,6 +5079,8 @@ class EngineManager(object):
                         )
                         self.engine_by_clusterid[cid].slurm_state = "PENDING"
                         started_engines.append(self.engine_by_clusterid[cid])
+                for engine in started_engines:
+                    engine.timeleft = parse_timeleft(str(stime))
                 time.sleep(3)
                 set_status_message(gb, "SLURM engines queued", GREEN)
                 add_log_line(gb, str(n) + " SLURM engines queued", MAGENTA)
@@ -6469,8 +6474,57 @@ def _autogrow_requested_engine_cores(
     return min(maximum, max(minimum, needed_cpu, memory_cores))
 
 
-def compute_autogrow_plan(all_engines, partition):    
+def _autogrow_runtime_residual(eligible, capacities, walltime_buffer):
+    """Lower bounds on demand restricted to sufficiently long-lived pilots.
+
+    Each duration prefix must fit in capacity with at least that much runtime.
+    A descending event sweep avoids scanning the whole fleet for every job or
+    counting the same demand twice. It supplements CPU/RAM/SSD accounting;
+    actual assignment still performs the full individual placement checks.
+    Capacity tuples are (seconds, free CPU, free MB, has SSD, is queued).
+    Keep the existing running-capacity tolerance, but do not inflate queued
+    allocations or SSD-only capacity.
+    """
+    def residual(pending, fleet, running_margin):
+        groups = defaultdict(lambda: [0.0, 0.0])
+        for job in pending:
+            cutoff = float(job.reqtime) + walltime_buffer
+            groups[cutoff][0] += float(job.ncpu)
+            groups[cutoff][1] += float(job.mem)
+        supply = sorted(fleet, key=lambda c: c[0], reverse=True)
+        index = 0
+        free_cpu = free_mem = demand_cpu = demand_mem = 0.0
+        need_cpu = need_mem = 0.0
+        for cutoff, (cpu, mem) in sorted(groups.items(), reverse=True):
+            demand_cpu += cpu
+            demand_mem += mem
+            while index < len(supply) and supply[index][0] >= cutoff:
+                _, cpu, mem, _, is_queued = supply[index]
+                margin = 1.0 if is_queued else running_margin
+                free_cpu += cpu * margin
+                free_mem += mem * margin
+                index += 1
+            need_cpu = max(need_cpu, demand_cpu - free_cpu)
+            need_mem = max(need_mem, demand_mem - free_mem)
+        return need_cpu, need_mem
+
+    cpu, mem = residual(eligible, capacities, 1.1)
+    ssd_cpu, ssd_mem = residual(
+        [j for j in eligible
+         if str(getattr(j, 'ssd_use', 'no') or 'no') == 'required'],
+        [c for c in capacities if c[3]], 1.0,
+    )
+    return dict(cpu=cpu, mem_mb=mem, ssd_cpu=ssd_cpu, ssd_mem_mb=ssd_mem)
+
+
+def compute_autogrow_plan(all_engines, partition):
     eligible = []
+    unserviceable = []
+    walltime_buffer = float(status.config.get(
+        'job_walltime_buffer_sec',
+        getattr(status, 'job_walltime_buffer_sec', 900.0),
+    ))
+    fresh_runtime = parse_timeleft(status.autogrow_runtime_default)
     download_available = max(
         0.0, jobs.dcache_download_total - jobs.dcache_download_inuse
     )
@@ -6493,11 +6547,23 @@ def compute_autogrow_plan(all_engines, partition):
                 s3_download_available
             )
         ):
+            # A fresh default pilot cannot run these jobs. Keep them pending,
+            # and do not let them consume this plan's transfer-slot budget.
+            if float(j.reqtime) + walltime_buffer > fresh_runtime:
+                unserviceable.append(j)
+                continue
             eligible.append(j)
             download_need, upload_need = jobs._dcache_slot_needs(j)
             download_available -= download_need
             upload_available -= upload_need
             s3_download_available -= jobs._s3_download_slot_need(j)
+
+    if not eligible and unserviceable:
+        return dict(
+            has_eligible=False, eligible_n=0, plan_nodes=0, best_nodes=0,
+            unserviceable_runtime_n=len(unserviceable),
+            plan_reason='pending job walltime exceeds the default fresh pilot runtime; no usable growth',
+        )
 
     unique_part = list(set([part_name for part_name,_ in status.autogrow_prefer_partitions]))
     fallback_part = str(getattr(status, 'autogrow_fallback_partition', '') or '')
@@ -6525,6 +6591,25 @@ def compute_autogrow_plan(all_engines, partition):
 
     queued_detail_counts = defaultdict(int)
     queued_capacity = getattr(engines, 'queued_engine_capacity_by_cid', {}) or {}
+    runtime_capacity = []
+    now = time.time()
+    for engine in all_engines:
+        if engine.partition != partition or getattr(engine, 'stopping', False):
+            continue
+        if (getattr(engine, 'cluster_id', None) not in (None, False)
+                and not getattr(engine, 'managed', True)):
+            continue
+        remaining = float(getattr(engine, 'timeleft', fresh_runtime))
+        if getattr(engine, 'status', '') == PHASING_OUT:
+            remaining = min(remaining, phaseout_backfill_window(engine, now))
+        runtime_capacity.append((
+            remaining,
+            max(0.0, float(getattr(engine, 'cores', 0.0))
+                - float(getattr(engine, 'res_cpu_reserved', 0.0))),
+            max(0.0, float(getattr(engine, 'totmem', 0.0))
+                - float(getattr(engine, 'res_mem_reserved_mb', 0.0))),
+            bool(getattr(engine, 'has_ssd', False)), False,
+        ))
     for detail in list(getattr(engines, 'queued_engines_detail', []) or []):
         try:
             cid, part_name, _age, _scratch = detail
@@ -6543,6 +6628,12 @@ def compute_autogrow_plan(all_engines, partition):
             queued_mem_mb = float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
         queue_cpu_cap += max(0.0, queued_cores)
         queue_mem_cap_mb += max(0.0, queued_mem_mb)
+        queued_engine = (getattr(engines, 'engine_by_clusterid', {}) or {}).get(str(cid))
+        remaining = float(getattr(queued_engine, 'timeleft', fresh_runtime))
+        runtime_capacity.append((
+            remaining, max(0.0, queued_cores), max(0.0, queued_mem_mb),
+            bool(_scratch), True,
+        ))
 
     # Preserve compatibility with old snapshots or transient squeue rows that do
     # not yet expose per-allocation capacity: only those unmatched allocations use
@@ -6559,6 +6650,12 @@ def compute_autogrow_plan(all_engines, partition):
         queue_mem_cap_mb += (
             unmatched * float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
         )
+        # Old snapshots expose counts only. Preserve their existing capacity
+        # credit at the configured future runtime rather than inventing an age.
+        runtime_capacity.extend((
+            fresh_runtime, float(prof.get('cores', 0.0) or 0.0),
+            float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0, False, True,
+        ) for _ in range(unmatched))
 
         
     fat_partitions = list(getattr(status, 'autogrow_fat_partitions', []) or [])
@@ -6645,6 +6742,13 @@ def compute_autogrow_plan(all_engines, partition):
     #The 1.1 is to not overgrow the cluster too much and have to shrink it too soon.
     required_cpu = max(0.0, pend_cpu - free_cpu_total * 1.1 - queue_cpu_cap)
     required_mem_mb = max(0.0, pend_mem_mb - free_mem_total_mb * 1.1 - queue_mem_cap_mb)
+    runtime_residual = _autogrow_runtime_residual(
+        eligible, runtime_capacity, walltime_buffer,
+    )
+    required_cpu = max(required_cpu, runtime_residual['cpu'])
+    required_mem_mb = max(required_mem_mb, runtime_residual['mem_mb'])
+    ssd_required_cpu = max(ssd_required_cpu, runtime_residual['ssd_cpu'])
+    ssd_required_mem_mb = max(ssd_required_mem_mb, runtime_residual['ssd_mem_mb'])
 
     # Memory-per-core pressure for info only
     avail_mpc = ((tot_mem_cap_mb + queue_mem_cap_mb) / 1024.0) / max(1.0, (tot_cpu_cap + queue_cpu_cap))
@@ -6676,6 +6780,8 @@ def compute_autogrow_plan(all_engines, partition):
             'required_mpc': required_mpc,
             'raw_best_nodes': 0.0,
             'fat_cap_applied': False,
+            'runtime_residual': runtime_residual,
+            'unserviceable_runtime_n': len(unserviceable),
         }
 
     try:
@@ -6792,6 +6898,8 @@ def compute_autogrow_plan(all_engines, partition):
                 'required_mpc': required_mpc,
                 'raw_best_nodes': 0.0,
                 'fat_cap_applied': False,
+                'runtime_residual': runtime_residual,
+                'unserviceable_runtime_n': len(unserviceable),
                 'plan_reason': 'ssd-preferred: non-SSD engine cap reached, waiting for scratch capacity',
             }
 
@@ -6816,6 +6924,8 @@ def compute_autogrow_plan(all_engines, partition):
             'required_mpc': required_mpc,
             'raw_best_nodes': 0.0,
             'fat_cap_applied': False,
+            'runtime_residual': runtime_residual,
+            'unserviceable_runtime_n': len(unserviceable),
             'plan_reason': 'no idle nodes in any preferred partition',
         }
 
@@ -6868,6 +6978,8 @@ def compute_autogrow_plan(all_engines, partition):
         'required_mpc': required_mpc,
         'raw_best_nodes': raw_best_nodes,
         'fat_cap_applied': fat_cap_applied,
+        'runtime_residual': runtime_residual,
+        'unserviceable_runtime_n': len(unserviceable),
         'plan_reason': (
             'submitted to Slurm queue despite zero fully idle nodes'
             if best_idle <= 0 else None

@@ -174,6 +174,7 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         self.assertEqual(
             manager.queued_engine_capacity_by_cid["411"], (2.0, 14628.0)
         )
+        self.assertEqual(manager.engine_by_clusterid["411"].timeleft, 86400)
 
     def test_start_slurm_uses_partial_core_request_and_placeholder_capacity(self):
         z = self.zslurm
@@ -195,6 +196,7 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].cores, 2.0)
         self.assertEqual(started[0].totmem, 14628.0)
+        self.assertEqual(started[0].timeleft, 86400)
         self.assertNotIn('SLURM_MEM_PER_NODE', popen.call_args.kwargs['env'])
         self.assertNotIn('SLURM_MEM_PER_CPU', popen.call_args.kwargs['env'])
 
