@@ -5430,8 +5430,15 @@ class EngineManager(object):
                 if cluster_jobid not in (None, "", False):
                     self.engine_by_clusterid[cluster_jobid] = e
 
+            # A live registration is a heartbeat, especially for a late chief
+            # reusing an imported placeholder.  Its source-side timestamp may
+            # already be older than TIMEOUT; never cancel it between this
+            # registration and its first poll.  Keep intentional stop fences.
+            e.lastseen = time.time()
             self.engine_by_id[myid] = e
-            if myid == zslurm_shared.short_name(status.address) or cluster_jobid == "":
+            # Spider may place a partial Slurm pilot on the manager's host.
+            # Allocation identity, not hostname equality, determines locality.
+            if cluster_jobid in (None, "", False):
                 e.cluster_id = False
             else:
                 e.cluster_id = cluster_jobid

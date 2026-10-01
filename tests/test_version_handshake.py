@@ -6,8 +6,10 @@ import pathlib
 import subprocess
 import sys
 import threading
+import time
 import types
 import unittest
+from unittest import mock
 
 from zslurm_version import VERSION
 
@@ -83,6 +85,84 @@ class VersionHandshakeTests(unittest.TestCase):
         log = self.manager.gb.log_file.getvalue()
         self.assertIn("chief version 0.1.0 differs", log)
         self.assertIn(f"manager version {VERSION}", log)
+
+    def test_slurm_worker_on_manager_host_is_not_a_local_engine(self):
+        for hostname, cluster_id in (
+            ("wn-dc-14.spider.surfsara.nl", "41383005_4"),
+            ("gcn42.snellius.surf.nl", "123456"),
+        ):
+            with self.subTest(hostname=hostname):
+                self.manager.engines = self.manager.EngineManager()
+                self.manager.status.address = hostname
+                engine_id = self.manager.engines.register(
+                    hostname, 30, 240000, "compute", cluster_id, 0, 0,
+                    "original-instance", VERSION,
+                )
+                engine = self.manager.engines.engine_by_id[engine_id]
+                self.assertEqual(engine.cluster_id, cluster_id)
+                self.assertIs(
+                    self.manager.engines.engine_by_clusterid[cluster_id], engine
+                )
+                self.assertTrue(engine.managed)
+                self.assertEqual(engine.instance, "original-instance")
+
+    def test_locality_depends_on_absent_allocation_not_hostname(self):
+        for cluster_id in (None, "", False):
+            with self.subTest(cluster_id=cluster_id):
+                self.manager.engines = self.manager.EngineManager()
+                engine_id = self.manager.engines.register(
+                    "different-host", 2, 16000, "compute", cluster_id,
+                    0, 0, "test", VERSION,
+                )
+                self.assertIs(
+                    self.manager.engines.engine_by_id[engine_id].cluster_id,
+                    False,
+                )
+                self.assertFalse(self.manager.engines.engine_by_clusterid)
+
+    def test_late_migration_registration_refreshes_heartbeat_without_losing_state(self):
+        z = self.manager
+        z.status.handover_mode = "TARGET_MIGRATING"
+        engine = z.Engine(
+            "node1", 30, 240000, "compute", cluster_id="41383005_2",
+            managed=True,
+        )
+        engine.lastseen = time.time() - z.TIMEOUT - 100
+        engine.jobs = {"running-job"}
+        engine.res_cpu_reserved = 8.0
+        engine.res_mem_reserved_mb = 24000.0
+        engine.res_ssd_reserved_gb = 7.0
+        engine.pending_commands = [("existing-command", None)]
+        z.engines.engine_by_clusterid[engine.cluster_id] = engine
+        z.engines.last_observed_cids = {engine.cluster_id}
+        before = time.time()
+
+        engine_id = z.engines.register(
+            "node1", 30, 240000, "compute", "41383005_2", 100, 10,
+            "original-instance", VERSION,
+        )
+
+        self.assertIs(z.engines.engine_by_id[engine_id], engine)
+        with mock.patch.object(z.engines, "cancel_cid") as cancel:
+            self.assertFalse(z.engines.reconcile_timed_out_engine(engine, True))
+        cancel.assert_not_called()
+        self.assertGreaterEqual(engine.lastseen, before)
+        self.assertEqual(engine.jobs, {"running-job"})
+        self.assertEqual(engine.res_cpu_reserved, 8.0)
+        self.assertEqual(engine.res_mem_reserved_mb, 24000.0)
+        self.assertEqual(engine.res_ssd_reserved_gb, 7.0)
+        self.assertEqual(engine.pending_commands, [("existing-command", None)])
+
+    def test_registration_does_not_remove_an_existing_stop_fence(self):
+        z = self.manager
+        engine = z.Engine(
+            "node1", 30, 240000, "compute", cluster_id="123", managed=True,
+        )
+        engine.stopping = True
+        z.engines.engine_by_clusterid["123"] = engine
+        engine_id = self.register(VERSION)
+        self.assertIs(z.engines.engine_by_id[engine_id], engine)
+        self.assertTrue(engine.stopping)
 
     def test_new_chief_uses_versioned_registration(self):
         namespace = load_chief_registration()
