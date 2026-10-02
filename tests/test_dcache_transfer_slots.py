@@ -124,7 +124,9 @@ class DcacheTransferSlotTests(unittest.TestCase):
 
     def test_assigned_job_releases_slot_when_engine_disappears(self):
         transfer = self.add_job("transfer", 1)
-        assigned = self.jobs.request_jobs("test-node", 0, 0, "compute")
+        # The test is about releasing an existing grant, not overassigning a
+        # task when the pilot has no free CPU or memory.
+        assigned = self.jobs.request_jobs("test-node", 1, 100, "compute")
 
         self.assertEqual(len(assigned), 1)
         self.assertEqual(transfer.state, "ASSIGNED")

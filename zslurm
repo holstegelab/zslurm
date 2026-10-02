@@ -3035,6 +3035,13 @@ class JobManager(object):
                 profile_regret_cache[cache_key] = regret
                 return regret
 
+            def _fits_free_capacity(job):
+                # Do not preclaim a job that fits the pilot's total resources
+                # but cannot start in its currently free slot. Such a grant
+                # can wait for hours behind long-running jobs and hide both
+                # backlog and fitting backfill from other pilots/autogrowth.
+                return job.ncpu <= current_cpu and job.mem <= current_mem
+
             def eligible(job):
                 if job.partition != partition:
                     return False
@@ -3059,6 +3066,8 @@ class JobManager(object):
                 if job.ncpu > cores:
                     return False
                 if job.mem > totmem:
+                    return False
+                if job.state != 'ASSIGNED' and not _fits_free_capacity(job):
                     return False
                 if not _ssd_ok(job, e):
                     return False
@@ -3123,7 +3132,7 @@ class JobManager(object):
                                 or job_candidate.archive_start_use_add == 0
                             )
                             and self._dcache_transfer_fits_locked(job_candidate)
-                        ) and _ssd_ok(job_candidate, e):
+                        ) and _ssd_ok(job_candidate, e) and _fits_free_capacity(job_candidate):
                             # Pipeline priority is strict. Memory/CPU packing
                             # optimizes only within the same priority band.
                             try:
@@ -3194,6 +3203,7 @@ class JobManager(object):
                     )
                     and self._dcache_transfer_fits_locked(job)
                     and _ssd_ok(job, e)
+                    and _fits_free_capacity(job)
                 ):
 
                     self.active_inuse += job.active_start_use_add
@@ -3240,6 +3250,8 @@ class JobManager(object):
                         if not self._dcache_transfer_fits_locked(job):
                             continue
                         if not _ssd_ok(job, e):
+                            continue
+                        if not _fits_free_capacity(job):
                             continue
                         new_queued.append(job)
                     queued = new_queued
