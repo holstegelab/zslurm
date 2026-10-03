@@ -5409,21 +5409,25 @@ class EngineManager(object):
         try:
             myid = zslurm_shared.short_name(myip)
 
-            myx = myid
-            counter = 1
-            while myx in self.engine_by_id:
-                counter += 1
-                myx = f"{myid}-{counter}"
-            myid = myx
-
             prev = self.engine_by_clusterid.get(cluster_jobid, None) if cluster_jobid not in (None, "", False) else None
-            if (
-                prev is not None
-                and getattr(prev, 'engine_id', None) in self.engine_by_id
-                and self.engine_by_id.get(prev.engine_id) is prev
-            ):
-                # Idempotent re-registration after a lost migration response.
+            if prev is not None and getattr(prev, 'engine_id', None) not in (None, '', '?'):
+                # Running jobs retain this ID across handover. Chiefs on the
+                # same hostname may migrate in any order; never swap their
+                # imported names, including before either chief registers.
                 myid = prev.engine_id
+            else:
+                reserved_ids = set(self.engine_by_id)
+                reserved_ids.update(
+                    engine.engine_id
+                    for engine in self.engine_by_clusterid.values()
+                    if engine is not None and getattr(engine, 'engine_id', None) not in (None, '', '?')
+                )
+                myx = myid
+                counter = 1
+                while myx in reserved_ids:
+                    counter += 1
+                    myx = f"{myid}-{counter}"
+                myid = myx
             if prev is not None:
                 # Reuse placeholder to preserve managed/observed state
                 e = prev
@@ -5939,7 +5943,12 @@ def _build_handover_snapshot(
             continue
         record = copy.deepcopy(getattr(engine, '__dict__', {}))
         record['cluster_id'] = cluster_id
-        record['jobs'] = list(getattr(engine, 'jobs', set()) or set())
+        # Engine.jobs contains Job objects, not RPC-safe IDs. Do not serialize
+        # their repr strings or carry stale/requeued membership into a target.
+        record['jobs'] = [
+            str(job.jobid) for job in jobs.jobs_by_id.values()
+            if job.state == 'RUNNING' and job.node_id == engine.engine_id
+        ]
         record['pending_commands'] = list(
             getattr(engine, 'pending_commands', []) or [])
         engine_records.append(_rpc_safe(record))
@@ -6096,7 +6105,26 @@ def _apply_handover_snapshot(snapshot):
             record.get('instance')
             or (snapshot.get('source', {}) or {}).get('instance')
             or status.handover_source_instance)
-        engine.jobs = set(record.get('jobs', []) or [])
+        # The job table is authoritative, including when importing a legacy
+        # snapshot whose engine jobs were object repr strings. Rebind canonical
+        # objects and reconstruct actual held leases rather than perpetuating
+        # stale counters. ASSIGNED jobs were returned to PENDING above.
+        engine.jobs = {
+            job for job in jobs.jobs_by_id.values()
+            if job.state == 'RUNNING' and job.node_id == engine.engine_id
+        }
+        engine.res_cpu_reserved = sum(
+            float(getattr(job, 'held_ncpu', job.ncpu))
+            for job in engine.jobs
+        )
+        engine.res_mem_reserved_mb = sum(
+            float(getattr(job, 'held_mem', job.mem))
+            for job in engine.jobs
+        )
+        engine.res_ssd_reserved_gb = sum(
+            float(getattr(job, 'ssd_alloc_gb', 0.0) or 0.0)
+            for job in engine.jobs
+        )
         engine.pending_commands = [
             tuple(command) for command in record.get('pending_commands', []) or []
         ]
