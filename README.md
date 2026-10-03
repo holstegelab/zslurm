@@ -896,6 +896,16 @@ budgets, leases, dependencies, scheduler settings, and Slurm-engine records. The
 old instance name is atomically changed into an alias for the new endpoint, and
 running chiefs reconnect without stopping their child processes.
 
+The manager bounds new grants by the smaller of the chief's reported free
+resources and the engine's actual remaining CPU/memory reservations. Running
+jobs count their current mutable leases, not immutable maxima; unacknowledged
+`ASSIGNED` grants already count at their initial shape. A lost grant reply
+replays the same engine's existing grants before assigning new work, without
+claiming their resources twice. Start acknowledgements and lease growth check
+the same holdings. This protects Spider and Snellius pilots when an older
+chief has stale free counters. A pre-existing overbooked pilot keeps its live
+children, but receives no additional work until its holdings fit again.
+
 The target must not contain jobs or engines, and a source with a local/unmanaged
 engine is rejected. Both managers must run a version that supports explicit
 handover. The equivalent gated control command is:

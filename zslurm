@@ -2852,6 +2852,31 @@ class JobManager(object):
 
         return jobs
 
+    def _engine_headroom_locked(self, nodeid, *, exclude_jobid=None):
+        """Actual lease/grant headroom, independent of a chief's free counters.
+
+        RUNNING leases may be smaller than immutable job maxima. ASSIGNED
+        grants hold their full initial shape even before start acknowledgement.
+        The canonical job table also survives handover and lost RPC replies.
+        Caller holds the job lock; do not mutate resource telemetry here.
+        """
+        engine = engines.engine_by_id.get(nodeid)
+        if engine is None:
+            return float('inf'), float('inf')
+        used_cpu = used_mem = 0.0
+        for key, job in self.jobs_by_id.items():
+            if (str(key) == str(exclude_jobid) or job.node_id != nodeid
+                    or job.state not in ('RUNNING', 'ASSIGNED')):
+                continue
+            if job.state == 'RUNNING':
+                used_cpu += float(getattr(job, 'held_ncpu', job.ncpu))
+                used_mem += float(getattr(job, 'held_mem', job.mem))
+            else:
+                used_cpu += float(job.ncpu)
+                used_mem += float(job.mem)
+        return (max(0.0, float(getattr(engine, 'cores', float('inf'))) - used_cpu),
+                max(0.0, float(getattr(engine, 'totmem', float('inf'))) - used_mem))
+
     def request_jobs(self, myid, current_cpu, current_mem, partition):
         phaseout_window = None
         phaseout_backfill_min_age = 0.0
@@ -2922,6 +2947,22 @@ class JobManager(object):
         try:
             queued = []
             assigned = []
+            # A lost grant reply leaves ASSIGNED jobs on this engine. Replay
+            # those exact holdings before considering new work; never let a
+            # later request claim their slots again or deassign them to itself.
+            own_assigned = [j for j in self.jobs_by_id.values()
+                            if j.state == 'ASSIGNED' and j.node_id == myid]
+            try:
+                current_cpu, current_mem = float(current_cpu), float(current_mem)
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(current_cpu) or not math.isfinite(current_mem):
+                return []
+            free_cpu, free_mem = self._engine_headroom_locked(myid)
+            current_cpu = max(0.0, min(free_cpu,
+                current_cpu - sum(float(j.ncpu) for j in own_assigned)))
+            current_mem = max(0.0, min(free_mem,
+                current_mem - sum(float(j.mem) for j in own_assigned)))
 
             jobs_view = self._jobs_in_priority_order(
                 lastin_first=(status.lastin_first and partition != 'archive')
@@ -3045,6 +3086,8 @@ class JobManager(object):
             def eligible(job):
                 if job.partition != partition:
                     return False
+                if job.state == 'ASSIGNED' and job.node_id == myid:
+                    return False  # Own grants are replayed, not reallocated.
                 if (
                     job.state != 'ASSIGNED'
                     and not self._dependency_allows_run_locked(job)
@@ -3085,6 +3128,14 @@ class JobManager(object):
                         return False
                 return True
 
+
+            for job in own_assigned:
+                if (job.partition == partition
+                        and job.reqtime + walltime_buffer <= timeleft
+                        and job.ncpu <= cores and job.mem <= totmem
+                        and _ssd_ok(job, e)):
+                    allres.append((job.jobid, job.job_name, job.command, job.cwd,
+                                   job.env, job.ncpu, job.mem, job.state))
 
             while len(queued) < (status.prio_fillmem_context + float(current_cpu)):
                 try: 
@@ -3380,7 +3431,11 @@ class JobManager(object):
                         if has_ssd and need > 0.0 and free_ssd < need:
                             ssd_ok = False
 
-                    if ssd_ok:
+                    free_cpu, free_mem = self._engine_headroom_locked(
+                        nodeid, exclude_jobid=jobid)
+                    capacity_ok = (getattr(job, 'ncpu', 0) <= free_cpu
+                                   and getattr(job, 'mem', 0) <= free_mem)
+                    if ssd_ok and capacity_ok:
                         self.job_start(nodeid, jobid)
                         res = True
                     else:
@@ -3496,9 +3551,13 @@ class JobManager(object):
             future_mem_mb = (
                 float(engine.res_mem_reserved_mb) - old_mem_mb + target_mem_mb
             )
+            free_cpu, free_mem = self._engine_headroom_locked(
+                nodeid, exclude_jobid=key)
             if (
                 future_cpu > float(engine.cores) + 1e-9
                 or future_mem_mb > float(engine.totmem) + 1e-9
+                or target_cpu > free_cpu + 1e-9
+                or target_mem_mb > free_mem + 1e-9
             ):
                 return {
                     'ok': False,

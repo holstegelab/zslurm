@@ -42,6 +42,101 @@ class CurrentCapacityTests(unittest.TestCase):
     def request(self, cpu, mem):
         return self.jobs.request_jobs(self.node.engine_id, cpu, mem, 'compute')
 
+    def running(self, jobid, cpu=8, mem=24000):
+        job = self.add_job(jobid, cpu=cpu, mem=mem)
+        job.assigned(self.node.engine_id)
+        self.assertTrue(self.jobs.can_run_assigned_job(self.node.engine_id, jobid))
+        self.z.engines.job_running(self.node.engine_id, job)
+        return job
+
+    def test_native_stale_chief_capacity_cannot_grant_fourth_eight_core_job(self):
+        for i in range(3):
+            self.running('running'+str(i))
+        pending = self.add_job('pending', slots=1)
+        self.assertEqual(self.request(14, 172708), [])
+        self.assertEqual(pending.state, 'PENDING')
+        self.assertEqual(self.jobs.dcache_download_inuse, 0)
+        self.assertEqual(self.node.res_cpu_reserved, 24)
+
+    def test_stale_chief_can_only_backfill_actual_remaining_capacity(self):
+        for i in range(3):
+            self.running('running'+str(i))
+        self.add_job('small', cpu=2, mem=1000)
+        too_large = self.add_job('large', cpu=8, mem=1000, priority=1000)
+        self.assertEqual([r[0] for r in self.request(14, 172708)], ['small'])
+        self.assertEqual(too_large.state, 'PENDING')
+
+    def test_legacy_overbooked_pilot_receives_no_additional_grant(self):
+        for i in range(4):
+            job = self.add_job('running'+str(i))
+            job.started(self.node.engine_id)
+            self.z.engines.job_running(self.node.engine_id, job)
+        self.node.res_cpu_reserved = 32
+        self.node.res_mem_reserved_mb = 96000
+        pending = self.add_job('pending', cpu=2, mem=8000)
+        self.assertEqual(self.request(6, 148708), [])
+        self.assertEqual(pending.state, 'PENDING')
+
+    def test_authoritative_memory_holding_caps_stale_chief_report(self):
+        self.node.totmem = 64000
+        self.running('running', cpu=2, mem=60000)
+        pending = self.add_job('pending', cpu=2, mem=8000)
+        self.assertEqual(self.request(28, 64000), [])
+        self.assertEqual(pending.state, 'PENDING')
+
+    def test_pending_grants_count_before_any_start_acknowledgement(self):
+        for i in range(4):
+            self.add_job(str(i))
+        first = self.request(30, 220708)
+        replay = self.request(30, 220708)
+        self.assertEqual(replay, first)
+        self.assertEqual(self.jobs.jobs_by_id['3'].state, 'PENDING')
+        self.assertEqual(sum(r[5] for r in replay), 24)
+
+    def test_own_grant_replay_does_not_compete_with_new_jobs_for_same_slot(self):
+        self.running('running', cpu=28, mem=1000)
+        self.add_job('first', cpu=2, mem=1000, slots=1)
+        initial = self.request(2, 1000)
+        other = self.add_job('other', cpu=2, mem=1000, priority=1000)
+        self.assertEqual(self.request(2, 1000), initial)
+        self.assertEqual(other.state, 'PENDING')
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+
+    def test_released_dynamic_lease_not_immutable_maximum_defines_headroom(self):
+        job = self.running('running', cpu=24, mem=60000)
+        resized = self.jobs.resize_running_job(self.node.engine_id, job.jobid, 2, 1000)
+        self.assertTrue(resized['ok'])
+        self.add_job('pending', cpu=24, mem=60000)
+        self.assertEqual([r[0] for r in self.request(28, 219708)], ['pending'])
+
+    def test_start_acknowledgement_rejects_unsafe_legacy_assignment_without_restart(self):
+        for i in range(3):
+            self.running('running'+str(i))
+        pending = self.add_job('pending', slots=1)
+        pending.assigned(self.node.engine_id)
+        self.jobs._reserve_dcache_transfer_locked(pending)
+        self.assertFalse(self.jobs.can_run_assigned_job(self.node.engine_id, pending.jobid))
+        self.assertEqual(pending.state, 'PENDING')
+        self.assertIsNone(pending.node_id)
+        self.assertEqual(self.node.res_cpu_reserved, 24)
+        self.assertEqual(self.jobs.dcache_download_inuse, 0)
+
+    def test_resize_cannot_steal_capacity_from_an_unacknowledged_grant(self):
+        job = self.running('running', cpu=24, mem=60000)
+        self.assertTrue(self.jobs.resize_running_job(self.node.engine_id, job.jobid, 2, 1000)['ok'])
+        self.add_job('pending', cpu=24, mem=60000)
+        self.assertEqual([r[0] for r in self.request(28, 219708)], ['pending'])
+        result = self.jobs.resize_running_job(self.node.engine_id, job.jobid, 24, 60000)
+        self.assertFalse(result['ok'])
+        self.assertEqual(job.held_ncpu, 2)
+
+    def test_snellius_headroom_uses_existing_holding_and_fractional_grants(self):
+        self.node.cores, self.node.totmem = 192, 336*1024
+        self.running('running', cpu=160, mem=300000)
+        self.add_job('small', cpu=22.75, mem=40000)
+        self.add_job('large', cpu=40, mem=1000, priority=1000)
+        self.assertEqual([r[0] for r in self.request(192, 336*1024)], ['small'])
+
     def test_eight_core_job_remains_unclaimed_with_only_six_free_cores(self):
         job = self.add_job('1', slots=1)
         self.assertEqual(self.request(6, 148708), [])
