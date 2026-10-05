@@ -3603,7 +3603,7 @@ class JobManager(object):
             )
             job.started(node_id)
             self._eligible_cache_ts = 0.0
-            e = engines.engine_by_id.get(node_id, None)
+            e = engines.job_lease_engine(node_id)
             if e is not None:
                 e.res_cpu_reserved += float(job.held_ncpu)
                 e.res_mem_reserved_mb += float(job.held_mem)
@@ -3637,7 +3637,7 @@ class JobManager(object):
                         self.active_inuse -= job.active_start_use_add
                         self.archive_inuse -= job.archive_start_use_add
                         self.dcache_inuse -= job.dcache_start_use_add
-                    e = engines.engine_by_id.get(job.node_id, None)
+                    e = engines.job_lease_engine(job.node_id)
                     if e is not None:
                         e.res_cpu_reserved -= float(
                             getattr(job, 'held_ncpu', job.ncpu)
@@ -4528,13 +4528,32 @@ class EngineManager(object):
                 )
             return msg
 
+    def job_lease_engine(self, eid):
+        """Account callbacks before an imported chief has registered.
+
+        Placeholders stay out of engine_by_id, so the scheduler cannot dispatch
+        work to an unregistered chief. A forwarded start/completion may arrive
+        first, however; its existing lease belongs to the uniquely identified
+        imported placeholder and must not be leaked or silently unreserved.
+        """
+        engine = self.engine_by_id.get(eid)
+        if engine is not None:
+            return engine
+        if (not eid or eid == '?' or getattr(status, 'handover_mode', '') not in
+                ('TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE')):
+            return None
+        expected = set(getattr(status, 'handover_expected_cluster_ids', set()) or set())
+        matches = [item for cid, item in list(self.engine_by_clusterid.items())
+                   if str(cid) in expected and item.engine_id == eid]
+        return matches[0] if len(matches) == 1 else None
+
     def job_running(self, eid, job):
-        engine = self.engine_by_id.get(eid, None)
+        engine = self.job_lease_engine(eid)
         if engine:
             engine.jobs.add(job)
 
     def job_stopped(self, eid, job):
-        engine = self.engine_by_id.get(eid, None)
+        engine = self.job_lease_engine(eid)
         if engine:
             engine.jobs.discard(job)
 

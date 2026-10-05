@@ -196,6 +196,64 @@ class HandoverSnapshotTests(unittest.TestCase):
         self.assertEqual(imported.res_mem_reserved_mb, 0)
         self.assertEqual(imported.res_ssd_reserved_gb, 0)
 
+    def imported_callback_placeholder(self, state='RUNNING'):
+        z = self.zslurm
+        job = self.add_job('early-callback', state, 0)
+        job.ssd_alloc_gb = 3.5 if state == 'RUNNING' else 0
+        engine = z.Engine('node1', 30, 220708, 'compute', cluster_id='12345')
+        z.engines.engine_by_id['node1'] = engine
+        z.engines.engine_by_clusterid['12345'] = engine
+        with mock.patch.object(z, '_manager_descriptor', return_value={}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot('early-callback-transfer', {})
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z._apply_handover_snapshot(snapshot)
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        self.assertFalse(z.engines.engine_by_id)  # Not schedulable before chief registration.
+        return z.engines.engine_by_clusterid['12345'], z.jobs.jobs_by_id[job.jobid]
+
+    def test_completion_before_chief_registration_releases_imported_lease(self):
+        z = self.zslurm
+        engine, job = self.imported_callback_placeholder()
+        z.jobs.job_done(job.jobid, z.RC_SUCCESS)
+        self.assertFalse(engine.jobs)
+        self.assertEqual(engine.res_cpu_reserved, 0)
+        self.assertEqual(engine.res_mem_reserved_mb, 0)
+        self.assertEqual(engine.res_ssd_reserved_gb, 0)
+        self.assertFalse(z.engines.engine_by_id)
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', '12345', 10, 0), 'node1')
+        self.assertEqual(z.engines.list_nodes()[0][14], 0)
+        self.assertEqual(z.engines.list_nodes()[0][7], 0)
+
+    def test_start_callback_before_chief_registration_reserves_imported_lease(self):
+        z = self.zslurm
+        engine, job = self.imported_callback_placeholder('PENDING')
+        z.jobs.job_start('node1', job.jobid)
+        self.assertEqual(engine.jobs, {job})
+        self.assertEqual(engine.res_cpu_reserved, job.held_ncpu)
+        self.assertEqual(engine.res_mem_reserved_mb, job.held_mem)
+        self.assertFalse(z.engines.engine_by_id)
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', '12345', 10, 0), 'node1')
+        self.assertEqual(z.engines.list_nodes()[0][14], job.held_ncpu)
+        z.jobs.job_done(job.jobid, z.RC_SUCCESS)
+        self.assertFalse(engine.jobs)
+        self.assertEqual(engine.res_cpu_reserved, 0)
+
+    def test_placeholder_callbacks_require_exact_handover_engine_scope(self):
+        z = self.zslurm
+        engine, _ = self.imported_callback_placeholder()
+        self.assertIs(z.engines.job_lease_engine('node1'), engine)
+        self.assertIsNone(z.engines.job_lease_engine('unrelated'))
+        z.status.handover_mode = 'ACTIVE'
+        self.assertIsNone(z.engines.job_lease_engine('node1'))
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        z.status.handover_expected_cluster_ids = set()
+        self.assertIsNone(z.engines.job_lease_engine('node1'))
+        z.status.handover_expected_cluster_ids = {'12345', '54321'}
+        z.engines.engine_by_clusterid['54321'] = z.Engine('node1', 30, 220708, 'compute', cluster_id='54321')
+        self.assertIsNone(z.engines.job_lease_engine('node1'))
+
     def test_legacy_engine_object_strings_are_not_live_imported_jobs(self):
         z = self.zslurm
         running = self.add_job('1', 'RUNNING', 0)
@@ -484,6 +542,12 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
         return process
 
     def test_same_host_running_jobs_survive_rpc_handover_and_completion(self):
+        self.exercise_same_host_running_job_transfer()
+
+    def test_forwarded_completion_before_target_chief_registration_releases_lease(self):
+        self.exercise_same_host_running_job_transfer(complete_before_registration=True)
+
+    def exercise_same_host_running_job_transfer(self, complete_before_registration=False):
         self.start_manager(self.instance_prefix + '_source')
         source_name, source_config = next(iter(self.wait_for_instances(1).items()))
         source = xmlrpc.client.ServerProxy(self.url(source_config), allow_none=True)
@@ -521,14 +585,19 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
         target_worker = xmlrpc.client.ServerProxy(self.url(configs[target_name], worker=True), allow_none=True)
         result = target.handover_from('test-control-token', source_name)
         self.assertTrue(result['ok'], result)
+        if complete_before_registration:
+            # Cached chiefs can forward a completion through the old job server
+            # before either chief registers at the newly activated target.
+            worker.job_finished(engine_ids[0], assigned[0], 0, {})
         for i in (1, 0):
             self.assertEqual(target_worker.register('same-node', 4, 8000, 'compute',
                                                     allocation_ids[i], 0, 0, source_name), engine_ids[i])
         rows = {row[1]: row for row in target.list_nodes()}
-        self.assertEqual(rows[engine_ids[0]][7], 1)
-        self.assertEqual(rows[engine_ids[0]][14:16], [0.5, 500])
+        self.assertEqual(rows[engine_ids[0]][7], 0 if complete_before_registration else 1)
+        self.assertEqual(rows[engine_ids[0]][14:16], [0, 0] if complete_before_registration else [0.5, 500])
         self.assertEqual(rows[engine_ids[1]][14:16], [2, 1000])
-        target_worker.job_finished(engine_ids[0], assigned[0], 0, {})
+        if not complete_before_registration:
+            target_worker.job_finished(engine_ids[0], assigned[0], 0, {})
         rows = {row[1]: row for row in target.list_nodes()}
         self.assertEqual(rows[engine_ids[0]][7], 0)
         self.assertEqual(rows[engine_ids[0]][14:16], [0, 0])
