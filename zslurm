@@ -674,6 +674,7 @@ def _cluster_defaults(config=None):
         "autogrow_fallback_partition": "normal",
         "autogrow_fat_partitions": [],
         "maintenance_window_enable": False,
+        "autogrow_time_min_enable": False,
         "default_engine_cores": 0,
         "autogrow_engine_cores": 0,
         "autogrow_dynamic_engine_cores": False,
@@ -725,6 +726,7 @@ def _cluster_defaults(config=None):
             # nodes.  Requiring a completely IDLE node would strand runnable
             # work instead of letting Slurm queue/backfill the pilot.
             "autogrow_require_idle_nodes": False,
+            "autogrow_time_min_enable": True,
             "autogrow_engine_min_cores": 2,
             "autogrow_engine_memory_mb_per_core": 8000.0,
             "autogrow_engine_memory_headroom_fraction": 0.08,
@@ -788,6 +790,16 @@ def _apply_cluster_config(config):
         defaults["maintenance_window_enable"],
     )
     status.maintenance_time_min_sec = max(0, _cfg_int(cfg.get("maintenance_time_min_sec"), 12 * 3600))
+    status.autogrow_time_min_enable = _cfg_bool(
+        cfg.get("autogrow_time_min_enable"),
+        defaults["autogrow_time_min_enable"],
+    )
+    status.autogrow_time_min_sec = max(
+        0, _cfg_int(cfg.get("autogrow_time_min_sec"), 12 * 3600)
+    )
+    status.autogrow_time_min_headroom_sec = max(
+        60, _cfg_int(cfg.get("autogrow_time_min_headroom_sec"), 3600)
+    )
     status.default_engine_cores = max(
         0,
         _cfg_int(
@@ -5044,7 +5056,8 @@ class EngineManager(object):
             set_status_message(gb, "Local engine terminated", GREEN)
 
     # FIXME
-    def start_slurm(self, gb, n, stime, partition, constraint, cores):
+    def start_slurm(self, gb, n, stime, partition, constraint, cores,
+                    minimum_runtime_seconds=None):
         self.lock.acquire()
         started_engines = []
         try:
@@ -5054,25 +5067,27 @@ class EngineManager(object):
                 )
             else:
                 set_status_message(gb, "Starting SLURM engines", YELLOW)
-                # Ask for `stime` but let backfill shorten it to whatever fits before
-                # the next (invisible) maintenance reservation -- see the note in
-                # zslurm_shared. An engine shorter than the floor spends more on
-                # startup and drain than it returns, so below that we stay queued
-                # and the capacity simply comes back after the window.
+                # Autogrow can supply a workload-aware floor computed before
+                # taking the engine lock. Other callers retain the site's
+                # maintenance policy. An explicit floor at/above stime means
+                # no shortening, NOT fallback to a smaller legacy floor.
                 time_min = None
-                if bool(getattr(status, 'maintenance_window_enable', True)):
+                if minimum_runtime_seconds is not None:
+                    time_min = zslurm_shared.submission_time_min(
+                        stime, minimum_runtime_seconds)
+                elif bool(getattr(status, 'maintenance_window_enable', True)):
                     time_min = zslurm_shared.submission_time_min(
                         stime,
                         getattr(status, 'maintenance_time_min_sec',
                                 zslurm_shared.DEFAULT_TIME_MIN_SECONDS))
-                    if time_min:
-                        add_log_line(
-                            gb,
-                            "Requesting engine walltime %s with --time-min %s; Slurm "
-                            "truncates it to what fits before the next reservation"
-                            % (stime, time_min),
-                            YELLOW,
-                        )
+                if time_min:
+                    add_log_line(
+                        gb,
+                        "Requesting engine walltime %s with --time-min %s; Slurm "
+                        "may shorten the allocation for backfill"
+                        % (stime, time_min),
+                        YELLOW,
+                    )
                 # Build sbatch command as a list to avoid quoting issues
                 args = [
                     "sbatch", "-N", "1", "-p", str(partition),
@@ -6666,6 +6681,34 @@ def _autogrow_runtime_residual(eligible, capacities, walltime_buffer):
     return dict(cpu=cpu, mem_mb=mem, ssd_cpu=ssd_cpu, ssd_mem_mb=ssd_mem)
 
 
+def _autogrow_minimum_runtime(eligible, walltime_buffer):
+    """Useful backfill floor, not a promise that queued work will fit later.
+
+    Only runnable jobs that fit the maximum pilot runtime enter this snapshot.
+    Keep the longest request, placement margin and startup/drain headroom;
+    per-worker assignment must still check the actual remaining allocation.
+    Round up to whole minutes so Slurm cannot round below the computed floor.
+    None preserves legacy/manual site policy; even an over-maximum explicit
+    floor must reach start_slurm so it cannot revert to a shorter legacy one.
+    """
+    if not getattr(status, 'autogrow_time_min_enable', False) or not eligible:
+        return None
+    headroom = max(
+        float(status.autogrow_time_min_headroom_sec), walltime_buffer
+    )
+    floor = max(
+        float(status.autogrow_time_min_sec),
+        max(float(j.reqtime) for j in eligible) + headroom,
+    )
+    if bool(getattr(status, 'engine_drain_before_end_enable', True)):
+        drain = float(status.config.get(
+            'engine_drain_before_end_sec',
+            getattr(status, 'engine_drain_before_end_sec', 12 * 3600.0),
+        ))
+        floor = max(floor, drain + headroom)
+    return int(math.ceil(floor / 60.0)) * 60
+
+
 def compute_autogrow_plan(all_engines, partition):
     eligible = []
     unserviceable = []
@@ -7119,6 +7162,9 @@ def compute_autogrow_plan(all_engines, partition):
         'best_part': best_part,
         'best_nodes': best_nodes,
         'engine_cores': requested_engine_cores,
+        'minimum_runtime_seconds': _autogrow_minimum_runtime(
+            eligible, walltime_buffer
+        ),
 
         'needed_cpu': nodes_cpu,
         'needed_mem': nodes_mem,
@@ -7574,6 +7620,8 @@ def thread_check_commands():
                                         'engine_cores',
                                         getattr(status, 'autogrow_engine_cores', 0),
                                     ) or 0),
+                                    minimum_runtime_seconds=plan.get(
+                                        'minimum_runtime_seconds'),
                                 )
                                 status.autogrow_last_action_compute_ts = now
                                 if started:

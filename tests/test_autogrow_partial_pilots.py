@@ -199,6 +199,41 @@ class PartialPilotAutogrowTests(unittest.TestCase):
         self.assertEqual(started[0].timeleft, 86400)
         self.assertNotIn('SLURM_MEM_PER_NODE', popen.call_args.kwargs['env'])
         self.assertNotIn('SLURM_MEM_PER_CPU', popen.call_args.kwargs['env'])
+        self.assertNotIn('--time-min', command)
+
+    def test_time_min_submission_preserves_site_defaults_and_explicit_floor(self):
+        z = self.zslurm
+        z.status.instance_name = "test-instance"
+        z.status.address = "127.0.0.1"
+        z.status.port = 12345
+        for site, floor, expected, cores in (
+            ("spider", 49 * 3600, "2-01:00:00", 30),
+            ("snellius", None, "12:00:00", 0),
+            ("snellius", 49 * 3600, "2-01:00:00", 0),
+            ("snellius", 5 * 86400, None, 0),
+            ("spider", 6 * 86400, None, 30),
+        ):
+            with self.subTest(site=site, floor=floor):
+                z._apply_cluster_config({"cluster_site": site})
+                process = mock.Mock()
+                process.communicate.return_value = (b"412\n", b"")
+                manager = z.EngineManager()
+                with mock.patch.object(z, "Popen", return_value=process) as popen, \
+                        mock.patch.object(z.time, "sleep"):
+                    started = manager.start_slurm(
+                        z.gb, 2, "5-00:00:00", z.status.default_partition, "ssd",
+                        cores, minimum_runtime_seconds=floor,
+                    )
+                command = popen.call_args.args[0]
+                if expected is None:
+                    self.assertNotIn("--time-min", command)
+                else:
+                    self.assertEqual(command[command.index("--time-min") + 1], expected)
+                self.assertEqual(command[command.index("-t") + 1], "5-00:00:00")
+                self.assertIn("--array=0-1", command)
+                self.assertIn("--exclusive" if not cores else "--cpus-per-task=30", command)
+                self.assertEqual(command[command.index("--constraint") + 1], "ssd")
+                self.assertEqual(len(started), 2)
 
     def test_feature_is_opt_in_outside_spider(self):
         z = self.zslurm

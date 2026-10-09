@@ -50,6 +50,7 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertTrue(defaults["autogrow_enable"])
         self.assertEqual(defaults["autogrow_max_compute_nodes"], 15)
         self.assertFalse(defaults["maintenance_window_enable"])
+        self.assertTrue(defaults["autogrow_time_min_enable"])
 
     def test_spider_site_file_enables_bounded_ssd_autogrow(self):
         path = pathlib.Path(__file__).resolve().parents[1] / "config/sites/spider.yaml"
@@ -77,6 +78,7 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertTrue(defaults["autogrow_require_idle_nodes"])
         self.assertTrue(defaults["autogrow_enable"])
         self.assertTrue(defaults["maintenance_window_enable"])
+        self.assertFalse(defaults["autogrow_time_min_enable"])
         self.assertEqual(defaults["autogrow_max_nonssd_fraction"], 0.5)
         self.assertIn("fat_genoa", defaults["node_profiles"])
 

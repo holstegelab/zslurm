@@ -36,6 +36,9 @@ class RuntimeAutogrowTests(unittest.TestCase):
         z._apply_cluster_config({"cluster_site": "spider"})
         z.status.autogrow_runtime_default = "5-00:00:00"
         z.status.job_walltime_buffer_sec = 900.0
+        z.status.engine_drain_before_end_enable = True
+        z.status.engine_drain_before_end_sec = 12 * 3600.0
+        z.status.config = {}
         z.engines = z.EngineManager()
         self.jobs = z.JobManager()
         self.jobs.active_total = 100000
@@ -95,12 +98,73 @@ class RuntimeAutogrowTests(unittest.TestCase):
         self.assertEqual(plan["runtime_residual"]["cpu"], 2)
         self.assertEqual(plan["runtime_residual"]["mem_mb"], 8000)
 
+    def test_spider_backfill_floor_covers_longest_runnable_job(self):
+        self.add_job("caller", seconds=6 * 3600)
+        self.add_job("partition", seconds=24 * 3600)
+        self.add_job("controller", seconds=48 * 3600)
+        self.assertEqual(self.plan()["minimum_runtime_seconds"], 49 * 3600)
+
+    def test_short_work_does_not_start_inside_end_of_life_drain(self):
+        self.add_job(seconds=6 * 3600)
+        self.assertEqual(self.plan()["minimum_runtime_seconds"], 13 * 3600)
+        self.zslurm.status.config["engine_drain_before_end_sec"] = 24 * 3600
+        self.assertEqual(self.plan()["minimum_runtime_seconds"], 25 * 3600)
+
+    def test_disabled_drain_uses_useful_floor_and_configured_headroom(self):
+        z = self.zslurm
+        z._apply_cluster_config({
+            "cluster_site": "spider", "autogrow_time_min_sec": 0,
+            "autogrow_time_min_headroom_sec": 1800,
+        })
+        z.status.engine_drain_before_end_enable = False
+        self.add_job(seconds=6 * 3600 + 1)
+        self.assertEqual(self.plan()["minimum_runtime_seconds"], 6 * 3600 + 1860)
+        z.status.config["job_walltime_buffer_sec"] = 7200
+        self.assertEqual(self.plan()["minimum_runtime_seconds"], 8 * 3600 + 60)
+
+    def test_useful_minimum_can_exceed_work_and_drain(self):
+        self.zslurm._apply_cluster_config({
+            "cluster_site": "spider", "autogrow_time_min_sec": 72 * 3600,
+        })
+        self.add_job()
+        self.assertEqual(self.plan()["minimum_runtime_seconds"], 72 * 3600)
+
+    def test_blocked_and_overlong_work_do_not_inflate_backfill_floor(self):
+        self.add_job("short", seconds=6 * 3600)
+        self.add_job("overlong", seconds=6 * 86400)
+        blocked = self.add_job("blocked", seconds=4 * 86400)
+        original = self.jobs.dependency_status
+        with mock.patch.object(self.jobs, "dependency_status", side_effect=lambda j:
+                               {"state": "WAITING"} if j is blocked else original(j)):
+            plan = self.plan()
+        self.assertEqual(plan["minimum_runtime_seconds"], 13 * 3600)
+        self.assertEqual(plan["eligible_n"], 1)
+        self.assertEqual(plan["unserviceable_runtime_n"], 1)
+
+    def test_time_min_can_be_disabled_on_spider_and_opted_in_on_snellius(self):
+        z = self.zslurm
+        self.add_job()
+        for site, enabled, expected in (
+            ("spider", False, None), ("snellius", True, 49 * 3600),
+        ):
+            with self.subTest(site=site):
+                z._apply_cluster_config({
+                    "cluster_site": site, "autogrow_time_min_enable": enabled,
+                })
+                self.assertEqual(self.plan()["minimum_runtime_seconds"], expected)
+
+    def test_floor_above_requested_max_is_preserved_to_prevent_legacy_fallback(self):
+        self.zslurm.status.autogrow_runtime_default = "12:00:00"
+        self.add_job(seconds=6 * 3600)
+        self.assertEqual(self.plan()["minimum_runtime_seconds"], 13 * 3600)
+
     def test_snellius_grows_exclusive_pilot_for_same_runtime_mismatch(self):
         self.zslurm._apply_cluster_config({"cluster_site": "snellius"})
         self.add_job()
         plan = self.plan([self.pilot()])
         self.assertEqual(plan["best_nodes"], 1)
         self.assertEqual(plan["engine_cores"], 0)
+        self.assertIsNone(plan["minimum_runtime_seconds"])
 
     def test_fresh_running_capacity_prevents_growth_on_both_sites(self):
         for site in ("spider", "snellius"):

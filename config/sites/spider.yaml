@@ -52,3 +52,9 @@ autogrow_fat_partitions: []
 autogrow_enable: true
 autogrow_max_compute_nodes: 15
 maintenance_window_enable: false
+# Only demand-backed compute autogrow uses this policy. Manual/staging pilots
+# keep their existing walltime behavior. The actual minimum is at least the
+# longest runnable request and the end-of-life drain horizon, plus headroom.
+autogrow_time_min_enable: true
+autogrow_time_min_sec: 43200
+autogrow_time_min_headroom_sec: 3600

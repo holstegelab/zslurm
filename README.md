@@ -355,20 +355,35 @@ users, and `sbatch --test-only` is not a usable substitute, because it reports t
 for, and an inference built on it concludes "no maintenance" precisely when a
 window is imminent.
 
-Instead every allocation is submitted with both a maximum and a minimum walltime:
+With the Snellius maintenance policy, pilot allocations are submitted with both
+a maximum and a minimum walltime:
 
 ```text
 sbatch -t 5-00:00:00 --time-min 12:00:00 ...
 ```
 
-Slurm then starts the job in the first slot that fits and truncates `TimeLimit`
-to exactly the time available before the next reservation, so allocations are
-self-sizing and the boundary is simply `StartTime + TimeLimit` of the resulting
-job. Below `maintenance_time_min_sec` (default **12 hours**) the job stays queued
+Slurm may shorten `TimeLimit` to let the allocation backfill; this does not
+guarantee an immediate start or bypass priority. The resulting boundary is
+`StartTime + TimeLimit`. Below `maintenance_time_min_sec` (default **12 hours**)
+the job stays queued
 instead: a shorter engine spends more on startup and drain than it gives back,
 and the capacity comes back by itself once the window has passed. Autogrow
-workers, manually requested engines and the coordinator's manager node all go
-through the same path.
+workers and manually requested engines use this policy; separately submitted
+manager allocations have their own walltime settings.
+
+Spider instead enables a workload-aware floor for **compute autogrow only**.
+It uses the larger of the configured useful minimum (12 hours), the longest
+runnable request plus headroom, and the end-of-life drain horizon plus headroom.
+Headroom defaults to one hour and is never less than the job placement margin.
+With the default 12-hour drain horizon, six-hour work therefore permits a
+13-hour allocation; 48-hour work requires at least 49 hours. Dependencies that
+are not ready and jobs exceeding the maximum pilot runtime do not raise this
+floor. When the floor reaches the requested maximum, `--time-min` is omitted
+and the full duration is required. The maximum, core/memory request, scientific
+job runtimes and existing demand/cap/idle guards are unchanged. Actual job
+placement still checks remaining time, including after the queue changes.
+Manual/staging Spider pilots and Snellius defaults are unchanged; the new
+policy is separately configurable on either site.
 
 There is also separate staging/archive-oriented autogrow behavior for `staging` engines when archive jobs are waiting.
 
@@ -481,6 +496,14 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - that floor: the shortest allocation still worth having. Below it the job stays
     queued until the window has passed, instead of starting and dying immediately
     (default `43200`, i.e. 12 hours)
+- **`autogrow_time_min_enable`**
+  - workload-aware `--time-min` for compute autogrow, overriding the legacy
+    maintenance floor only on that path (default true on Spider, false elsewhere)
+- **`autogrow_time_min_sec`**
+  - minimum useful allocation before workload/drain constraints (default `43200`)
+- **`autogrow_time_min_headroom_sec`**
+  - startup/placement headroom, at least the job walltime buffer (default `3600`,
+    minimum `60`); add this to the longest runnable job and the drain horizon
 - **`job_walltime_buffer_sec`**
   - slack a job's `reqtime` must leave inside an engine's remaining walltime before
     it may start there (default `900`)
