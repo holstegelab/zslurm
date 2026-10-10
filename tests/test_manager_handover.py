@@ -93,6 +93,50 @@ class HandoverSnapshotTests(unittest.TestCase):
             z.handover_display_label("TARGET_ACTIVE"), "TAKEOVER DONE"
         )
 
+    def assert_submission_token_survives_handover(self, terminal):
+        z = self.zslurm
+        args = ('replayed-call', 'true', '/work', {}, 2, 16000, 21600, 0,
+                None, 0, 0, 0, 0, 0, 0, 'compute', 0, None, '', 'no', 0,
+                'workflow-owner', 'same-request-token', 150)
+        jobid = z.jobs.submit_job(*args)
+        if terminal:
+            job = z.jobs.jobs_by_id.pop(jobid)
+            job.state = 'COMPLETED'
+            z.jobs.finished_jobs_by_owner['workflow-owner'] = [job]
+        with mock.patch.object(z, '_manager_descriptor', return_value={
+                'instance': 'source', 'manager_uuid': 'source-uuid'}):
+            snapshot = z._build_handover_snapshot('token-transfer', {'manager_uuid': 'target-uuid'})
+        # Exercise the actual XML-RPC representation, not an in-process alias
+        # of the old manager's token dictionary.
+        snapshot = xmlrpc.client.loads(xmlrpc.client.dumps((snapshot,), allow_none=True))[0][0]
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z.status.instance_name = 'target'
+        z.status.manager_uuid = 'target-uuid'
+        z._apply_handover_snapshot(snapshot)
+        before_counter = z.jobs.jobid_counter
+        before_counts = dict(z.jobs.total_jobs)
+        self.assertEqual(z.jobs.submit_job(*args), jobid)
+        self.assertEqual(z.jobs.jobid_counter, before_counter)
+        self.assertEqual(z.jobs.total_jobs, before_counts)
+        self.assertEqual(z.jobs.seen_tokens, {'same-request-token': jobid})
+        if terminal:
+            self.assertFalse(z.jobs.jobs_by_id)
+            self.assertEqual(z.jobs.finished_jobs_by_owner['workflow-owner'][0].jobid, jobid)
+        else:
+            self.assertEqual(list(z.jobs.jobs_by_id), [jobid])
+            self.assertEqual(z.jobs.jobs_by_id[jobid].priority, 150)
+        changed = list(args)
+        changed[-2] = 'genuine-workflow-retry-token'
+        self.assertNotEqual(z.jobs.submit_job(*changed), jobid)
+        self.assertEqual(z.jobs.jobid_counter, before_counter + 1)
+
+    def test_pending_submission_replay_after_handover_is_not_duplicated(self):
+        self.assert_submission_token_survives_handover(terminal=False)
+
+    def test_completed_submission_replay_after_handover_is_not_restarted(self):
+        self.assert_submission_token_survives_handover(terminal=True)
+
     def test_snapshot_requeues_assigned_and_preserves_running_lease(self):
         z = self.zslurm
         running = self.add_job("1", "RUNNING", 20)
