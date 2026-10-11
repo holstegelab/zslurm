@@ -168,6 +168,15 @@ Running jobs are reported but left untouched; this cannot retroactively protect
 a running controller on an old chief. Tagged jobs still require a chief >=0.2.4,
 normal resources, satisfied dependencies, and sufficient allocation time.
 
+The manager RPC `cancel_job(jobid, False, expected_state)` supports exact
+compare-and-cancel for `PENDING` and `REQUEUED`. The state check and cancellation
+share the dispatch lock: a job that became assigned or running is left alone,
+without signalling a worker. A successful cancellation is terminal, including
+when retries remain. Clients must check `health()['conditional_cancel_states']`
+before using `REQUEUED`; older managers advertise only the legacy
+`conditional_pending_cancel` capability. Never fall back to unconditional
+cancellation after a rejected comparison. This behavior is site-independent.
+
 On Snellius, starting Slurm engines also offers an SSD scratch-node reservation prompt. For regular partitions, the UI asks for:
 
 - **Partition**
