@@ -34,6 +34,7 @@ import traceback
 
 import zslurm_shared
 from zslurm_version import VERSION
+from zslurm_startup import MONITOR_ROLE_ENV, controller_monitor_supported
 import atexit
 try:
     import ipyparallel
@@ -3116,6 +3117,10 @@ class JobManager(object):
             def eligible(job, check_free=True):
                 if job.partition != partition:
                     return False
+                if (isinstance(getattr(job, 'env', None), dict)
+                        and job.env.get(MONITOR_ROLE_ENV) == 'controller'
+                        and not controller_monitor_supported(getattr(e, 'chief_version', None))):
+                    return False
                 if job.state == 'ASSIGNED' and job.node_id == myid:
                     return False  # Own grants are replayed, not reallocated.
                 if (
@@ -3541,7 +3546,10 @@ class JobManager(object):
                         nodeid, exclude_jobid=jobid)
                     capacity_ok = (getattr(job, 'ncpu', 0) <= free_cpu
                                    and getattr(job, 'mem', 0) <= free_mem)
-                    if ssd_ok and capacity_ok:
+                    monitor_ok = not (isinstance(getattr(job, 'env', None), dict)
+                        and job.env.get(MONITOR_ROLE_ENV) == 'controller') or controller_monitor_supported(
+                            getattr(engine, 'chief_version', None))
+                    if ssd_ok and capacity_ok and monitor_ok:
                         self.job_start(nodeid, jobid)
                         res = True
                     else:

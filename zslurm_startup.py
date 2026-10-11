@@ -6,6 +6,7 @@ zero usage, and do not consume a workflow retry.
 """
 import errno
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -15,6 +16,13 @@ import time
 import zslurm_lease
 
 MONITOR_ROLE_ENV = 'ZSLURM_JOB_MONITOR_ROLE'
+
+
+def controller_monitor_supported(version):
+    """Fail closed when a rolling deployment still has legacy chiefs."""
+    if not isinstance(version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+        return False
+    return tuple(int(v) for v in version.split('.')) >= (0, 2, 4)
 
 
 def stuck_detection_enabled(config, job_role=None):

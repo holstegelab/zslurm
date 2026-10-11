@@ -148,6 +148,12 @@ silently exempt the coordinator's subsequently submitted scientific jobs.
 `compute` explicitly selects normal detection; other values are rejected before
 launch. This is site-independent (Spider and Snellius). Already running or old
 chiefs are not modified by a software update; rolling deployment is required.
+From release 0.2.4, an updated manager places explicitly tagged controllers only
+on chiefs reporting 0.2.4 or later. Older/unversioned chiefs keep processing
+ordinary work; they are not stopped. Existing running tasks are unaffected.
+This prevents a recovered controller from silently receiving the old heuristic
+during a mixed-version rollout. Ensure an updated pilot is available; the tag
+does not itself replace already queued legacy pilot allocations.
 
 On Snellius, starting Slurm engines also offers an SSD scratch-node reservation prompt. For regular partitions, the UI asks for:
 
