@@ -507,6 +507,22 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
 - **`job_walltime_buffer_sec`**
   - slack a job's `reqtime` must leave inside an engine's remaining walltime before
     it may start there (default `900`)
+- **`capacity_wait_min_age_sec`**, **`capacity_wait_max_sec`**, **`capacity_wait_cooldown_sec`**
+  - defaults `600`, `1800`, `300` seconds. If an older higher-priority job fits
+    a pilot's total resources but not its current free CPU/memory, one busy
+    pilot per logical partition can temporarily accumulate its required slot
+    instead of continually refilling each small hole with lower-priority work.
+    Surplus can still backfill; equal/higher-priority work is not blocked.
+  - The job remains PENDING, available to other pilots and autogrowth. No
+    grant, storage, SSD or transfer reservation is made until it actually fits.
+    Dependencies, time remaining, SSD and transfer/storage gates still apply.
+    The wait expires within `capacity_wait_max_sec` (or remaining usable pilot
+    time), followed by a cooldown; set the maximum to `0` to disable it.
+  - This bounds deliberate idle capacity, not waiting time or runtime. It is
+    not a fair-share guarantee for equal-priority jobs. Running dynamic leases
+    retain their existing rights; the soft hint is recomputed after handover.
+    The policy uses the actual pilot shape, including fractional CPU requests,
+    with no Spider/Snellius hostname or node-size assumptions.
 - **`phaseout_backfill_enable`**
   - let a phasing-out engine still accept work that finishes before its last job does
 - **`phaseout_backfill_margin_sec`**

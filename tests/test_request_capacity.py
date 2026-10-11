@@ -4,6 +4,7 @@ import importlib.util
 import io
 from pathlib import Path
 import threading
+import time
 import unittest
 
 
@@ -211,6 +212,34 @@ class CurrentCapacityTests(unittest.TestCase):
         self.assertLessEqual(sum(row[5] for row in grant), 192)
         self.assertLessEqual(sum(row[6] for row in grant), 336*1024)
         self.assertTrue(all(job.state == 'PENDING' for job in tasks[8:]))
+
+    def test_aged_spider_priority_accumulates_memory_without_preclaim(self):
+        running = [self.running('busy-' + str(i), cpu=2, mem=16000) for i in range(12)]
+        self.running('wide', cpu=4, mem=24000)
+        high = self.add_job('high', cpu=4, mem=32000, priority=1000, slots=1)
+        high.submit_ts = time.time() - 7200
+        for i in range(40):
+            self.add_job('small-' + str(i), cpu=2, mem=16000)
+        self.jobs.job_done(running[0].jobid, 0)
+        self.assertEqual(self.request(*self.jobs._engine_headroom_locked(self.node.engine_id)), [])
+        self.assertEqual(high.state, 'PENDING')
+        self.assertIsNone(high.node_id)
+        self.assertEqual(self.jobs.dcache_download_inuse, 0)
+        self.jobs.job_done(running[1].jobid, 0)
+        grant = self.request(*self.jobs._engine_headroom_locked(self.node.engine_id))
+        self.assertEqual([row[0] for row in grant], ['high'])
+        self.assertEqual(self.jobs.dcache_download_inuse, 1)
+
+    def test_aged_snellius_priority_uses_released_fractional_lease(self):
+        self.node.cores, self.node.totmem = 192, 344064
+        self.running('busy', cpu=169.25, mem=320000)
+        high = self.add_job('high', cpu=22.75, mem=40000, priority=1000)
+        high.submit_ts = time.time() - 7200
+        self.add_job('small', cpu=2, mem=16000)
+        self.assertEqual(self.request(22.75, 24064), [])
+        self.assertEqual(high.state, 'PENDING')
+        self.assertTrue(self.jobs.resize_running_job(self.node.engine_id, 'busy', 169.25, 300000)['ok'])
+        self.assertEqual([row[0] for row in self.request(22.75, 44064)], ['high'])
 
 
 if __name__ == '__main__':

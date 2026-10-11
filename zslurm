@@ -1280,6 +1280,12 @@ class JobManager(object):
         # rules also apply to jobs submitted after the operator creates them.
         self.cwd_priority_overrides = OrderedDict()
 
+        # Soft placement hints, not grants/leases. At most one pilot per
+        # partition accumulates CPU/memory for aged higher-priority work.
+        # Recomputed after manager handover; no job/resource ownership changes.
+        self.capacity_waits = {}
+        self.capacity_wait_cooldowns = {}
+
         # Compact terminal outcomes used by dependencies.  Finished Job objects
         # are retained separately for queue/report output and may be trimmed per
         # owner; dependency correctness must not depend on that presentation
@@ -3088,14 +3094,26 @@ class JobManager(object):
                 profile_regret_cache[cache_key] = regret
                 return regret
 
+            protected_job = None
+
             def _fits_free_capacity(job):
                 # Do not preclaim a job that fits the pilot's total resources
                 # but cannot start in its currently free slot. Such a grant
                 # can wait for hours behind long-running jobs and hide both
                 # backlog and fitting backfill from other pilots/autogrowth.
-                return job.ncpu <= current_cpu and job.mem <= current_mem
+                if job.ncpu > current_cpu or job.mem > current_mem:
+                    return False
+                if (protected_job is not None
+                        and protected_job.state in queue_states
+                        and job is not protected_job
+                        and job.priority < protected_job.priority):
+                    # Backfill only the surplus, so successive completions can
+                    # accumulate a slot. Equal/higher priority still wins.
+                    return (job.ncpu <= max(0.0, current_cpu - protected_job.ncpu)
+                            and job.mem <= max(0.0, current_mem - protected_job.mem))
+                return True
 
-            def eligible(job):
+            def eligible(job, check_free=True):
                 if job.partition != partition:
                     return False
                 if job.state == 'ASSIGNED' and job.node_id == myid:
@@ -3122,7 +3140,7 @@ class JobManager(object):
                     return False
                 if job.mem > totmem:
                     return False
-                if job.state != 'ASSIGNED' and not _fits_free_capacity(job):
+                if check_free and job.state != 'ASSIGNED' and not _fits_free_capacity(job):
                     return False
                 if not _ssd_ok(job, e):
                     return False
@@ -3139,6 +3157,83 @@ class JobManager(object):
                     if not self._dcache_transfer_fits_locked(job):
                         return False
                 return True
+
+            # Current-capacity-only packing can continually refill single
+            # holes with small jobs and starve a larger higher-priority job.
+            # Briefly protect its CPU/memory on ONE busy pilot, leaving it
+            # PENDING and available to every other pilot/autogrow. Never charge
+            # transfer/storage/SSD counters or change the start handshake.
+            min_age = max(0.0, float(status.config.get(
+                'capacity_wait_min_age_sec', 600.0)))
+            max_wait = max(0.0, float(status.config.get(
+                'capacity_wait_max_sec', 1800.0)))
+            cooldown = max(0.0, float(status.config.get(
+                'capacity_wait_cooldown_sec', 300.0)))
+
+            def _active_wait_engine(engine):
+                return (engine is not None
+                        and engine.partition == partition
+                        and not getattr(engine, 'stopping', False)
+                        and getattr(engine, 'status', None) != PHASING_OUT
+                        and (engine.cluster_id in (None, False, '') or (
+                            getattr(engine, 'managed', False)
+                            and getattr(engine, 'slurm_state', None) == 'R')))
+
+            wait = self.capacity_waits.get(partition)
+            if wait is not None:
+                target = self.jobs_by_id.get(wait['jobid'])
+                host = engines.engine_by_id.get(wait['nodeid'])
+                expired = now_ts >= wait['deadline']
+                invalid = (max_wait <= 0 or expired or target is None
+                           or target.state not in queue_states
+                           or target.partition != partition
+                           or not _active_wait_engine(host))
+                if not invalid:
+                    invalid = (target.ncpu > host.cores or target.mem > host.totmem
+                               or target.reqtime + walltime_buffer > host.timeleft
+                               or not self._dependency_allows_run_locked(target))
+                if invalid:
+                    self.capacity_waits.pop(partition, None)
+                    if expired:
+                        self.capacity_wait_cooldowns[partition] = now_ts + cooldown
+                    add_log_line(gb, f"Capacity wait released: job {wait['jobid']} "
+                                 f"on {wait['nodeid']} ({'expired' if expired else 'ineligible/claimed'}).", CYAN)
+                    wait = None
+                elif wait['nodeid'] == myid:
+                    if eligible(target, check_free=False):
+                        protected_job = target
+                    else:
+                        self.capacity_waits.pop(partition, None)
+                        wait = None
+
+            if (wait is None and max_wait > 0 and _active_wait_engine(e)
+                    and now_ts >= self.capacity_wait_cooldowns.get(partition, 0)
+                    and any(j.node_id == myid and j.state == 'RUNNING'
+                            for j in self.jobs_by_id.values())):
+                # Only contend with genuinely runnable lower-priority backfill.
+                # Fresh/non-runnable/oversize jobs never block fitting work.
+                fitting_priority = min((j.priority for j in jobs_view
+                    if j.state in queue_states and eligible(j)), default=None)
+                if fitting_priority is not None:
+                    for target in jobs_view:
+                        if (target.state not in queue_states
+                                or target.priority <= fitting_priority
+                                or now_ts - float(getattr(target, 'submit_ts', now_ts)) < min_age
+                                or not eligible(target, check_free=False)
+                                or _fits_free_capacity(target)):
+                            continue
+                        duration = min(max_wait, max(0.0,
+                            timeleft - target.reqtime - walltime_buffer))
+                        if duration <= 0:
+                            continue
+                        wait = dict(jobid=target.jobid, nodeid=myid,
+                                    deadline=now_ts + duration)
+                        self.capacity_waits[partition] = wait
+                        protected_job = target
+                        add_log_line(gb, f"Capacity wait: job {target.jobid} remains PENDING; "
+                                     f"accumulate {target.ncpu} cores/{target.mem} MB on {myid} "
+                                     f"for at most {duration:.0f}s.", CYAN)
+                        break
 
 
             for job in own_assigned:
@@ -3338,8 +3433,7 @@ class JobManager(object):
                 for job in assigned:
                     # FIXME; assume 5 days of time                    
                     if (                                                
-                        job.ncpu <= current_cpu
-                        and job.mem <= current_mem  
+                        _fits_free_capacity(job)
                         and _ssd_ok(job, e)
                     ):
                         # Ask the previous engine to drop assignment and reassign to this engine.
@@ -6183,6 +6277,10 @@ def _apply_handover_snapshot(snapshot):
     for name in ('total_jobs', 'running_jobs', 'failed_jobs', 'done_jobs'):
         setattr(jobs, name, dict(manager.get(name, {}) or {}))
     jobs._eligible_cache_ts = 0.0
+    # Capacity waits never own jobs or resources and cannot survive a changed
+    # live pilot registry. Recompute on requests after chiefs re-register.
+    jobs.capacity_waits = {}
+    jobs.capacity_wait_cooldowns = {}
 
     engines.engine_by_id = {}
     engines.engine_by_clusterid = {}
