@@ -155,6 +155,19 @@ This prevents a recovered controller from silently receiving the old heuristic
 during a mixed-version rollout. Ensure an updated pilot is available; the tag
 does not itself replace already queued legacy pilot allocations.
 
+From release 0.2.5, an operator can also explicitly register an application-owned
+controller namespace with the authenticated manager RPC
+`register_controller_owner_prefix(token, "my-controller:")`. This is a literal
+prefix of the job's **owner**, not its name, cwd, command, or inherited environment.
+Registration is additive and idempotent; it tags matching queued and future jobs
+with the same controller launch option and survives manager handover. Ordinary
+scientific jobs must use a different owner namespace. The default registry is
+empty on every site, including Spider and Snellius. Explicit conflicting roles
+and untagged in-flight grants cause registration to fail before any change.
+Running jobs are reported but left untouched; this cannot retroactively protect
+a running controller on an old chief. Tagged jobs still require a chief >=0.2.4,
+normal resources, satisfied dependencies, and sufficient allocation time.
+
 On Snellius, starting Slurm engines also offers an SSD scratch-node reservation prompt. For regular partitions, the UI asks for:
 
 - **Partition**

@@ -1280,6 +1280,9 @@ class JobManager(object):
         # rule matches a cwd.  Unlike the legacy one-shot queue reorder, these
         # rules also apply to jobs submitted after the operator creates them.
         self.cwd_priority_overrides = OrderedDict()
+        # Explicit application-owned controller namespaces. Empty by default;
+        # never infer this role from inherited workflow environment variables.
+        self.controller_owner_prefixes = []
 
         # Soft placement hints, not grants/leases. At most one pilot per
         # partition accumulates CPU/memory for aged higher-priority work.
@@ -1820,6 +1823,7 @@ class JobManager(object):
                     'autoconsolidate_enable': bool(status.autoconsolidate_enable),
                     'autogrow_max_compute_nodes': int(cfg.get('autogrow_max_compute_nodes', 0) or 0),
                     'cwd_priority_overrides': self.list_cwd_priority_overrides(),
+                    'controller_owner_prefixes': list(self.controller_owner_prefixes),
                 },
                 'pending_jobs': n_pending,
                 'budgeted_pending_jobs': n_budget_pending,
@@ -1958,6 +1962,52 @@ class JobManager(object):
             return (max(priorities) if priorities else DEFAULT_JOB_PRIORITY) + 1
         finally:
             self.lock.release()
+
+    @staticmethod
+    def _validate_controller_owner_prefix(prefix):
+        if (not isinstance(prefix, str) or not prefix or len(prefix) > 256
+                or not re.fullmatch(r'[A-Za-z0-9_.:/-]+', prefix)):
+            raise ValueError('a nonempty literal controller owner prefix is required')
+        return prefix
+
+    def _apply_owner_controller_role_locked(self, job):
+        if (job.state not in queue_states or not any(
+                str(getattr(job, 'owner', '') or '').startswith(prefix)
+                for prefix in self.controller_owner_prefixes)):
+            return False
+        env = getattr(job, 'env', None) or {}
+        if not isinstance(env, dict) or env.get(MONITOR_ROLE_ENV) not in (None, 'controller'):
+            raise ValueError('controller owner conflicts with an explicit monitor role')
+        changed = env.get(MONITOR_ROLE_ENV) != 'controller'
+        # Do not mutate the caller's environment mapping (or another job's).
+        job.env = dict(env, **{MONITOR_ROLE_ENV: 'controller'})
+        return changed
+
+    def register_controller_owner_prefix(self, prefix):
+        """Adopt queued/future controllers without restarting existing jobs.
+
+        Registration is explicit and additive. Existing RUNNING jobs are not
+        hotpatched. Reject an in-flight untagged grant rather than changing its
+        environment after the chief might already have received it.
+        """
+        prefix = self._validate_controller_owner_prefix(prefix)
+        with self.lock:
+            matching = [j for j in self.jobs_by_id.values()
+                if str(getattr(j, 'owner', '') or '').startswith(prefix)]
+            for job in matching:
+                env = getattr(job, 'env', None) or {}
+                if not isinstance(env, dict) or env.get(MONITOR_ROLE_ENV) not in (None, 'controller'):
+                    raise ValueError('controller owner conflicts with an explicit monitor role')
+                if job.state == 'ASSIGNED' and env.get(MONITOR_ROLE_ENV) != 'controller':
+                    raise ValueError('untagged controller grant is in flight; inspect before retrying')
+            if prefix not in self.controller_owner_prefixes:
+                self.controller_owner_prefixes.append(prefix)
+            changed = sum(self._apply_owner_controller_role_locked(j) for j in matching)
+            self._eligible_cache_ts = 0.0
+            return dict(prefix=prefix, prefixes=list(self.controller_owner_prefixes),
+                matched=len(matching), queued_tagged=changed,
+                queued_jobids=[str(j.jobid) for j in matching if j.state in queue_states],
+                running_unmodified=sum(j.state == 'RUNNING' for j in matching))
 
     def set_cwd_priority_override(self, pattern, priority):
         normalized = str(pattern or '').strip()
@@ -2161,6 +2211,9 @@ class JobManager(object):
                 runtime = (now - job.starttime) if getattr(job, 'starttime', None) else 0.0
                 out.append({
                     'jobid': str(job.jobid),
+                    'owner': getattr(job, 'owner', None),
+                    'requested_monitor_role': (getattr(job, 'env', None) or {}).get(
+                        MONITOR_ROLE_ENV, 'compute'),
                     'name': job.job_name,
                     'state': st,
                     'partition': job.partition,
@@ -2554,6 +2607,7 @@ class JobManager(object):
                 )
                 job.dependency_spec = dependency_spec
                 self._apply_priority_override_locked(job)
+                self._apply_owner_controller_role_locked(job)
                 self.jobs_by_id[jobid] = job
                 self.total_jobs[partition] = self.total_jobs.get(partition, 0) + 1
                 self._eligible_cache_ts = 0.0
@@ -3117,6 +3171,7 @@ class JobManager(object):
             def eligible(job, check_free=True):
                 if job.partition != partition:
                     return False
+                self._apply_owner_controller_role_locked(job)
                 if (isinstance(getattr(job, 'env', None), dict)
                         and job.env.get(MONITOR_ROLE_ENV) == 'controller'
                         and not controller_monitor_supported(getattr(e, 'chief_version', None))):
@@ -4110,6 +4165,7 @@ def ping():
         "default_job_priority": DEFAULT_JOB_PRIORITY,
         "list_jobs_priority": True,
         "cwd_priority_overrides": True,
+        "controller_owner_roles": True,
         "targeted_job_status": True,
         "conditional_pending_cancel": True,
         "directional_dcache_slots": True,
@@ -4254,6 +4310,22 @@ def rpc_deprioritize(token=None, pattern=None):
     jobs.deprioritize(pattern)
     add_log_line(gb, f"[agent] deprioritize '{pattern}' ({len(matched)} jobs, lastin_first={status.lastin_first})", CYAN)
     return {"ok": True, "matched": len(matched), "lastin_first": bool(status.lastin_first)}
+
+
+def rpc_register_controller_owner_prefix(token=None, prefix=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if _handover_committed_source():
+        return _handover_proxy(False).register_controller_owner_prefix(token, prefix)
+    try:
+        result = jobs.register_controller_owner_prefix(prefix)
+    except (TypeError, ValueError) as error:
+        return {"ok": False, "code": 3, "error": str(error)}
+    add_log_line(gb, f"[agent] controller owner prefix '{prefix}': "
+                 f"{result['queued_tagged']} queued jobs tagged; "
+                 f"{result['running_unmodified']} running jobs unchanged", CYAN)
+    return {"ok": True, **result}
 
 
 def rpc_set_cwd_priority_override(token=None, pattern=None, priority=None):
@@ -4417,6 +4489,9 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(set_autogrow, "set_autogrow")
         server.register_function(rpc_prioritize, "prioritize")
         server.register_function(rpc_deprioritize, "deprioritize")
+        server.register_function(
+            rpc_register_controller_owner_prefix, "register_controller_owner_prefix"
+        )
         server.register_function(
             list_cwd_priority_overrides, "list_cwd_priority_overrides"
         )
@@ -6170,6 +6245,7 @@ def _build_handover_snapshot(
             [pattern, int(priority)]
             for pattern, priority in jobs.cwd_priority_overrides.items()
         ],
+        'controller_owner_prefixes': list(jobs.controller_owner_prefixes),
     }
     scheduler_values = {
         'lastin_first': bool(status.lastin_first),
@@ -6228,6 +6304,13 @@ def _apply_handover_snapshot(snapshot):
     """Import a source snapshot into an already-validated empty target."""
     manager = snapshot.get('manager', {}) or {}
     scheduler = snapshot.get('scheduler', {}) or {}
+    prefixes = manager.get('controller_owner_prefixes', [])
+    if not isinstance(prefixes, list):
+        raise ValueError('invalid controller owner prefix registry')
+    for prefix in prefixes:
+        jobs._validate_controller_owner_prefix(prefix)
+    if len(set(prefixes)) != len(prefixes):
+        raise ValueError('duplicate controller owner prefix registry')
 
     jobs.jobs_by_id = OrderedDict()
     for data in snapshot.get('jobs', []) or []:
@@ -6267,12 +6350,14 @@ def _apply_handover_snapshot(snapshot):
             'cwd_priority_overrides', []
         ) or []
     )
+    jobs.controller_owner_prefixes = list(prefixes)
     for job in jobs.jobs_by_id.values():
         if not hasattr(job, 'base_priority'):
             job.base_priority = int(getattr(
                 job, 'priority', DEFAULT_JOB_PRIORITY
             ) or 0)
         jobs._apply_priority_override_locked(job)
+        jobs._apply_owner_controller_role_locked(job)
     jobs.jobid_counter = int(manager.get('jobid_counter', jobs.jobid_counter))
     for name in (
         'active_total', 'active_inuse', 'dcache_total', 'dcache_inuse',
