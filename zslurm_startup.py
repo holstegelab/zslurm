@@ -14,6 +14,19 @@ import time
 
 import zslurm_lease
 
+MONITOR_ROLE_ENV = 'ZSLURM_JOB_MONITOR_ROLE'
+
+
+def stuck_detection_enabled(config, job_role=None):
+    """CPU/I/O silence is not proof that a queue-waiting controller is stuck.
+
+    This changes only that heuristic; normal accounting, cancellation and
+    allocation limits remain active. Unknown roles must not silently opt out.
+    """
+    if job_role not in (None, 'compute', 'controller'):
+        raise ValueError('job monitor role must be compute or controller')
+    return bool(config.get('stuck_detection_enable', True)) and job_role != 'controller'
+
 
 TRANSIENT_START_ERRNOS = frozenset(
     getattr(errno, name) for name in (
@@ -141,7 +154,10 @@ class DeferredJobStarts:
                 ]
                 if child.get('context') is not None:
                     monitor_args.append(child['context'])
-                self.monitor(*monitor_args)
+                monitor_options = {}
+                if child.get('monitor_role') is not None:
+                    monitor_options['job_role'] = child['monitor_role']
+                self.monitor(*monitor_args, **monitor_options)
 
         try:
             # Never chdir the multi-threaded chief. Slow/failing shared-storage
@@ -157,6 +173,12 @@ class DeferredJobStarts:
                 env.update({k: v for k, v in os.environ.items() if k.startswith('SLURM')})
             else:
                 env = dict(os.environ)
+            # This is a one-job launch option, not an inheritable environment
+            # default. A controller's submitted compute children must retain
+            # ordinary stuck detection, as must jobs inheriting chief env.
+            monitor_role = original_env.get(MONITOR_ROLE_ENV) if isinstance(original_env, dict) else None
+            stuck_detection_enabled({}, monitor_role)  # validate before spawn
+            env.pop(MONITOR_ROLE_ENV, None)
             # The submitted environment was captured on the controller. Never
             # pass its temporary or scratch directory to a worker allocation.
             for name in (
@@ -185,6 +207,7 @@ class DeferredJobStarts:
                 child.update(
                     process=process, logfile=logfile,
                     logfile_path=logfile_path, context=child_context,
+                    monitor_role=monitor_role,
                 )
                 logfile = None  # The monitor now owns/cleans the open handle.
                 child_context = None  # The monitor now owns/cleans the context.

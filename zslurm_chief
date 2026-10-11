@@ -16,7 +16,7 @@ import tempfile
 import zslurm_shared
 from zslurm_version import VERSION
 import zslurm_lease
-from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts
+from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts, stuck_detection_enabled
 import socket
 
 if "--version" in sys.argv[1:]:
@@ -1183,7 +1183,7 @@ class status:
 
 def job_monitor(
     jobid, process, ncpu, mem, logfile, logfile_path,
-    job_scratch_context=None,
+    job_scratch_context=None, *, job_role=None,
 ):
     memcache = [] #stores memory usage at different snapshots over time
     cpucache = [] #stores cpu usage at different snapshots over time
@@ -1200,7 +1200,11 @@ def job_monitor(
     live_monitor_interval = float(config.get('monitor_live_interval_sec', min(5.0, monitor_interval)))
     stuck_cpu_thr = float(config.get('stuck_cpu_core_threshold', 0.05))
     stuck_io_thr = float(config.get('stuck_io_activity_bytes_threshold', 4096.0))
-    stuck_enabled = bool(config.get('stuck_detection_enable', True))
+    stuck_enabled = stuck_detection_enabled(config, job_role)
+    if job_role == 'controller':
+        sys.stderr.write(f'{xtime()} - [{myid}] Job {jobid}: controller role; '
+                         'CPU/I/O silence termination disabled, resource monitoring retained\n')
+        sys.stderr.flush()
     stuck_stop_threshold = int(config.get('stuck_stop_threshold', STOP_THRESHOLD))
     if stuck_stop_threshold < 1:
         stuck_stop_threshold = 1

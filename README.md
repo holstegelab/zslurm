@@ -139,6 +139,16 @@ Inside the `zslurm` curses UI:
 
 When starting Slurm engines, entering `staging` maps to archive-oriented engines used for transfer/archive work.
 
+Workflow coordinators that legitimately wait on queued child jobs can explicitly
+submit `ZSLURM_JOB_MONITOR_ROLE=controller` in their job environment. Updated
+chiefs retain resource accounting and cancellation but do not terminate these
+jobs solely for low CPU/I/O activity. Ordinary jobs keep the configured stuck
+detection. The launch option is removed from the child environment so it cannot
+silently exempt the coordinator's subsequently submitted scientific jobs.
+`compute` explicitly selects normal detection; other values are rejected before
+launch. This is site-independent (Spider and Snellius). Already running or old
+chiefs are not modified by a software update; rolling deployment is required.
+
 On Snellius, starting Slurm engines also offers an SSD scratch-node reservation prompt. For regular partitions, the UI asks for:
 
 - **Partition**
