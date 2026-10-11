@@ -2983,9 +2983,9 @@ class JobManager(object):
                     engine.backfill_announced = True
                     add_log_line(
                         gb,
-                        f"Phase-out backfill: engine {engine.engine_id} waits "
-                        f"{int(phaseout_window / 60)}m on its last job; accepting work "
-                        f"that fits inside that window.",
+                        f"Phase-out backfill: engine {engine.engine_id} has an estimated "
+                        f"{int(phaseout_window / 60)}m backfill window; accepting work "
+                        f"that fits with the placement margin.",
                         CYAN,
                     )
             # Do not start or assign work to unmanaged cluster engines (seen as missing in squeue)
@@ -7404,31 +7404,29 @@ def engine_drain_seconds(engine, now=None):
 def phaseout_backfill_window(engine, now=None):
     """Runtime a PHASING_OUT engine may still hand out, or 0.0 to hand out none.
 
-    A phased-out engine holds its node until its last job ends. When that job still
-    has hours to run, the rest of the node sits idle for those hours. We can fill
-    that gap, but only with work certain to finish first, so the engine still stops
-    at about the moment it would have stopped anyway -- delaying the phase-out would
-    defeat the point of it.
+    Consolidation/manual drains only backfill inside their current jobs' drain
+    estimate, so backfill does not deliberately delay releasing surplus capacity.
+    End-of-life drains have a different constraint: the remaining Slurm lease.
+    The early (default twelve-hour) drain marker must not blacklist short jobs
+    that fit well inside that lease. Such backfill can extend a busy pilot's
+    useful life, but never its allocation, and still stops when it becomes idle.
 
     Conservative by construction: it returns 0.0, i.e. the old flat refusal, unless
     all of the following hold.
 
       * backfilling is enabled;
-      * the engine is NOT draining because its node walltime is nearly up -- that
-        one is already racing a hard kill and must not be handed more to lose;
+      * the engine is not stopping;
       * the engine still has running work, because letting an empty one die is
         exactly what phasing out is for;
       * at least `min_window` seconds remain after subtracting the margin, so we
         only bother when the reclaimed gap is worth a job's startup cost.
 
-    The margin is subtracted twice over: once from the drain estimate and once from
-    the node walltime, and callers still apply job_walltime_buffer_sec on top.
+    Subtract phaseout_backfill_margin_sec from the applicable horizon; callers
+    apply job_walltime_buffer_sec on top. Estimates are not runtime guarantees.
     """
     if not bool(status.config.get(
             "phaseout_backfill_enable",
             getattr(status, 'phaseout_backfill_enable', True))):
-        return 0.0
-    if getattr(engine, 'end_of_life_drain', False):
         return 0.0
     if getattr(engine, 'stopping', False):
         return 0.0
@@ -7440,11 +7438,16 @@ def phaseout_backfill_window(engine, now=None):
     min_window = float(status.config.get(
         "phaseout_backfill_min_window_sec",
         getattr(status, 'phaseout_backfill_min_window_sec', 3600.0)))
-    window = engine_drain_seconds(engine, now) - margin
-    if window < min_window:
-        return 0.0
     node_left = float(getattr(engine, 'timeleft', 0.0) or 0.0) - margin
-    return max(0.0, min(window, node_left))
+    if (not math.isfinite(margin) or margin < 0.0
+            or not math.isfinite(min_window) or min_window <= 0.0
+            or not math.isfinite(node_left)):
+        return 0.0
+    if getattr(engine, 'end_of_life_drain', False):
+        window = node_left
+    else:
+        window = min(engine_drain_seconds(engine, now) - margin, node_left)
+    return window if window >= min_window else 0.0
 
 
 def thread_check_commands():
@@ -7514,9 +7517,9 @@ def thread_check_commands():
         status.gpfs_io_pct = numpy.array(gpfs_io_pct, dtype=float)
 
         # End-of-life drain: an engine near its Slurm walltime will be hard-killed,
-        # taking any running job with it. Phase it out early (it then accepts NO new
-        # jobs -- request_jobs returns [] for PHASING_OUT -- and stops once idle) so
-        # work drains gracefully and autogrow replaces the capacity. Runs before
+        # taking any running job with it. Phase it out early; only bounded short
+        # backfill inside the remaining lease may still start, and it stops once
+        # idle. Autogrow replaces long-job capacity. Runs before
         # consolidation so the drain flag is set before the unphase logic below.
         try:
             if bool(getattr(status, 'engine_drain_before_end_enable', True)):

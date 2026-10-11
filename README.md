@@ -306,17 +306,18 @@ Phasing out means:
 
 #### Backfilling a phasing-out engine
 
-A phased-out engine holds its node until its **last** job ends. When that job still
-has hours to run, the rest of the node would otherwise sit idle for those hours, so
-the engine may still accept work that is certain to finish first -- it then stops at
-about the moment it would have stopped anyway.
+A phased-out engine holds its node until its **last** job ends. For consolidation
+or manual draining, backfill must fit inside the estimated remaining work, so it
+does not deliberately delay releasing surplus capacity. For **end-of-life**
+draining, the constraint is instead the remaining Slurm lease: the early default
+12-hour drain marker does not blacklist a four-hour job on a busy pilot with ten
+hours left. This can extend its useful life, but never its allocation.
 
 This is deliberately conservative and falls back to refusing everything, exactly as
 before, unless all of these hold:
 
 - `phaseout_backfill_enable` is on
-- the engine is **not** draining because its node walltime is nearly up -- that one is
-  already racing a hard kill
+- the engine is not stopping
 - the engine still has running work, since letting an empty one die is the point
 - at least `phaseout_backfill_min_window_sec` (default 1 h) remains after subtracting
   `phaseout_backfill_margin_sec` (default 30 min)
@@ -324,6 +325,9 @@ before, unless all of these hold:
 The window is also capped by the node's own remaining walltime minus the same margin,
 and every job still has to satisfy `job_walltime_buffer_sec` on top, so a backfilled
 job needs roughly 45 minutes of slack before it is allowed to start.
+These are scheduling estimates, not guarantees that a job cannot overrun. Empty
+pilots still stop, and the minimum queue age, actual free cores/memory, dependency
+and controller-version checks remain in force on both Spider and Snellius.
 
 #### Fitting jobs to remaining walltime
 
@@ -553,7 +557,8 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
     The policy uses the actual pilot shape, including fractional CPU requests,
     with no Spider/Snellius hostname or node-size assumptions.
 - **`phaseout_backfill_enable`**
-  - let a phasing-out engine still accept work that finishes before its last job does
+  - let a busy phasing-out engine accept work fitting its drain estimate, or its
+    remaining lease for end-of-life draining
 - **`phaseout_backfill_margin_sec`**
   - safety margin subtracted from both the drain estimate and the node walltime when
     sizing that backfill window (default `1800`)
