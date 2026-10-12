@@ -588,6 +588,25 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
     def test_same_host_running_jobs_survive_rpc_handover_and_completion(self):
         self.exercise_same_host_running_job_transfer()
 
+    def test_idle_retirement_control_is_registered_and_retained_over_rpc_handover(self):
+        source_name = self.instance_prefix + '_source'
+        target_name = self.instance_prefix + '_target'
+        self.start_manager(source_name)
+        source_config = self.wait_for_instances(1)[source_name]
+        source = xmlrpc.client.ServerProxy(self.url(source_config), allow_none=True)
+        source_uuid = source.health()['manager_uuid']
+        self.assertTrue(source.health()['conditional_autoconsolidate'])
+        self.assertFalse(source.set_autoconsolidate(None, True, False, source_uuid)['ok'])
+        self.assertTrue(source.set_autoconsolidate('test-control-token', True, False, source_uuid)['ok'])
+        self.assertTrue(source.get_status_json()['scheduler']['autoconsolidate_enable'])
+        self.start_manager(target_name)
+        target_config = self.wait_for_instances(2)[target_name]
+        target = xmlrpc.client.ServerProxy(self.url(target_config), allow_none=True)
+        self.assertTrue(target.handover_from('test-control-token', source_name)['ok'])
+        self.assertTrue(target.get_status_json()['scheduler']['autoconsolidate_enable'])
+        self.assertFalse(source.set_autoconsolidate('test-control-token', False, True, source_uuid)['ok'])
+        self.assertTrue(target.get_status_json()['scheduler']['autoconsolidate_enable'])
+
     def test_forwarded_completion_before_target_chief_registration_releases_lease(self):
         self.exercise_same_host_running_job_transfer(complete_before_registration=True)
 

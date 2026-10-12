@@ -4169,6 +4169,7 @@ def ping():
         "targeted_job_status": True,
         "conditional_pending_cancel": True,
         "conditional_cancel_states": ["PENDING", "REQUEUED"],
+        "conditional_autoconsolidate": True,
         "directional_dcache_slots": True,
         "s3_download_slots": True,
         "gpfs_io_metrics": True,
@@ -4287,6 +4288,34 @@ def set_autogrow(token=None, enable=None, max_compute_nodes=None):
                      f"max_nodes={cfg.get('autogrow_max_compute_nodes')}", CYAN)
     return {"ok": True, "autogrow_enable": bool(status.autogrow_enable),
             "autogrow_max_compute_nodes": int(cfg.get('autogrow_max_compute_nodes', 0) or 0)}
+
+
+def set_autoconsolidate(token=None, enable=None, expected_current=None,
+                       expected_manager_uuid=None):
+    """Explicitly restore/toggle idle retirement on the identified live primary.
+
+    No jobs are cancelled here. The existing demand-aware consolidation loop
+    selects excess engines and waits for their running work to finish. Refuse
+    stale state and handover endpoints rather than silently changing a successor.
+    """
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    with jobs.lock, engines.lock:
+        if (type(enable) is not bool or type(expected_current) is not bool
+                or not expected_manager_uuid
+                or expected_manager_uuid != status.manager_uuid
+                or status.handover_mode not in ('ACTIVE', 'TARGET_ACTIVE')
+                or bool(status.autoconsolidate_enable) != expected_current):
+            return {"ok": False, "code": 3,
+                    "error": "exact active primary and unchanged boolean consolidation state required"}
+        status.autoconsolidate_enable = enable
+        # Preserve an explicit post-transfer adjustment if activation is replayed.
+        if status.handover_mode == 'TARGET_ACTIVE':
+            status.handover_saved_autoconsolidate = enable
+    add_log_line(gb, f"[agent] autoconsolidate: {expected_current} -> {enable}", CYAN)
+    return {"ok": True, "autoconsolidate_enable": enable,
+            "previous": expected_current, "manager_uuid": status.manager_uuid}
 
 
 def rpc_prioritize(token=None, pattern=None):
@@ -4488,6 +4517,7 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(set_transfer_limits, "set_transfer_limits")
         server.register_function(set_scheduler_mode, "set_scheduler_mode")
         server.register_function(set_autogrow, "set_autogrow")
+        server.register_function(set_autoconsolidate, "set_autoconsolidate")
         server.register_function(rpc_prioritize, "prioritize")
         server.register_function(rpc_deprioritize, "deprioritize")
         server.register_function(

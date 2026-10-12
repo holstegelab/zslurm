@@ -356,6 +356,21 @@ Autoconsolidation also includes safeguards such as:
 
 If there are still eligible queued jobs, consolidation may be skipped so that useful capacity is not removed too aggressively.
 
+Headless managers expose the same toggle through an identity- and state-checked
+control RPC (requires version 0.2.8 or newer). Inspect `zscontrol status` and
+manager health first, then explicitly supply the observed UUID and old setting:
+
+```bash
+zscontrol --instance MY_PRIMARY consolidate on --expect off --manager-uuid OBSERVED_UUID
+```
+
+This changes only the existing demand-aware consolidation policy; it does not
+cancel a job, change its runtime, or resize an allocation. Running jobs drain
+normally before an excess engine stops. Forwarders, in-progress handovers,
+stale identities and changed old settings are rejected; inspect a lost response
+before retrying. The setting is retained through subsequent manager handovers.
+The control and retirement policy are shared by Spider and Snellius.
+
 ### Autogrow (`g`)
 
 Autogrow does the opposite of consolidation: it starts new Slurm-backed engines when the current eligible queue suggests that more capacity is really needed.
