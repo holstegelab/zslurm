@@ -111,6 +111,90 @@ zslurm
 
 4. Inspect jobs with `zsqueue` and nodes with `zsnodes`.
 
+## GPU jobs (0.3.0)
+
+One maintained manager can own `compute`, `archive` and `gpu` workers. The
+GPU implementation was ported from the CCS/DeepConsensus checkout, retaining
+main's dependencies, retry-safe grants, leases, portable pilot launchers and
+explicit handover. It does **not** merge two existing populated managers or
+automatically replace their running binaries.
+
+```bash
+zsbatch --instance MY_MANAGER -p gpu --gpus 1 -c 4 --mem 131072 \
+  -t 04:00:00 -- ./deepconsensus.sh
+```
+
+GPU jobs default to one device; CPU/archive jobs default to zero. Positive
+`--gpus` requires `-p gpu`. A GPU job is placed only when its devices, CPU,
+memory, scratch requirements, dependencies and estimated runtime all fit on
+one GPU worker. Two GPUs on different workers cannot satisfy a two-GPU job.
+CPU demand never requests a GPU worker. CPU and GPU worker caps are separate.
+
+Physical routes and allocation shapes remain site configuration. Spider's
+default GPU route is `gpu_a100_22c`; Snellius's is `gpu_a100` (override it, for
+example with `gpu_h100`, together with that partition's profile). Absent routes
+are disabled when `sinfo` discovery succeeds. No GPU allocation shape is
+guessed: configure `cores`, `mem_gb`, `gpus`, and optionally `gpu_type` before
+starting workers. This is the allocation used by the existing Spider CCS run:
+
+```yaml
+gpu_partition: gpu_a100_22c
+autogrow_max_gpu_nodes: 5
+consolidation_min_gpu_engines: 0
+node_profiles:
+  # Merge with existing CPU profiles; do not remove them.
+  gpu_a100_22c:
+    cores: 44
+    mem_gb: 320
+    gpus: 2
+    gpu_type: a100
+```
+
+`mem_gb` follows existing node-profile units (GiB; converted to Slurm MB).
+GPU workers use the configured CPU/RAM request and `--gres=gpu:a100:2`, not
+the CPU pool's partial/exclusive shape. Review core-to-memory requirements at
+the site. Optional `has_ssd`/`ssd_gb` describe GPU-worker scratch. The shipped
+site templates set `autogrow_max_gpu_nodes: 0`: GPU growth is opt-in, demand
+backed, counts already queued/held allocations, has its own cooldown, and
+never grows from dependency/storage/transfer-blocked or unserviceable jobs.
+Short remaining pilot leases do not hide long-job demand. Backfill shortening
+must retain enough time for the requests being placed.
+
+Manual `d` accepts the logical `gpu` route or a configured physical partition.
+`o gpu +1` drains one GPU worker; `o gpu -1` restores one. Automatic GPU
+consolidation preserves every busy worker (including unacknowledged grants),
+retires only unused idle capacity, and cancels surplus queued tasks with a
+PENDING-only Slurm filter. It never cancels a whole array or releases an
+administrative hold. New demand restores automatic drains, not manual drains.
+
+Devices are reserved at grant time, retained while a start is deferred, and
+released after completion/failure or a rejected start. Lost replies replay
+the same device assignment; retrying GPU submissions is idempotent. Start
+acknowledgements must match the exact grant's device IDs, so a stale
+pre-handover grant cannot start on a subsequently reassigned device. CPU/RAM
+lease resizing does not release devices. Explicit handover preserves running
+GPU assignments and requeues unstarted grants, and rejects CPU-only targets.
+The separate legacy CCS checkpoint/restart mechanism is not transplanted.
+
+The chief sets worker-local `CUDA_VISIBLE_DEVICES`, NVIDIA visibility and
+Apptainer/Singularity overrides; CPU children see no GPUs. This is cooperative
+visibility, **not** a separate per-job device cgroup/security boundary.
+`zsqueue --json`, `zsnodes --json`, detailed job RPCs, queue statistics and
+the manager UI expose device counts/assignments. Legacy 14/15-field job and
+25-field node RPC rows remain unchanged unless GPU fields are requested.
+
+Install the same 0.3.0 release for manager, chiefs and GPU clients before
+rollout. New GPU clients/chiefs refuse old managers. Old CPU client/registration
+arguments remain valid; the positional GPU protocol of the old CCS fork is
+explicitly rejected (its GPU-count argument occupied main's idempotency-token
+position). Do not deploy by overwriting a checkout that live processes import.
+Qualify the release separately, then plan a staged rollout; mock scheduling
+tests do not establish CUDA/container/hardware correctness.
+
+The source GPU helper used for the port had SHA256
+`468dbb3d3197778254322b77675e0c41c267e8788d557672df914c8b8a4f1d9d`;
+it came from the uncommitted CCS checkout inspected on 13 October 2026.
+
 ## Interactive manager controls
 
 Inside the `zslurm` curses UI:

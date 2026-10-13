@@ -14,6 +14,7 @@ import math
 import re
 import tempfile
 import zslurm_shared
+import zslurm_gpu
 from zslurm_version import VERSION
 import zslurm_lease
 from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts, stuck_detection_enabled
@@ -1005,6 +1006,13 @@ _warned_legacy_manager = False
 def register_with_manager(proxy, *registration_args):
     """Send the chief version when supported without breaking old managers."""
     global _warned_legacy_manager
+    if len(registration_args) > 3 and registration_args[3] == 'gpu':
+        if not manager_supports_method(proxy, 'register_gpu_versioned'):
+            raise RuntimeError('GPU workers require a GPU-capable maintained manager; upgrade it first')
+        devices = zslurm_gpu.worker_devices(os.environ)
+        if not devices:
+            raise RuntimeError('GPU worker has no allocated CUDA devices')
+        return proxy.register_gpu_versioned(*(registration_args + (VERSION, devices)))
     if manager_supports_method(proxy, "register_versioned"):
         return proxy.register_versioned(*(registration_args + (VERSION,)))
     if not _warned_legacy_manager:
@@ -1016,6 +1024,15 @@ def register_with_manager(proxy, *registration_args):
         sys.stderr.flush()
         _warned_legacy_manager = True
     return proxy.register(*registration_args)
+
+
+def acknowledge_job_grant(proxy, engine_id, job):
+    """Fence GPU start acknowledgements by their exact grant device IDs."""
+    environment = job[4] if isinstance(job[4], dict) else {}
+    if int(environment.get('ZSLURM_GPUS', 0)) > 0:
+        return proxy.can_run_assigned_job(engine_id, job[0],
+            zslurm_gpu.device_ids(environment.get('ZSLURM_GPU_DEVICES', '')))
+    return proxy.can_run_assigned_job(engine_id, job[0])
 
 
 def register_at_manager(manager_uri):
@@ -1657,6 +1674,11 @@ try :
                         jobs = []
                 for job in jobs:
                     jobid, job_name, command, cwd, env, ncpu, mem, state = job
+                    if partition != 'gpu' and isinstance(env, dict):
+                        # Old CPU managers return the raw submitter environment.
+                        # Inherited GPU tags are not a device grant.
+                        env = dict(env, ZSLURM_GPUS='0', ZSLURM_GPU_DEVICES='')
+                        job = tuple(job[:4]) + (env,) + tuple(job[5:])
                     if jobid in status.running_processes or jobid in job_starter.pending:
                         continue
                     if state == 'ASSIGNED':
@@ -1665,7 +1687,7 @@ try :
                             # arrives. A lost reply can then be retried safely.
                             status.assigned_jobs[jobid] = job
                             try:
-                                permission = s.can_run_assigned_job(myid, jobid)
+                                permission = acknowledge_job_grant(s, myid, job)
                             except MANAGER_RPC_ERRORS:
                                 continue
                             status.assigned_jobs.pop(jobid, None)

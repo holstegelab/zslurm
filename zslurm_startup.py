@@ -14,6 +14,7 @@ import threading
 import time
 
 import zslurm_lease
+import zslurm_gpu
 
 MONITOR_ROLE_ENV = 'ZSLURM_JOB_MONITOR_ROLE'
 
@@ -177,10 +178,9 @@ class DeferredJobStarts:
             args = shlex.split(command)
             env = original_env
             if isinstance(env, dict):
-                env = {k: v for k, v in env.items() if not k.startswith('SLURM')}
-                env.update({k: v for k, v in os.environ.items() if k.startswith('SLURM')})
+                env = zslurm_gpu.child_environment(env, os.environ)
             else:
-                env = dict(os.environ)
+                env = zslurm_gpu.child_environment({}, os.environ)
             # This is a one-job launch option, not an inheritable environment
             # default. A controller's submitted compute children must retain
             # ordinary stuck detection, as must jobs inheriting chief env.

@@ -7,6 +7,12 @@ default_partition: normal
 # compute pilots.
 staging_partition: __disabled__
 staging_autogrow_enable: false
+# GPU jobs use the same manager with a separate device-accounted worker class.
+# Growth stays disabled until an operator sets a cap and an explicit allocation
+# profile (cores, mem_gb, gpus, optional gpu_type) in node_profiles below.
+gpu_partition: gpu_a100_22c
+autogrow_max_gpu_nodes: 0
+consolidation_min_gpu_engines: 0
 enable_ssd_prompt: true
 # All normal nodes expose local XFS through TMPDIR. The dedicated SSD prompt
 # maps an affirmative answer to --constraint=ssd; suppress the arbitrary

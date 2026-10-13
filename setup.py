@@ -7,11 +7,11 @@ import os.path
 
 setup(
     name="ZSlurm",
-    version="0.2.8",
+    version="0.3.0",
     scripts = ['zsqueue', 'zsbatch', 'zscancel','zslurm','zsnodes', 'zslurm_chief','zslurm_lease','slurm_to_zslurm','zsqueue_stats','zsoccupancy','zsstats','node_usage_viewer.py','zsstatus','zscontrol'],
     install_requires=['numpy>=1.4.1', 'psutil', 'tabulate', 'PyYAML'],
     extras_require={'ipyparallel': ['ipyparallel']},
-     py_modules=['zslurm_shared','zslurm_lease','zslurm_startup','zslurm_version','zslurm_config','zsb'],
+     py_modules=['zslurm_shared','zslurm_lease','zslurm_startup','zslurm_version','zslurm_config','zslurm_gpu','zsb'],
      data_files=[('share/zslurm/sites', ['config/sites/spider.yaml'])],
      author = "M. Hulsman",
      author_email = "m.hulsman1@amsterdamumc.nl",

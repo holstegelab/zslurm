@@ -3,6 +3,11 @@
 cluster_site: snellius
 default_partition: genoa
 staging_partition: staging
+# Override with gpu_h100 or another site route if required. Configure an exact
+# GPU allocation profile in node_profiles before enabling GPU autogrow.
+gpu_partition: gpu_a100
+autogrow_max_gpu_nodes: 0
+consolidation_min_gpu_engines: 0
 enable_ssd_prompt: true
 ssd_feature_name: scratch-node
 default_engine_cores: 0

@@ -588,6 +588,62 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
     def test_same_host_running_jobs_survive_rpc_handover_and_completion(self):
         self.exercise_same_host_running_job_transfer()
 
+    def test_gpu_assignments_survive_real_rpc_handover_without_duplicate_grants(self):
+        config_dir = self.workdir / '.zslurm'
+        config_dir.mkdir()
+        (config_dir / 'config.yaml').write_text(yaml.safe_dump({
+            'cluster_site':'generic', 'gpu_partition':'gpu_fake',
+            'node_profiles':{'gpu_fake':{'cores':4,'mem_gb':8,'gpus':2}},
+            'autogrow_enable':False,
+        }))
+        sinfo = self.workdir / 'fake-bin' / 'sinfo'
+        sinfo.write_text("#!/bin/sh\nprintf '%s\\n' 'normal*|(null)' 'gpu_fake|gpu:a100:2'\n")
+        sinfo.chmod(0o755)
+        source_name = self.instance_prefix + '_source'
+        self.start_manager(source_name)
+        config = self.wait_for_instances(1)[source_name]
+        source = xmlrpc.client.ServerProxy(self.url(config), allow_none=True)
+        worker = xmlrpc.client.ServerProxy(self.url(config, worker=True), allow_none=True)
+        fake_squeue = self.workdir / 'fake-bin' / 'squeue'
+        fake_squeue.write_text('#!/bin/sh\ncase "$*" in *' + source_name
+            + "*) printf '%s\\n' '1001|1001|N/A|" + source_name
+            + "|1-00:00:00|R|gpu-node|gpu_fake|0:00|N/A|4|None';; esac\n")
+        engine_id = worker.register_gpu_versioned('gpu-node',4,8000,'gpu','1001',
+            0,0,source_name,source.health()['version'],['GPU-A','GPU-B'])
+        deadline = time.time() + 20
+        while source.queue_stats()['engines']['running_gpu'] != 1:
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.1)
+        args = ('gpu-call','true',str(self.workdir),{},1,1000,3600,0,None,
+                0,0,0,0,0,0,'gpu',0,None,'','no',0,'gpu-owner','request-token',100,1)
+        running = source.submit_job(*args)
+        grants = worker.request_jobs(engine_id,4,8000,'gpu')
+        self.assertEqual(grants[0][4]['ZSLURM_GPU_DEVICES'], 'GPU-A')
+        self.assertTrue(worker.can_run_assigned_job(engine_id,running,['GPU-A']))
+        waiting_args = list(args)
+        waiting_args[-3] = 'waiting-token'
+        waiting = source.submit_job(*waiting_args)
+        self.assertEqual(worker.request_jobs(engine_id,3,7000,'gpu')[0][0], waiting)
+        target_name = self.instance_prefix + '_target'
+        self.start_manager(target_name)
+        target_config = self.wait_for_instances(2)[target_name]
+        target = xmlrpc.client.ServerProxy(self.url(target_config),allow_none=True)
+        target_worker = xmlrpc.client.ServerProxy(self.url(target_config,worker=True),allow_none=True)
+        self.assertTrue(target.handover_from('test-control-token',source_name)['ok'])
+        self.assertEqual(target.submit_job(*args), running)
+        self.assertEqual(target_worker.register_gpu_versioned('gpu-node',4,8000,
+            'gpu','1001',0,0,source_name,target.health()['version'],['GPU-A','GPU-B']), engine_id)
+        row = target.list_nodes(True)[0]
+        self.assertEqual(row[25:], [2,1,['GPU-A','GPU-B']])
+        grants = target_worker.request_jobs(engine_id,3,7000,'gpu')
+        self.assertEqual(grants[0][0],waiting)
+        self.assertEqual(grants[0][4]['ZSLURM_GPU_DEVICES'],'GPU-B')
+        self.assertTrue(target_worker.can_run_assigned_job(engine_id,waiting,['GPU-B']))
+        # Cached source endpoint forwards completion to the imported owner.
+        worker.job_finished(engine_id,running,0,{})
+        target_worker.job_finished(engine_id,waiting,0,{})
+        self.assertEqual(target.list_nodes(True)[0][26],0)
+
     def test_idle_retirement_control_is_registered_and_retained_over_rpc_handover(self):
         source_name = self.instance_prefix + '_source'
         target_name = self.instance_prefix + '_target'

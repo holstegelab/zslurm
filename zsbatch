@@ -13,13 +13,15 @@ import sys
 import shlex
 import time
 import traceback
+import uuid
 
 parser = argparse.ArgumentParser(description='Submit ZSlurm job')
 
 parser.add_argument('-c','--cpus-per-task',type=float, default=1, help='Advise the Slurm controller that ensuing job steps will require ncpus number of processors per task. Without this option, the controller will just try to allocate one processor per task.')
 parser.add_argument('--mem',type=float, default=1024, help='Specify the real memory required per node in MegaBytes. Default value is 1024.') # in mb
 parser.add_argument('-t','--time', default='0:1:0', help='Advise on total run time of the job allocation. Used by scheduler to prevent scheduling on nodes that will run out of time before job completion. Acceptable time formats include "minutes", "minutes:seconds", "hours:minutes:seconds", "days-hours", "days-hours:minutes" and "days-hours:minutes:seconds".') #mintues #minutes:sconds #hours:mintues:seconds #days-[time]
-parser.add_argument('-p','--partition', default='compute', help='Either compute or archive')
+parser.add_argument('-p','--partition', default='compute', choices=['compute', 'archive', 'gpu'], help='ZSlurm job partition (distinct from a physical Slurm partition)')
+parser.add_argument('--gpus', type=int, default=None, help='GPUs per task: default 1 in gpu partition, 0 otherwise')
 parser.add_argument('-q', '--qos', default='none', help='Included for SLURM compatibility, not used') # not used
 parser.add_argument('--requeue', action='store_true', help='Specifies that the batch job should eligible to being requeue. The job may be requeued after node failure. When a job is requeued, the batch script is initiated from its beginning.')
 parser.add_argument('-n', '--ntasks',type=float, default=1, help='Number of tasks to run') 
@@ -46,6 +48,10 @@ parser.add_argument('--instance', type=str, default=None, help='Submit to a spec
 
 parser.add_argument('job_args', nargs='*')
 args = parser.parse_args()
+if args.gpus is None:
+    args.gpus = 1 if args.partition == 'gpu' else 0
+if args.gpus < 0 or (args.partition == 'gpu') != (args.gpus > 0):
+    parser.error('Positive --gpus requires --partition=gpu; GPU jobs require at least one GPU')
 
 def _resolve_instance():
     if args.instance:
@@ -194,10 +200,17 @@ if job_args and os.path.exists(job_args[0]): #executes file
 if job_name is None:
     job_name = os.path.basename(job_args[0])
 
-if not args.partition in ['compute','archive']:
-    print('zsbatch: error: Only compute and archive partitions are currently supported')
+if args.partition == 'gpu':
+    try:
+        capability = proxy.ping()
+    except Exception:
+        capability = {}
+    if not isinstance(capability, dict) or capability.get('gpu_submit_protocol') != 1:
+        print('zsbatch: error: update the running manager before submitting GPU jobs')
+        sys.exit(1)
 
 attempt = 4
+gpu_tokens = [str(uuid.uuid4()) for _ in range(int(args.ntasks))] if args.partition == 'gpu' else []
 while attempt > 0 :
     try:
         for i in range(int(args.ntasks)):
@@ -211,7 +224,9 @@ while attempt > 0 :
             ]
             # Keep the default call compatible with older managers. Priority
             # was appended after owner/idempotency_key in the extended API.
-            if args.priority != 100:
+            if args.partition == 'gpu':
+                submit_args.extend([None, gpu_tokens[i], args.priority, args.gpus])
+            elif args.priority != 100:
                 submit_args.extend([None, None, args.priority])
             jobid = proxy.submit_job(*submit_args)
             if args.parsable:
@@ -220,7 +235,9 @@ while attempt > 0 :
                 print('Submitted batch job ' + jobid)
         sys.exit(0)
     except XMLRPCFault as serror:
-        if args.priority != 100:
+        if args.partition == 'gpu':
+            print('zsbatch: error: GPU submission was rejected: %s' % serror)
+        elif args.priority != 100:
             print(
                 'zsbatch: error: priority-aware submission was rejected; '
                 'update the running ZSlurm manager before using --priority: %s'
