@@ -419,6 +419,9 @@ class Status(object):
         
         self.node_profiles = dict(DEFAULT_NODE_PROFILES)
         self.cluster_site = "generic"
+        # Explicit, instance-loaded exclusions for physical compute pilots.
+        # Keep this separate from staging's dynamic archive-failure list.
+        self.compute_pilot_exclude_nodes = ()
         self.default_partition = "normal"
         self.staging_partition = "staging"
         self.enable_ssd_prompt = False
@@ -675,6 +678,7 @@ def _cluster_defaults(config=None):
 
     defaults = {
         "cluster_site": site,
+        "compute_pilot_exclude_nodes": [],
         "default_partition": "normal",
         "staging_partition": "staging",
         "gpu_partition": None,
@@ -760,6 +764,34 @@ def _optional_partition(value):
     return str(value).strip() if value and str(value).strip() != '__disabled__' else None
 
 
+def _cfg_compute_pilot_exclude_nodes(value):
+    """Validate explicit Slurm hostnames before building an sbatch command.
+
+    A config value is a YAML list or a comma-separated string. Slurm hostlist
+    ranges and arbitrary sbatch syntax are deliberately not accepted here:
+    every excluded physical node must be named explicitly.
+    """
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        names = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        names = value
+    else:
+        raise ValueError("compute_pilot_exclude_nodes must be a list of node names or comma-separated string")
+    if len(names) > 64:
+        raise ValueError("compute_pilot_exclude_nodes may contain at most 64 nodes")
+    checked = []
+    for name in names:
+        if not isinstance(name, str):
+            raise ValueError("compute_pilot_exclude_nodes contains a non-string node name")
+        name = name.strip()
+        if not name or len(name) > 255 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            raise ValueError("compute_pilot_exclude_nodes contains an invalid node name")
+        checked.append(name)
+    return tuple(sorted(set(checked)))
+
+
 def _discover_slurm_partitions():
     """Validate physical routes when Slurm is available; never query per job."""
     try:
@@ -839,8 +871,11 @@ def _apply_cluster_config(config, *, discover_partitions=False):
     """
     cfg = config if isinstance(config, dict) else {}
     defaults = _cluster_defaults(cfg)
+    compute_pilot_exclude_nodes = _cfg_compute_pilot_exclude_nodes(
+        cfg.get("compute_pilot_exclude_nodes", defaults["compute_pilot_exclude_nodes"]))
 
     status.cluster_site = defaults["cluster_site"]
+    status.compute_pilot_exclude_nodes = compute_pilot_exclude_nodes
     status.default_partition = str(cfg.get("default_partition", defaults["default_partition"]) or defaults["default_partition"])
     status.staging_partition = _optional_partition(cfg.get('staging_partition', defaults['staging_partition']))
     status.gpu_partition = _optional_partition(cfg.get('gpu_partition', defaults['gpu_partition']))
@@ -1918,6 +1953,8 @@ class JobManager(object):
                     'autogrow_enable': bool(status.autogrow_enable),
                     'autoconsolidate_enable': bool(status.autoconsolidate_enable),
                     'autogrow_max_compute_nodes': int(cfg.get('autogrow_max_compute_nodes', 0) or 0),
+                    'compute_pilot_exclude_nodes': list(_cfg_compute_pilot_exclude_nodes(
+                        getattr(status, 'compute_pilot_exclude_nodes', ()))),
                     'cwd_priority_overrides': self.list_cwd_priority_overrides(),
                     'controller_owner_prefixes': list(self.controller_owner_prefixes),
                 },
@@ -4317,6 +4354,10 @@ def ping():
         "gpfs_io_metrics": True,
         "job_dependencies": True,
         "job_dependency_types": sorted(SUPPORTED_DEPENDENCY_TYPES),
+        "compute_pilot_node_exclusions": True,
+        "compute_pilot_exclude_nodes": list(_cfg_compute_pilot_exclude_nodes(
+            getattr(status, 'compute_pilot_exclude_nodes', ()))),
+        "list_pilot_allocations": True,
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
         "explicit_handover": True,
         "handover_mode": str(getattr(status, 'handover_mode', 'ACTIVE')),
@@ -4655,6 +4696,7 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(get_job_states, "get_job_states")
         server.register_function(queue_stats, "queue_stats")
         server.register_function(list_nodes, "list_nodes")
+        server.register_function(list_pilot_allocations, "list_pilot_allocations")
         # Agent / programmatic interface (see docs/agent-interface-plan.md)
         server.register_function(ping, "ping")
         server.register_function(health, "health")
@@ -5526,6 +5568,11 @@ class EngineManager(object):
                     lpartition = "archive"
                 else:
                     lpartition = worker_kind
+                    if worker_kind == 'compute':
+                        excluded_nodes = _cfg_compute_pilot_exclude_nodes(
+                            getattr(status, 'compute_pilot_exclude_nodes', ()))
+                        if excluded_nodes:
+                            args.append("--exclude=" + ",".join(excluded_nodes))
 
                 # Resolve the runtime before calling sbatch. Slurm copies the
                 # launcher into a spool directory, so use the absolute,
@@ -6367,6 +6414,48 @@ def list_nodes(*args):
     return engines.list_nodes(*args)
 
 
+def list_pilot_allocations():
+    """Read-only registry of physical pilots, including queued placeholders.
+
+    This is a manager observation, not a fresh Slurm query. Callers making a
+    placement decision must reconcile these IDs with squeue/scontrol; a pilot
+    can move from pending to running between the two observations.
+    """
+    if _handover_committed_source():
+        return _handover_proxy(False).list_pilot_allocations()
+    with engines.lock:
+        observed = set(getattr(engines, 'last_observed_cids', set()) or set())
+        allocations = []
+        for cid, engine in sorted(engines.engine_by_clusterid.items(),
+                                  key=lambda item: str(item[0])):
+            if engine is None:
+                continue
+            allocations.append({
+                'cluster_id': str(cid),
+                'slurm_job_id': str(getattr(engine, 'slurm_job_id', None) or cid),
+                'partition': str(getattr(engine, 'partition', '') or ''),
+                'slurm_partition': str(getattr(engine, 'slurm_partition', '') or ''),
+                'slurm_state': str(getattr(engine, 'slurm_state', '') or ''),
+                'instance': str(getattr(engine, 'instance', '') or ''),
+                'managed': bool(getattr(engine, 'managed', False)),
+                'observed_in_last_squeue': str(cid) in observed,
+            })
+    return {
+        'ok': True,
+        'schema_version': 1,
+        'instance': str(getattr(status, 'instance_name', '') or ''),
+        'manager_uuid': str(getattr(status, 'manager_uuid', '') or ''),
+        'owned_instance_names': sorted({
+            str(name) for name in (
+                [getattr(status, 'instance_name', '')]
+                + list(getattr(status, 'handover_owned_aliases', set()) or set())
+                + [row['instance'] for row in allocations])
+            if name
+        }),
+        'allocations': allocations,
+    }
+
+
 def failed_node(*args):
     if _handover_committed_source():
         return _handover_proxy(True).failed_node(*args)
@@ -6513,6 +6602,8 @@ def _build_handover_snapshot(
                 'autogrow_max_compute_nodes', 0) or 0),
         'autogrow_max_gpu_nodes': int((getattr(status, 'config', {}) or {}).get(
             'autogrow_max_gpu_nodes', 0) or 0),
+        'compute_pilot_exclude_nodes': list(_cfg_compute_pilot_exclude_nodes(
+            getattr(status, 'compute_pilot_exclude_nodes', ()))),
     }
     finished = []
     for owner, owner_jobs in jobs.finished_jobs_by_owner.items():
@@ -6589,6 +6680,12 @@ def _apply_handover_snapshot(snapshot):
     _validate_gpu_handover_snapshot(snapshot)
     manager = snapshot.get('manager', {}) or {}
     scheduler = snapshot.get('scheduler', {}) or {}
+    # Validate the transferred submission policy before mutating the target.
+    # Legacy snapshots lack this key and therefore retain the target's
+    # instance-loaded policy rather than accidentally clearing it.
+    transferred_exclusions = _cfg_compute_pilot_exclude_nodes(
+        scheduler.get('compute_pilot_exclude_nodes',
+                      getattr(status, 'compute_pilot_exclude_nodes', ())))
     prefixes = manager.get('controller_owner_prefixes', [])
     if not isinstance(prefixes, list):
         raise ValueError('invalid controller owner prefix registry')
@@ -6720,6 +6817,7 @@ def _apply_handover_snapshot(snapshot):
         'autogrow_enable', False))
     status.handover_saved_autoconsolidate = bool(scheduler.get(
         'autoconsolidate_enable', False))
+    status.compute_pilot_exclude_nodes = transferred_exclusions
     status.handover_expected_cluster_ids = set(
         str(value)
         for value in snapshot.get('registered_cluster_ids', []) or [])
@@ -6730,6 +6828,7 @@ def _apply_handover_snapshot(snapshot):
     status.autogrow_enable = False
     status.autoconsolidate_enable = False
     if isinstance(getattr(status, 'config', None), dict):
+        status.config['compute_pilot_exclude_nodes'] = list(transferred_exclusions)
         status.config['autogrow_max_compute_nodes'] = int(scheduler.get(
             'autogrow_max_compute_nodes',
             status.config.get('autogrow_max_compute_nodes', 0)) or 0)
@@ -6749,6 +6848,13 @@ def receive_handover(secret, handover_id, snapshot):
     if getattr(status, 'handover_mode', 'ACTIVE') != 'ACTIVE':
         return {'ok': False, 'code': 3,
                 'error': f"target is in handover state {status.handover_mode}"}
+    try:
+        _cfg_compute_pilot_exclude_nodes(
+            (snapshot.get('scheduler', {}) or {}).get(
+                'compute_pilot_exclude_nodes',
+                getattr(status, 'compute_pilot_exclude_nodes', ())))
+    except ValueError as error:
+        return {'ok': False, 'code': 3, 'error': str(error)}
 
     jobs.lock.acquire()
     engines.lock.acquire()
@@ -9419,6 +9525,10 @@ def _remove_owned_instance_records():
 
 
 def main(scr, *args, **kwds):
+    # A malformed exclusion must fail before registering an instance record;
+    # otherwise an unusable manager could leave a stale discovery pointer.
+    _cfg_compute_pilot_exclude_nodes(
+        zslurm_shared.get_config().get('compute_pilot_exclude_nodes'))
     cli_args = kwds.get('cli_args')
     requested_recovery = getattr(cli_args, 'recover_instance', None)
     address = zslurm_shared.get_hostname()
@@ -10016,6 +10126,8 @@ def main_headless(args):
     thread. Required for autonomous/agent operation and for testing the agent
     interface (see docs/agent-interface-plan.md). add_log_line() already no-ops
     its window writes when gb.wlog is None, so logging goes to cluster.log only."""
+    _cfg_compute_pilot_exclude_nodes(
+        zslurm_shared.get_config().get('compute_pilot_exclude_nodes'))
     address = zslurm_shared.get_hostname()
     requested_recovery = getattr(args, 'recover_instance', None)
     recovery_config = _prepare_explicit_recovery(
