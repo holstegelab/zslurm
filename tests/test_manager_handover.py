@@ -342,6 +342,109 @@ class HandoverSnapshotTests(unittest.TestCase):
         self.assertEqual(z.status.handover_registered_cluster_ids, set())
         self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
 
+    def test_legacy_snapshot_tracks_six_unregistered_orphan_leases_until_terminal(self):
+        z = self.zslurm
+        orphan_cid = '41497549_1'
+        orphan = z.Engine('node-orphan', 30, 220708, 'compute', cluster_id=orphan_cid)
+        z.engines.engine_by_clusterid[orphan_cid] = orphan
+        orphan_jobs = []
+        for number in range(6):
+            job = self.add_job(str(number + 1), 'RUNNING', 20)
+            job.node_id = orphan.engine_id
+            orphan_jobs.append(job)
+        orphan.jobs = set(orphan_jobs)
+        live = self.add_job('7', 'RUNNING', 20)
+        live.node_id = 'node-live'
+        registered = z.Engine('node-live', 30, 220708, 'compute', cluster_id='41500000')
+        registered.jobs = {live}
+        z.engines.engine_by_id[registered.engine_id] = registered
+        z.engines.engine_by_clusterid[registered.cluster_id] = registered
+        pending = self.add_job('8', 'PENDING', 0)
+        z.jobs.active_inuse = 140
+        z.jobs.running_jobs = {'compute': 7}
+
+        with mock.patch.object(z, '_manager_descriptor', return_value={
+                'instance': 'source', 'manager_uuid': 'source-uuid'}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot(
+                'legacy-orphan-transfer', {'manager_uuid': 'target-uuid'})
+        self.assertEqual(snapshot['registered_cluster_ids'], ['41500000'])
+        # The XML-RPC round trip must not rely on source-side object identity.
+        snapshot = xmlrpc.client.loads(
+            xmlrpc.client.dumps((snapshot,), allow_none=True))[0][0]
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z.status.instance_name = 'target'
+        z.status.manager_uuid = 'target-uuid'
+        z._apply_handover_snapshot(snapshot)
+        self.assertEqual(z.status.handover_expected_cluster_ids,
+                         {'41500000', orphan_cid})
+        self.assertEqual(
+            {job.jobid for job in z.engines.engine_by_clusterid[orphan_cid].jobs},
+            {job.jobid for job in orphan_jobs})
+        z.status.handover_mode = 'TARGET_IMPORTED'
+        activated = z.activate_received_handover(
+            z.status.handover_secret, 'legacy-orphan-transfer')
+        self.assertEqual(activated['remaining_chiefs'], 2)
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+
+        self.assertEqual(z.register('node-live', 30, 220708, 'compute',
+                                    '41500000', 0, 0), 'node-live')
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+        imported_orphan = z.engines.engine_by_clusterid[orphan_cid]
+        imported_orphan.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+        z.engines.last_observed_cids = set()
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed', return_value=False):
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(
+                imported_orphan, True))
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+        self.assertTrue(all(z.jobs.jobs_by_id[job.jobid].state == 'RUNNING'
+                            for job in orphan_jobs))
+
+        imported_orphan.last_orphan_terminal_check = None
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (
+            b'41497549|41497549_1|CANCELLED\n', b'')
+        with mock.patch.object(z, 'Popen', return_value=process):
+            self.assertTrue(z.engines.reconcile_imported_orphan_engine(
+                imported_orphan, True))
+        for job in orphan_jobs:
+            imported = z.jobs.jobs_by_id[job.jobid]
+            self.assertEqual(imported.state, 'REQUEUED')
+            self.assertIsNone(imported.node_id)
+        self.assertEqual(z.jobs.jobs_by_id[live.jobid].state, 'RUNNING')
+        self.assertEqual(z.jobs.jobs_by_id[live.jobid].node_id, 'node-live')
+        self.assertEqual(z.jobs.jobs_by_id[pending.jobid].state, 'PENDING')
+        self.assertEqual(z.status.handover_terminal_cluster_ids, {orphan_cid})
+        self.assertEqual(z.status.handover_mode, 'TARGET_ACTIVE')
+        self.assertEqual(z.register('node-orphan', 30, 220708, 'compute',
+                                    orphan_cid, 0, 0), 'DENIED')
+
+    def test_import_adds_only_valid_unregistered_pilots_with_running_leases(self):
+        z = self.zslurm
+        registered = z.Engine('snellius-chief', 30, 220708, 'compute',
+                              cluster_id='registered-site-id')
+        z.engines.engine_by_id[registered.engine_id] = registered
+        z.engines.engine_by_clusterid[registered.cluster_id] = registered
+        invalid_cid = z.Engine('invalid-cid-chief', 30, 220708, 'compute',
+                               cluster_id='not-a-slurm-id')
+        z.engines.engine_by_clusterid[invalid_cid.cluster_id] = invalid_cid
+        running = self.add_job('invalid', 'RUNNING', 0)
+        running.node_id = invalid_cid.engine_id
+        stale = z.Engine('no-lease-chief', 30, 220708, 'compute',
+                         cluster_id='123_1')
+        z.engines.engine_by_clusterid[stale.cluster_id] = stale
+        z.engines.engine_by_clusterid['123_2'] = z.Engine(
+            '?', 30, 220708, 'compute', cluster_id='123_2')
+        with mock.patch.object(z, '_manager_descriptor', return_value={}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot('filtered-orphans', {})
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z._apply_handover_snapshot(snapshot)
+        self.assertEqual(z.status.handover_expected_cluster_ids,
+                         {'registered-site-id'})
+
     def test_imported_orphan_requires_fresh_absence_and_no_live_chief(self):
         z = self.zslurm
         engine, job = self.imported_orphan_array()

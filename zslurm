@@ -6899,9 +6899,24 @@ def _apply_handover_snapshot(snapshot):
     status.handover_saved_autoconsolidate = bool(scheduler.get(
         'autoconsolidate_enable', False))
     status.compute_pilot_exclude_nodes = transferred_exclusions
-    status.handover_expected_cluster_ids = set(
+    registered_cids = set(
         str(value)
         for value in snapshot.get('registered_cluster_ids', []) or [])
+    # Older sources enumerate only engine_by_id above. A chief that vanished
+    # before handover can still own RUNNING leases in engine_by_clusterid; if
+    # omitted here, activation declares migration complete before the target
+    # can prove that allocation terminal and requeue those exact leases.
+    # Preserve the source's registered set (including Snellius IDs) unchanged,
+    # and add only imported, unregistered Slurm pilots with real live leases.
+    orphan_cids = {
+        cid for cid, engine in engines.engine_by_clusterid.items()
+        if (cid not in registered_cids
+            and re.fullmatch(r"\d+(?:_\d+)?", cid)
+            and isinstance(engine.engine_id, str)
+            and engine.engine_id not in ('', '?')
+            and engine.jobs)
+    }
+    status.handover_expected_cluster_ids = registered_cids | orphan_cids
     status.handover_registered_cluster_ids = set()
     status.handover_terminal_cluster_ids = set()
     status.handover_owned_aliases = set(
