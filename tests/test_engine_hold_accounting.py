@@ -161,21 +161,63 @@ class EngineHoldAccountingTests(unittest.TestCase):
         engine.slurm_job_id = "9004"
         manager.engine_by_clusterid["123_4"] = engine
         for output, expected in [
-                (b"9004|COMPLETED\n", True),
-                (b"9004|CANCELLED by 123\n", True),
-                (b"9004|RUNNING\n", False),
-                (b"9004|PENDING\n", False),
-                (b"9004|COMPLETING\n", False),
-                (b"9004.batch|COMPLETED\n", False),
-                (b"9005|COMPLETED\n", False),
-                (b"9004|COMPLETED\n9004|RUNNING\n", False),
+                (b"9004|123_4|COMPLETED\n", True),
+                (b"9004|123_4|CANCELLED by 123\n", True),
+                (b"9004|123_4|RUNNING\n", False),
+                (b"9004|123_4|PENDING\n", False),
+                (b"9004|123_4|COMPLETING\n", False),
+                (b"9004|123_4.batch|COMPLETED\n", False),
+                (b"9005|123_4|COMPLETED\n", False),
+                (b"9004|123_5|COMPLETED\n", False),
+                (b"123|123|COMPLETED\n", False),
+                (b"9004|123_4|COMPLETED\n9004|123_4|RUNNING\n", False),
+                (b"9004|123_4|COMPLETED\n9004|123_5|RUNNING\n", False),
+                (b"9004|COMPLETED\n", False),
+                (b"9004|123_4|COMPLETED|extra\n", False),
                 (b"", False)]:
             with self.subTest(output=output), mock.patch.object(
-                    z, "Popen", return_value=fake_process(stdout=output)):
+                    z, "Popen", return_value=fake_process(stdout=output)) as popen:
                 self.assertEqual(manager._slurm_terminal_confirmed("123_4"), expected)
+                popen.assert_called_once_with(
+                    ["sacct", "-n", "-X", "-j", "9004", "-P",
+                     "--format=JobIDRaw,JobID,State"],
+                    stdout=z.subprocess.PIPE, stderr=z.subprocess.PIPE)
         with mock.patch.object(z, "Popen", return_value=fake_process(
-                returncode=1, stdout=b"9004|COMPLETED\n")):
+                returncode=1, stdout=b"9004|123_4|COMPLETED\n")):
             self.assertFalse(manager._slurm_terminal_confirmed("123_4"))
+
+    def test_terminal_accounting_spider_array_uses_canonical_jobid(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        # An unmaterialized array task is addressed as 123_4, but Spider's
+        # JobIDRaw column reports the shared base 123 for all array siblings.
+        for output, expected in [
+                (b"123|123_4|CANCELLED\n", True),
+                (b"123_4|123_4|COMPLETED\n", True),
+                (b"123|123_5|COMPLETED\n123|123_4|FAILED\n", True),
+                (b"123|123|COMPLETED\n123|123_4|TIMEOUT\n", True),
+                (b"123|123_5|COMPLETED\n", False),
+                (b"123|123|COMPLETED\n", False),
+                (b"123|123_4.batch|COMPLETED\n", False),
+                (b"123|123_4|COMPLETED\n123|123_4|RUNNING\n", False),
+                (b"9005|123_4|COMPLETED\n", False),
+                (b"123|123_4|COMPLETED\nbroken row\n", False)]:
+            with self.subTest(output=output), mock.patch.object(
+                    z, "Popen", return_value=fake_process(stdout=output)) as popen:
+                self.assertEqual(manager._slurm_terminal_confirmed("123_4"), expected)
+                self.assertEqual(popen.call_args.args[0][4], "123_4")
+
+    def test_terminal_accounting_non_array_requires_exact_jobid(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        for output, expected in [
+                (b"456|456|COMPLETED\n", True),
+                (b"456|456_1|COMPLETED\n", False),
+                (b"457|456|COMPLETED\n", False),
+                (b"456|456|COMPLETED\n456|456|FAILED\n", False)]:
+            with self.subTest(output=output), mock.patch.object(
+                    z, "Popen", return_value=fake_process(stdout=output)):
+                self.assertEqual(manager._slurm_terminal_confirmed("456"), expected)
 
     def test_controller_never_reconciles_queued_engines(self):
         tree = ast.parse(ZSLURM_PATH.read_text())
@@ -194,6 +236,7 @@ class EngineHoldAccountingTests(unittest.TestCase):
 
         self.assertNotIn("hold_or_cancel_queued", calls)
         self.assertNotIn("release_held", calls)
+        self.assertIn("reconcile_imported_orphan_engine", calls)
 
     def test_failed_hold_stays_queued_without_cancellation(self):
         manager = self.zslurm.EngineManager()

@@ -46,6 +46,9 @@ class HandoverSnapshotTests(unittest.TestCase):
         z.status.handover_mode = "ACTIVE"
         z.status.handover_target = None
         z.status.handover_owned_aliases = set()
+        z.status.handover_expected_cluster_ids = set()
+        z.status.handover_registered_cluster_ids = set()
+        z.status.handover_terminal_cluster_ids = set()
         z.status.lastin_first = True
         z.status.prio_fillmem_context = 500
         z.status.autogrow_enable = True
@@ -297,6 +300,114 @@ class HandoverSnapshotTests(unittest.TestCase):
         z.status.handover_expected_cluster_ids = {'12345', '54321'}
         z.engines.engine_by_clusterid['54321'] = z.Engine('node1', 30, 220708, 'compute', cluster_id='54321')
         self.assertIsNone(z.engines.job_lease_engine('node1'))
+
+    def imported_orphan_array(self):
+        z = self.zslurm
+        job = self.add_job('orphan-lease', 'RUNNING', 20)
+        z.jobs.active_inuse = 20
+        z.jobs.running_jobs = {'compute': 1}
+        engine = z.Engine('node1', 30, 220708, 'compute', cluster_id='123_4')
+        engine.jobs = {job}
+        engine.res_cpu_reserved = job.held_ncpu
+        engine.res_mem_reserved_mb = job.held_mem
+        z.engines.engine_by_clusterid['123_4'] = engine
+        z.engines.last_observed_cids = set()
+        engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        z.status.handover_saved_autogrow = False
+        z.status.handover_saved_autoconsolidate = False
+        z.status.handover_expected_cluster_ids = {'123_4'}
+        return engine, job
+
+    def test_terminal_imported_orphan_requeues_same_jobs_and_finishes_migration(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (b'123|123_4|CANCELLED\n', b'')
+        with mock.patch.object(z, 'Popen', return_value=process):
+            self.assertTrue(z.engines.reconcile_imported_orphan_engine(engine, True))
+        self.assertIs(z.jobs.jobs_by_id[job.jobid], job)
+        self.assertEqual(job.state, 'REQUEUED')
+        self.assertIsNone(job.node_id)
+        self.assertNotIn('123_4', z.engines.engine_by_clusterid)
+        self.assertEqual(engine.res_cpu_reserved, 0)
+        self.assertEqual(engine.res_mem_reserved_mb, 0)
+        self.assertEqual(z.status.handover_terminal_cluster_ids, {'123_4'})
+        self.assertEqual(z.status.handover_mode, 'TARGET_ACTIVE')
+        self.assertEqual(z.get_status_json()['handover']['terminal_chiefs'], 1)
+        # A delayed registration RPC cannot resurrect the fenced chief.
+        self.assertEqual(z.register('node1', 30, 220708, 'compute',
+                                    '123_4', 0, 0), 'DENIED')
+        self.assertFalse(z.engines.engine_by_id)
+        self.assertEqual(z.status.handover_registered_cluster_ids, set())
+        self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+
+    def test_imported_orphan_requires_fresh_absence_and_no_live_chief(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed', return_value=True) as terminal:
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, False))
+            engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE - 1
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+            z.engines.last_observed_cids = {'123_4'}
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            z.engines.last_observed_cids = set()
+            z.engines.engine_by_id['node1'] = engine
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            z.engines.engine_by_id.clear()
+            z.status.handover_expected_cluster_ids = set()
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            z.status.handover_expected_cluster_ids = {'123_4'}
+            z.engines.engine_by_clusterid['123_5'] = z.Engine(
+                'node1', 30, 220708, 'compute', cluster_id='123_5')
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            terminal.assert_not_called()
+        self.assertEqual(job.state, 'RUNNING')
+        self.assertIs(z.engines.engine_by_clusterid['123_4'], engine)
+
+    def test_imported_orphan_rejects_sibling_base_and_ambiguous_sacct_rows(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        for output in (
+                b'123|123_5|COMPLETED\n',
+                b'123|123|COMPLETED\n',
+                b'123|123_4|RUNNING\n',
+                b'123|123_4|CANCELLED\n123|123_4|COMPLETED\n',
+                b'123|123_4|CANCELLED\nmalformed\n'):
+            engine.last_orphan_terminal_check = None
+            process = mock.Mock(returncode=0)
+            process.communicate.return_value = (output, b'')
+            with self.subTest(output=output), mock.patch.object(z, 'Popen', return_value=process):
+                self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+                self.assertEqual(job.state, 'RUNNING')
+                self.assertIs(z.engines.engine_by_clusterid['123_4'], engine)
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+
+    def test_imported_orphan_throttles_repeated_accounting_queries(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed', return_value=False) as terminal:
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            terminal.assert_called_once_with('123_4')
+        self.assertEqual(job.state, 'RUNNING')
+
+    def test_imported_orphan_rechecks_chief_registration_after_sacct(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+
+        def chief_registered_during_query(_cid):
+            self.assertEqual(z.engines.register('node1', 30, 220708, 'compute',
+                                                '123_4', 0, 0), 'node1')
+            return True
+
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed',
+                               side_effect=chief_registered_during_query):
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+        self.assertEqual(job.state, 'RUNNING')
+        self.assertIs(z.engines.engine_by_id['node1'], engine)
+        self.assertEqual(z.status.handover_terminal_cluster_ids, set())
 
     def test_legacy_engine_object_strings_are_not_live_imported_jobs(self):
         z = self.zslurm

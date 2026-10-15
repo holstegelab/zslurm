@@ -477,6 +477,7 @@ class Status(object):
         self.handover_saved_autoconsolidate = None
         self.handover_expected_cluster_ids = set()
         self.handover_registered_cluster_ids = set()
+        self.handover_terminal_cluster_ids = set()
         self.handover_owned_aliases = set()
 
 
@@ -4382,6 +4383,8 @@ def get_status_json():
             status, 'handover_expected_cluster_ids', set()) or set()),
         'registered_chiefs': len(getattr(
             status, 'handover_registered_cluster_ids', set()) or set()),
+        'terminal_chiefs': len(getattr(
+            status, 'handover_terminal_cluster_ids', set()) or set()),
     }
     return result
 
@@ -5873,24 +5876,96 @@ class EngineManager(object):
 
     def _slurm_terminal_confirmed(self, cid):
         """Check the exact allocation; absence from a name-filtered queue is insufficient."""
+        cid = str(cid)
         control_id = self._slurm_control_id(cid)
+        if (not re.fullmatch(r"\d+(?:_\d+)?", cid)
+                or not re.fullmatch(r"\d+(?:_\d+)?", control_id)):
+            return False
         try:
             process = Popen(
-                ["sacct", "-n", "-X", "-j", control_id, "-P", "--format=JobIDRaw,State"],
+                ["sacct", "-n", "-X", "-j", control_id, "-P", "--format=JobIDRaw,JobID,State"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, _ = process.communicate()
             if process.returncode != 0:
                 return False
             if isinstance(stdout, bytes):
                 stdout = stdout.decode("utf-8")
-            rows = [line.strip().split("|") for line in stdout.splitlines() if line.strip()]
-            matches = [row for row in rows if len(row) >= 2 and row[0] == control_id]
+            # Spider reports JobIDRaw=array base for an unmaterialized task,
+            # e.g. 123|123_4|CANCELLED. JobID is the canonical task identity;
+            # raw ID alone can identify a sibling or the array parent instead.
+            expected_raw_ids = {control_id}
+            if "_" in cid:
+                expected_raw_ids.add(cid.split("_", 1)[0])
+            matches = []
+            for line in stdout.splitlines():
+                if not line.strip():
+                    continue
+                fields = [field.strip() for field in line.split("|")]
+                if len(fields) != 3 or not all(fields):
+                    return False
+                raw_id, job_id, state = fields
+                if job_id == cid:
+                    if raw_id not in expected_raw_ids:
+                        return False
+                    matches.append(state)
+                elif raw_id == control_id:
+                    # One physical ID must not identify two canonical tasks.
+                    return False
             terminal = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
                         "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
-            return (len(matches) == 1 and bool(matches[0][1].split())
-                    and matches[0][1].split()[0] in terminal)
+            return len(matches) == 1 and matches[0].split()[0] in terminal
         except (OSError, UnicodeError):
             return False
+
+    def _imported_orphan_terminal_candidate(self, engine, slurm_snapshot_ok):
+        """Require an imported, unregistered chief absent from fresh Slurm snapshots."""
+        if (slurm_snapshot_ok is not True
+                or getattr(status, 'handover_mode', '') != 'TARGET_MIGRATING'):
+            return False
+        cid = str(getattr(engine, 'cluster_id', '') or '')
+        eid = str(getattr(engine, 'engine_id', '') or '')
+        expected = getattr(status, 'handover_expected_cluster_ids', set()) or set()
+        registered = getattr(status, 'handover_registered_cluster_ids', set()) or set()
+        terminal = getattr(status, 'handover_terminal_cluster_ids', set()) or set()
+        if (not re.fullmatch(r"\d+(?:_\d+)?", cid)
+                or not eid or eid == '?'
+                or cid not in expected or cid in registered or cid in terminal
+                or self.engine_by_clusterid.get(cid) is not engine
+                or eid in self.engine_by_id
+                or any(item is engine for item in self.engine_by_id.values())
+                or cid in self.last_observed_cids
+                or engine.missing_hits < SQUEUE_MISSING_TOLERANCE):
+            return False
+        # engine_removed acts on the chief ID. Never requeue another pilot's
+        # lease if a malformed import gave two placeholders the same ID.
+        return sum(item is not None and item.engine_id == eid
+                   for item in self.engine_by_clusterid.values()) == 1
+
+    def reconcile_imported_orphan_engine(self, engine, slurm_snapshot_ok):
+        """Requeue leases of a terminal imported pilot that never re-registered."""
+        with self.lock:
+            if not self._imported_orphan_terminal_candidate(engine, slurm_snapshot_ok):
+                return False
+            cid = str(engine.cluster_id)
+            now = time.monotonic()
+            last_check = getattr(engine, 'last_orphan_terminal_check', None)
+            if (last_check is not None and 0 <= now - last_check < 60):
+                return False
+            engine.last_orphan_terminal_check = now
+        if not self._slurm_terminal_confirmed(cid):
+            return False
+        with self.lock:
+            # A chief may have registered while sacct ran. Recheck ownership
+            # and the latest squeue observation before changing any job state.
+            if not self._imported_orphan_terminal_candidate(engine, slurm_snapshot_ok):
+                return False
+            self._unregister(engine, "Imported chief lost; Slurm termination confirmed")
+            status.handover_terminal_cluster_ids.add(cid)
+            _maybe_finish_chief_migration()
+            add_log_line(
+                gb, f"Requeued leases of terminal imported pilot {cid}; "
+                "chief never re-registered.", YELLOW)
+            return True
 
     def reconcile_timed_out_engine(self, engine, slurm_snapshot_ok):
         """Fence a silent chief; requeue only after fresh Slurm absence evidence.
@@ -5962,6 +6037,12 @@ class EngineManager(object):
             raise ValueError('GPU workers require explicit devices; CPU/archive workers must not register devices')
         self.lock.acquire()
         try:
+            if (str(cluster_jobid) in getattr(status, 'handover_terminal_cluster_ids', set())
+                    and getattr(status, 'handover_mode', '') in
+                    ('TARGET_MIGRATING', 'TARGET_ACTIVE')):
+                # Reconciliation fenced this exact terminated allocation. A
+                # late RPC from its old chief must not resurrect its leases.
+                return 'DENIED'
             myid = zslurm_shared.short_name(myip)
 
             prev = self.engine_by_clusterid.get(cluster_jobid, None) if cluster_jobid not in (None, "", False) else None
@@ -6360,7 +6441,7 @@ def _migration_command_payload():
 
 def register(*args):
     myid = engines.register(*args)
-    if getattr(status, 'handover_mode', '') in (
+    if myid not in (None, 'DENIED') and getattr(status, 'handover_mode', '') in (
             'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'):
         try:
             cluster_id = str(args[4])
@@ -6822,6 +6903,7 @@ def _apply_handover_snapshot(snapshot):
         str(value)
         for value in snapshot.get('registered_cluster_ids', []) or [])
     status.handover_registered_cluster_ids = set()
+    status.handover_terminal_cluster_ids = set()
     status.handover_owned_aliases = set(
         str(value)
         for value in snapshot.get('source_instance_names', []) or [])
@@ -6922,7 +7004,9 @@ def _maybe_finish_chief_migration():
     expected = set(getattr(status, 'handover_expected_cluster_ids', set()) or set())
     registered = set(
         getattr(status, 'handover_registered_cluster_ids', set()) or set())
-    if expected - registered:
+    terminal = set(
+        getattr(status, 'handover_terminal_cluster_ids', set()) or set())
+    if expected - registered - terminal:
         return False
     if getattr(status, 'handover_mode', '') in (
             'TARGET_IMPORTED', 'TARGET_MIGRATING'):
@@ -6950,6 +7034,7 @@ def abort_received_handover(secret, handover_id):
     status.handover_owned_aliases = set()
     status.handover_expected_cluster_ids = set()
     status.handover_registered_cluster_ids = set()
+    status.handover_terminal_cluster_ids = set()
     status.autogrow_enable = False
     status.autoconsolidate_enable = False
     add_log_line(gb, f"Handover {handover_id}: target import rolled back.", YELLOW)
@@ -8042,8 +8127,14 @@ def thread_check_commands():
         try:
             slurm_snapshot_ok = engines._check_cluster_engines()
             all_engines = list(engines.engine_by_id.values())
+            imported_placeholders = [engine for engine in engines.engine_by_clusterid.values()
+                                     if engine is not None and engine.engine_id != '?'
+                                     and engine.engine_id not in engines.engine_by_id]
         finally:
             engines.lock.release()
+
+        for engine in imported_placeholders:
+            engines.reconcile_imported_orphan_engine(engine, slurm_snapshot_ok)
 
         now = time.time()
         for engine in all_engines:
