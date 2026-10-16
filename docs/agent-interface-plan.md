@@ -1,5 +1,8 @@
 # Agent Interface Plan for zslurm + Snellius
 
+> Design and implementation history. For current commands and operator workflows,
+> see [Operations](operations.md) and the [CLI reference](cli.md).
+
 *Companion to [`zslurm-architecture.md`](zslurm-architecture.md). Goal: let a Claude Code
 agent drive zslurm on Snellius autonomously — plan a run, submit it, watch it, and
 self-correct — without ever touching the curses TUI, while honouring the three pillars
@@ -34,6 +37,16 @@ primary documented workflow.** Do **not** scrape the TUI.
 ---
 
 ## 2. What to build (capabilities → mechanism)
+
+Unpublished live activity extension: `list_jobs_activity` opts into five appended
+job fields (`phase_name`, `phase_since`, `wait_reason`, `wait_since`,
+`wait_seconds`), for 20 fields including priority, or 22 when GPU fields are
+also requested. The activity flag follows the existing GPU flag in the RPC
+arguments. Default 14-field, priority 15-field and GPU 17-field rows remain
+unchanged. `zsqueue --json` schema 3 pads these fields when
+talking to an older manager. Chiefs carry activity through their existing
+heartbeat using the introspection-gated `poll_with_job_activity` RPC; job state
+and resource ownership are unaffected. See [intentional waits](resources.md#intentional-waits-and-live-job-activity).
 
 All new RPCs are thin shims over existing state/methods, registered next to the existing 6
 on the job server, taking `jobs.lock` for any mutation. Read RPCs stay open; **all writes

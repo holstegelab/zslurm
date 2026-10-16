@@ -1,5 +1,11 @@
 # zslurm / cluster_manager — Architecture & Behaviour Report
 
+> Historical design report. Version-specific statements and source line numbers
+> below describe an earlier checkout (some sections were updated later). For
+> current setup and behaviour, start with the [README](../README.md),
+> [scheduling guide](scheduling.md) and [operations guide](operations.md).
+> Headless operation and the programmatic control interface are now implemented.
+
 *Status: analysis report, 2026-06-02. Line references are `file:line` against the
 working copy in this repo (`zslurm`, `zslurm_chief`, `zslurm_shared.py`, the `zs*`
 clients) and the Snakemake executor plugin in `~/repos/snakemake_executor`.*
