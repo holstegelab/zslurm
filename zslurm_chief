@@ -11,10 +11,13 @@ import threading
 import traceback
 import getpass
 import math
+import re
+import tempfile
 import zslurm_shared
+import zslurm_gpu
 from zslurm_version import VERSION
 import zslurm_lease
-from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts
+from zslurm_startup import BestEffortDiagnosticStream, DeferredJobStarts, stuck_detection_enabled
 import socket
 
 if "--version" in sys.argv[1:]:
@@ -59,6 +62,12 @@ from time import gmtime, strftime
 
 def xtime():
     return (strftime("%Y-%m-%d %H:%M:%S", gmtime()))
+
+
+def retain_completed_job_log(retcode):
+    """Retain every failed child log; successful logs may be discarded."""
+
+    return retcode != 0
 
 STOP_THRESHOLD=60
 
@@ -323,22 +332,66 @@ def parse_slurm_memory_mb(value):
     return result
 
 
-def get_slurm_memory_limit_mb(cpu_count, environ=None):
+def _slurm_allocation_memory_mb(cpu_count, environ):
+    """Resolve conflicting inherited memory modes from this actual allocation.
+
+    Only a one-node pilot with a matching numeric job ID may use this result.
+    Failure is bounded and falls back conservatively in the caller.
+    """
+    job_id = str(environ.get('SLURM_JOB_ID', ''))
+    if not re.fullmatch(r'[0-9]+(?:_[0-9]+)?', job_id):
+        return None
+    try:
+        result = subprocess.run(['scontrol', 'show', 'job', job_id, '-o'],
+                                capture_output=True, text=True, check=True,
+                                timeout=5, env=environ)
+        records = [dict(word.split('=', 1) for word in line.split() if '=' in word)
+                   for line in result.stdout.splitlines()]
+        matches = [record for record in records if record.get('JobId') == job_id]
+        # An array's final instantiated task may retain the base JobId. Querying
+        # it can return every array sibling; never combine fields across jobs.
+        if len(matches) != 1:
+            return None
+        fields = matches[0]
+        if fields.get('NumNodes') != '1':
+            return None
+        granted_cpus = float(fields['NumCPUs'])
+        if not math.isfinite(granted_cpus) or granted_cpus < cpu_count:
+            return None
+        per_cpu = parse_slurm_memory_mb(fields.get('MinMemoryCPU'))
+        per_node = parse_slurm_memory_mb(fields.get('MinMemoryNode'))
+        if per_cpu is not None and per_node is None:
+            return per_cpu * cpu_count
+        if per_node is not None and per_cpu is None:
+            return per_node
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        pass
+    return None
+
+
+def get_slurm_memory_limit_mb(cpu_count, environ=None, allocation_lookup=None):
     """Return the memory granted to this Slurm allocation, when advertised."""
     env = os.environ if environ is None else environ
     per_node = parse_slurm_memory_mb(env.get('SLURM_MEM_PER_NODE'))
-    if per_node is not None:
-        return per_node
     per_cpu = parse_slurm_memory_mb(env.get('SLURM_MEM_PER_CPU'))
     if per_cpu is None:
-        return None
+        return per_node
     try:
         advertised_cpu = max(0.0, float(cpu_count))
     except (TypeError, ValueError):
-        return None
+        return per_node
     if not math.isfinite(advertised_cpu) or advertised_cpu <= 0.0:
-        return None
-    return per_cpu * advertised_cpu
+        return per_node
+    cpu_limit = per_cpu * advertised_cpu
+    if per_node is None or per_node == cpu_limit:
+        return cpu_limit
+    # Nested sbatch can retain the parent's opposite memory-mode variable.
+    # Never choose the larger limit from conflicting environment values alone.
+    lookup = allocation_lookup or _slurm_allocation_memory_mb
+    resolved = lookup(advertised_cpu, env)
+    if resolved is not None:
+        return resolved
+    return min(per_node, cpu_limit)
 
 
 def compute_engine_memory_capacity_mb(
@@ -467,63 +520,20 @@ def get_effective_available_mb():
 
 
 
-def configured_scratch_capacity_gb(config_map=None):
-    """Return this pilot's configured SSD entitlement, or None when uncapped."""
-    cfg = config if config_map is None else config_map
-    raw_value = cfg.get("ssd_capacity_gb")
-    if raw_value is None and str(cfg.get("cluster_site", "")).lower() == "spider":
-        # Spider grants 80 decimal GB of scratch per requested core. Keep a
-        # 30-core pilot below its roughly 2235-GiB entitlement.
-        raw_value = 2200.0
-    try:
-        value = float(raw_value or 0.0)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(value) or value <= 0.0:
-        return None
-    return value
+def detect_scratch_path(cluster_jobid, environ=None, allow_tmpdir=False):
+    """Return the local scratch root assigned to this pilot allocation.
 
-
-def _configured_scratch_paths(config_map=None, environ=None):
-    cfg = config if config_map is None else config_map
+    Snellius exposes a job-specific ``/scratch-node`` directory. Spider binds
+    its node-local XFS volume to ``TMPDIR=/tmp`` inside each Slurm job. TMPDIR
+    is therefore only accepted when a Slurm job identity is present; a login
+    node's ordinary /tmp must never make an unmanaged engine advertise SSD.
+    """
     env = os.environ if environ is None else environ
-    raw = cfg.get("ssd_scratch_root")
-    values = raw if isinstance(raw, (list, tuple)) else [raw]
-    paths = []
-    for value in values:
-        if not value:
-            continue
-        expanded = os.path.expanduser(os.path.expandvars(str(value)))
-        # expandvars reads os.environ, so also support an injected/test env.
-        if str(value).strip() in ("$TMPDIR", "${TMPDIR}"):
-            expanded = env.get("TMPDIR", expanded)
-        if expanded:
-            paths.append(expanded)
-    return paths
+    candidates = []
 
-
-def detect_scratch_path(cluster_jobid, config_map=None, environ=None):
-    """Return this Slurm pilot's writable allocation-local SSD directory."""
-    cfg = config if config_map is None else config_map
-    env = os.environ if environ is None else environ
-
-    # Spider exposes the allocation-local SSD through $TMPDIR. Only accept it
-    # for a real Slurm allocation; a login node's generic /tmp is not SSD.
-    candidates_by_path = _configured_scratch_paths(cfg, env)
-    if (
-        str(cfg.get("cluster_site", "")).strip().lower() == "spider"
-        and env.get("SLURM_JOB_ID")
-        and env.get("TMPDIR")
-    ):
-        candidates_by_path.append(env["TMPDIR"])
-    for path in candidates_by_path:
-        try:
-            if os.path.isdir(path) and os.access(path, os.W_OK):
-                return os.path.realpath(path)
-        except Exception as ex:
-            sys.stderr.write(f"{xtime()} - Scratch path probe failed for {path}: {ex}\n")
-            sys.stderr.write(traceback.format_exc())
-            sys.stderr.flush()
+    configured = env.get("ZSLURM_ENGINE_SCRATCH_DIR")
+    if configured:
+        candidates.append(str(configured))
 
     try:
         user = getpass.getuser()
@@ -533,36 +543,48 @@ def detect_scratch_path(cluster_jobid, config_map=None, environ=None):
         sys.stderr.flush()
         return None
 
-    if not user:
-        return None
-
-    candidates = []
-    job_id = env.get("SLURM_JOB_ID")
+    job_id = env.get("SLURM_JOB_ID") or env.get("SLURM_JOBID")
+    legacy_ids = []
     if job_id:
-        candidates.append(str(job_id))
+        legacy_ids.append(str(job_id))
     array_job_id = env.get("SLURM_ARRAY_JOB_ID")
     if array_job_id:
-        candidates.append(str(array_job_id))
+        legacy_ids.append(str(array_job_id))
         array_task_id = env.get("SLURM_ARRAY_TASK_ID")
         if array_task_id:
-            candidates.append(f"{array_job_id}_{array_task_id}")
+            legacy_ids.append(f"{array_job_id}_{array_task_id}")
 
     if cluster_jobid:
         cid = str(cluster_jobid)
         if cid:
-            candidates.append(cid)
+            legacy_ids.append(cid)
             if "_" in cid:
-                candidates.append(cid.split("_", 1)[0])
+                legacy_ids.append(cid.split("_", 1)[0])
 
     seen = set()
-    for candidate in candidates:
+    for candidate in legacy_ids:
         if not candidate or candidate in seen:
             continue
         seen.add(candidate)
-        path = f"/scratch-node/{user}.{candidate}"
+        if user:
+            candidates.append(f"/scratch-node/{user}.{candidate}")
+
+    slurm_tmp = env.get("SLURM_TMPDIR")
+    if slurm_tmp:
+        candidates.append(str(slurm_tmp))
+    generic_tmp = env.get("TMPDIR")
+    if allow_tmpdir and job_id and generic_tmp:
+        candidates.append(str(generic_tmp))
+
+    seen_paths = set()
+    for path in candidates:
+        path = os.path.realpath(os.path.expanduser(path))
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
         try:
             if os.path.isdir(path) and os.access(path, os.W_OK):
-                return os.path.realpath(path)
+                return path
         except Exception as ex:
             sys.stderr.write(f"{xtime()} - Scratch path probe failed for {path}: {ex}\n")
             sys.stderr.write(traceback.format_exc())
@@ -571,22 +593,90 @@ def detect_scratch_path(cluster_jobid, config_map=None, environ=None):
     return None
 
 
+def configured_scratch_capacity_gb(settings, engine_cores):
+    """Return an optional per-pilot SSD capacity cap in GiB."""
+    fixed = float(settings.get("scratch_capacity_gb", 0.0) or 0.0)
+    per_core = float(
+        settings.get("scratch_capacity_gb_per_core", 0.0) or 0.0
+    )
+    limits = []
+    if fixed > 0.0:
+        limits.append(fixed)
+    if per_core > 0.0 and float(engine_cores) > 0.0:
+        limits.append(per_core * float(engine_cores))
+    return min(limits) if limits else None
+
+
 def read_scratch_usage(path, capacity_gb=None):
-    """Return (total_gb, used_gb) for the scratch path."""
+    """Return (schedulable GiB, unavailable GiB) for the scratch path."""
     if not path:
         return 0.0, 0.0
     try:
         usage = shutil.disk_usage(path)
-        total_gb = max(0.0, usage.total / (1024.0 ** 3))
-        if capacity_gb is not None:
-            total_gb = min(total_gb, max(0.0, float(capacity_gb)))
-        used_gb = max(0.0, (usage.total - usage.free) / (1024.0 ** 3))
+        physical_total_gb = max(0.0, usage.total / (1024.0 ** 3))
+        physical_free_gb = max(0.0, usage.free / (1024.0 ** 3))
+        if capacity_gb is None:
+            total_gb = physical_total_gb
+        else:
+            total_gb = min(physical_total_gb, max(0.0, float(capacity_gb)))
+        # A partial Spider pilot must not advertise the entire shared 12-TiB
+        # device. Within its cap, physical free space is still authoritative.
+        available_gb = min(total_gb, physical_free_gb)
+        used_gb = max(0.0, total_gb - available_gb)
         return total_gb, used_gb
     except Exception as ex:
         sys.stderr.write(f"{xtime()} - SSD usage read failed for {path}: {ex}\n")
         sys.stderr.write(traceback.format_exc())
         sys.stderr.flush()
         return 0.0, 0.0
+
+
+def prepare_job_scratch(root, jobid):
+    """Create and return a private scratch directory for one child job."""
+    if not root:
+        return None
+    component = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in str(jobid)
+    )
+    if not component:
+        raise ValueError("empty ZSlurm job id cannot name scratch")
+    jobs_root = os.path.join(os.path.realpath(root), ".zslurm", "jobs")
+    os.makedirs(jobs_root, mode=0o700, exist_ok=True)
+    os.chmod(jobs_root, 0o700)
+    # Attempts can briefly overlap while the manager replaces a lost worker
+    # process. A unique suffix prevents a new attempt from deleting scratch
+    # that the previous process may still be using.
+    path = tempfile.mkdtemp(prefix="job-" + component + "-", dir=jobs_root)
+    os.chmod(path, 0o700)
+    return path
+
+
+def cleanup_job_scratch(root, path):
+    """Remove one owned child directory, never the pilot or filesystem root."""
+    if not root or not path:
+        return
+    jobs_root = os.path.realpath(
+        os.path.join(os.path.realpath(root), ".zslurm", "jobs")
+    )
+    resolved = os.path.realpath(path)
+    if os.path.dirname(resolved) != jobs_root or not os.path.basename(
+        resolved
+    ).startswith("job-"):
+        raise RuntimeError("refusing unsafe scratch cleanup: " + str(path))
+    shutil.rmtree(resolved, ignore_errors=True)
+
+
+def configure_job_scratch_environment(env, root, jobid):
+    """Assign one child directory and make all common temp APIs use it."""
+    if not root:
+        return None
+    path = prepare_job_scratch(root, jobid)
+    env["ZSLURM_SCRATCH_ROOT"] = os.path.realpath(root)
+    env["ZSLURM_SCRATCH_DIR"] = path
+    for name in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
+        env[name] = path
+    return path
 
 
 def parse_link_rate_bps(value):
@@ -812,14 +902,16 @@ if not cluster_managed:
     clusterid = ''
 
 ssd_refresh_interval = max(1.0, float(config.get('ssd_usage_refresh_interval_sec', 60.0)))
-scratch_path = detect_scratch_path(clusterid)
-ssd_capacity_limit_gb = configured_scratch_capacity_gb()
+scratch_path = detect_scratch_path(
+    clusterid, allow_tmpdir=bool(config.get("scratch_use_tmpdir", False))
+)
+scratch_capacity_gb = configured_scratch_capacity_gb(config, e_ncpu)
 ssd_total_gb = 0.0
 ssd_used_gb = 0.0
 ssd_last_refresh = 0.0
 
 if scratch_path and os.path.isdir(scratch_path):
-    total, used = read_scratch_usage(scratch_path, ssd_capacity_limit_gb)
+    total, used = read_scratch_usage(scratch_path, scratch_capacity_gb)
     ssd_total_gb = total
     ssd_used_gb = used
     ssd_last_refresh = time.time()
@@ -914,6 +1006,13 @@ _warned_legacy_manager = False
 def register_with_manager(proxy, *registration_args):
     """Send the chief version when supported without breaking old managers."""
     global _warned_legacy_manager
+    if len(registration_args) > 3 and registration_args[3] == 'gpu':
+        if not manager_supports_method(proxy, 'register_gpu_versioned'):
+            raise RuntimeError('GPU workers require a GPU-capable maintained manager; upgrade it first')
+        devices = zslurm_gpu.worker_devices(os.environ)
+        if not devices:
+            raise RuntimeError('GPU worker has no allocated CUDA devices')
+        return proxy.register_gpu_versioned(*(registration_args + (VERSION, devices)))
     if manager_supports_method(proxy, "register_versioned"):
         return proxy.register_versioned(*(registration_args + (VERSION,)))
     if not _warned_legacy_manager:
@@ -925,6 +1024,15 @@ def register_with_manager(proxy, *registration_args):
         sys.stderr.flush()
         _warned_legacy_manager = True
     return proxy.register(*registration_args)
+
+
+def acknowledge_job_grant(proxy, engine_id, job):
+    """Fence GPU start acknowledgements by their exact grant device IDs."""
+    environment = job[4] if isinstance(job[4], dict) else {}
+    if int(environment.get('ZSLURM_GPUS', 0)) > 0:
+        return proxy.can_run_assigned_job(engine_id, job[0],
+            zslurm_gpu.device_ids(environment.get('ZSLURM_GPU_DEVICES', '')))
+    return proxy.can_run_assigned_job(engine_id, job[0])
 
 
 def register_at_manager(manager_uri):
@@ -1090,7 +1198,10 @@ class status:
     current_cpu_usage = {}
     current_mem_usage = {}
 
-def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
+def job_monitor(
+    jobid, process, ncpu, mem, logfile, logfile_path,
+    job_scratch_context=None, *, job_role=None,
+):
     memcache = [] #stores memory usage at different snapshots over time
     cpucache = [] #stores cpu usage at different snapshots over time
     iocache = {} #stores latest known io counter info per process. Note that this is an estimate, when a child process stops this information disappears, so we might miss the last 30 seconds of io per child process.
@@ -1106,7 +1217,11 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
     live_monitor_interval = float(config.get('monitor_live_interval_sec', min(5.0, monitor_interval)))
     stuck_cpu_thr = float(config.get('stuck_cpu_core_threshold', 0.05))
     stuck_io_thr = float(config.get('stuck_io_activity_bytes_threshold', 4096.0))
-    stuck_enabled = bool(config.get('stuck_detection_enable', True))
+    stuck_enabled = stuck_detection_enabled(config, job_role)
+    if job_role == 'controller':
+        sys.stderr.write(f'{xtime()} - [{myid}] Job {jobid}: controller role; '
+                         'CPU/I/O silence termination disabled, resource monitoring retained\n')
+        sys.stderr.flush()
     stuck_stop_threshold = int(config.get('stuck_stop_threshold', STOP_THRESHOLD))
     if stuck_stop_threshold < 1:
         stuck_stop_threshold = 1
@@ -1334,16 +1449,27 @@ def job_monitor(jobid, process, ncpu, mem,logfile, logfile_path):
 
     logfile.close()
 
+    if job_scratch_context:
+        job_scratch_root, job_scratch_path = job_scratch_context
+        try:
+            cleanup_job_scratch(job_scratch_root, job_scratch_path)
+        except Exception as ex:
+            sys.stderr.write(
+                f"{xtime()}:{jobid} - Scratch cleanup failed for "
+                f"{job_scratch_path}: {ex}\n"
+            )
+            sys.stderr.flush()
+
     if not keep_logfiles:
         try:
-            with open(logfile_path, 'r') as logfile:
-                log_insides = logfile.read()
-            if 'error in file' not in log_insides.lower() or retcode == 0:
+            if not retain_completed_job_log(retcode):
                 sys.stderr.write(f'Deleting log file {logfile_path} as there are no errors.\n')
                 sys.stderr.flush()
                 os.remove(logfile_path)
             else:
-                sys.stderr.write(f'Keeping log file {logfile_path} as there are errors.\n')
+                sys.stderr.write(
+                    f'Keeping failed job log {logfile_path} (return code {retcode}).\n'
+                )
                 sys.stderr.flush()
 
         except FileNotFoundError:
@@ -1430,13 +1556,30 @@ lease_socket_path = _lease_socket_path()
 lease_server = zslurm_lease.LeaseServer(
     lease_socket_path, lease_controller
 ).start()
+
+
+def _prepare_child_scratch_environment(env, jobid):
+    # Scratch may be discovered again after chief startup. Bind the root into
+    # the returned context so a later refresh cannot redirect cleanup.
+    root = scratch_path
+    if not root:
+        return None
+    path = configure_job_scratch_environment(env, root, jobid)
+    return root, path
+
+
+def _cleanup_child_scratch_context(context):
+    root, path = context
+    cleanup_job_scratch(root, path)
+
+
 job_starter = DeferredJobStarts(
     status, lease_controller, lease_socket_path, job_monitor, event_timer,
     retry_seconds=config.get('job_start_retry_seconds', PING_INTERVAL),
     retry_max_seconds=config.get('job_start_retry_max_seconds', 300.0),
     memory_available=_lease_memory_available,
-    scratch_root=scratch_path,
-    scratch_capacity_gb=ssd_total_gb,
+    prepare_child_environment=_prepare_child_scratch_environment,
+    cleanup_child_context=_cleanup_child_scratch_context,
 )
 atexit.register(lease_server.close)
 sys.stderr.write(f"{xtime()} - LEASE SERVER; INFO: {lease_socket_path}\n")
@@ -1531,17 +1674,20 @@ try :
                         jobs = []
                 for job in jobs:
                     jobid, job_name, command, cwd, env, ncpu, mem, state = job
+                    if partition != 'gpu' and isinstance(env, dict):
+                        # Old CPU managers return the raw submitter environment.
+                        # Inherited GPU tags are not a device grant.
+                        env = dict(env, ZSLURM_GPUS='0', ZSLURM_GPU_DEVICES='')
+                        job = tuple(job[:4]) + (env,) + tuple(job[5:])
                     if jobid in status.running_processes or jobid in job_starter.pending:
                         continue
                     if state == 'ASSIGNED':
                         if status.current_cpu >= ncpu and min(status.current_mem, mb_memory_available) >= mem:
-                            # Keep the grant locally until the acknowledgement
-                            # response arrives. can_run_assigned_job is
-                            # idempotent, so a lost response is retried instead
-                            # of becoming a manager-only RUNNING ghost.
+                            # Retain the grant until the acknowledgement reply
+                            # arrives. A lost reply can then be retried safely.
                             status.assigned_jobs[jobid] = job
                             try:
-                                permission = s.can_run_assigned_job(myid, jobid)
+                                permission = acknowledge_job_grant(s, myid, job)
                             except MANAGER_RPC_ERRORS:
                                 continue
                             status.assigned_jobs.pop(jobid, None)
@@ -1617,9 +1763,14 @@ try :
 
             if now - ssd_last_refresh >= ssd_refresh_interval:
                 if not scratch_path or not os.path.isdir(scratch_path):
-                    scratch_path = detect_scratch_path(clusterid)
+                    scratch_path = detect_scratch_path(
+                        clusterid,
+                        allow_tmpdir=bool(
+                            config.get("scratch_use_tmpdir", False)
+                        ),
+                    )
                 ssd_total_gb, ssd_used_gb = read_scratch_usage(
-                    scratch_path, ssd_capacity_limit_gb
+                    scratch_path, scratch_capacity_gb
                 )
                 ssd_last_refresh = now
 

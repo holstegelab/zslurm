@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -16,7 +17,7 @@ import zslurm_lease
 import zslurm_startup as startup
 
 
-def fixture(tmp_path, scratch_root=None, scratch_capacity_gb=0):
+def fixture(tmp_path):
     state = SimpleNamespace(
         lock=threading.RLock(), current_cpu=8.0, current_mem=16000.0,
         running_processes={}, current_cpu_usage={}, current_mem_usage={},
@@ -46,7 +47,6 @@ def fixture(tmp_path, scratch_root=None, scratch_capacity_gb=0):
     starter = startup.DeferredJobStarts(
         state, leases, '/tmp/test-only.sock', monitor, wake,
         retry_seconds=20, retry_max_seconds=300, clock=lambda: clock[0],
-        scratch_root=scratch_root, scratch_capacity_gb=scratch_capacity_gb,
     )
     command = shlex.join([sys.executable, '-c', "print('child completed')"])
     job = ('J1', 'test_rule', command, str(tmp_path), dict(os.environ), 8.0, 16000.0, 'RUNNING')
@@ -227,35 +227,83 @@ def test_engine_slurm_identity_and_original_environment_are_preserved(tmp_path, 
     assert env == {'SLURM_JOB_ID': 'controller-allocation', 'CUSTOM': 'kept'}
 
 
-def test_child_receives_private_allocation_scratch_and_cleanup(tmp_path, monkeypatch):
-    allocation = tmp_path / 'allocation'
-    allocation.mkdir()
-    starter, state, leases, job, clock, finished, observed = fixture(
-        tmp_path, scratch_root=allocation, scratch_capacity_gb=3000,
-    )
-    monkeypatch.setenv('SLURM_JOB_ID', 'engine-allocation')
-    env = {'TMPDIR': '/controller/tmp'}
+def test_child_scratch_context_survives_retry_and_is_cleaned(tmp_path):
+    starter, state, leases, job, clock, finished, observed = fixture(tmp_path)
+    prepared_paths = []
+    cleaned_paths = []
+    environment_before_prepare = []
+    cleanup_done = threading.Event()
+
+    def prepare_environment(env, jobid):
+        environment_before_prepare.append({
+            name: env.get(name)
+            for name in (
+                'ZSLURM_SCRATCH_ROOT', 'ZSLURM_SCRATCH_DIR',
+                'TMPDIR', 'TMP', 'TEMP', 'TEMPDIR',
+            )
+        })
+        path = tmp_path / f'scratch-{len(prepared_paths)}'
+        path.mkdir()
+        prepared_paths.append(path)
+        env['ZSLURM_SCRATCH_DIR'] = str(path)
+        env['TMPDIR'] = str(path)
+        return str(path)
+
+    def cleanup_context(path):
+        cleaned_paths.append(Path(path))
+        shutil.rmtree(path)
+
+    original_monitor = starter.monitor
+
+    def monitor_with_context(
+        jobid, process, cores, mem, logfile, logfile_path, context
+    ):
+        try:
+            original_monitor(
+                jobid, process, cores, mem, logfile, logfile_path
+            )
+        finally:
+            cleanup_context(context)
+            cleanup_done.set()
+
+    starter.prepare_child_environment = prepare_environment
+    starter.cleanup_child_context = cleanup_context
+    starter.monitor = monitor_with_context
+    controller_env = dict(os.environ)
+    controller_env.update({
+        'TMPDIR': '/controller/tmp',
+        'ZSLURM_SCRATCH_DIR': '/controller/scratch',
+    })
     code = (
-        "import os; from pathlib import Path; "
-        "root=Path(os.environ['ZSLURM_SCRATCH_ROOT']); "
-        "assert os.environ['TMPDIR'] == str(root); "
-        "assert os.environ['ZSLURM_SCRATCH_CAPACITY_GB'] == '3000.0'; "
-        "(root / 'owned').write_text('ok'); print(root.name)"
+        "import os; print(os.environ['ZSLURM_SCRATCH_DIR'], "
+        "os.environ['TMPDIR'])"
     )
     job = job[:2] + (
-        shlex.join([sys.executable, '-c', code]), job[3], env,
+        shlex.join([sys.executable, '-c', code]), job[3], controller_env
     ) + job[5:]
+
     starter.claim(job)
+    with mock.patch.object(
+        startup.subprocess, 'Popen',
+        side_effect=OSError(errno.EAGAIN, 'process limit'),
+    ):
+        starter.run_ready()
+
+    assert cleaned_paths == [prepared_paths[0]]
+    assert not prepared_paths[0].exists()
+    assert all(value is None for value in environment_before_prepare[0].values())
+
+    clock[0] = 20
     starter.run_ready()
     assert finished.wait(10)
-    child = allocation / 'job-J1'
-    for _ in range(100):
-        if not child.exists():
-            break
-        threading.Event().wait(0.01)
-    assert not child.exists()
-    assert Path(observed[0][1]).read_text() == 'job-J1\n'
-    assert env == {'TMPDIR': '/controller/tmp'}
+    assert cleanup_done.wait(10)
+    assert cleaned_paths == prepared_paths
+    assert not prepared_paths[1].exists()
+    assert Path(observed[0][1]).read_text() == (
+        f'{prepared_paths[1]} {prepared_paths[1]}\n'
+    )
+    assert controller_env['TMPDIR'] == '/controller/tmp'
+    assert controller_env['ZSLURM_SCRATCH_DIR'] == '/controller/scratch'
 
 
 def test_chief_diagnostic_write_and_flush_failures_are_nonfatal():

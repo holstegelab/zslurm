@@ -8,13 +8,33 @@ import errno
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import threading
 import time
 
 import zslurm_lease
+import zslurm_gpu
+
+MONITOR_ROLE_ENV = 'ZSLURM_JOB_MONITOR_ROLE'
+
+
+def controller_monitor_supported(version):
+    """Fail closed when a rolling deployment still has legacy chiefs."""
+    if not isinstance(version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+        return False
+    return tuple(int(v) for v in version.split('.')) >= (0, 2, 4)
+
+
+def stuck_detection_enabled(config, job_role=None):
+    """CPU/I/O silence is not proof that a queue-waiting controller is stuck.
+
+    This changes only that heuristic; normal accounting, cancellation and
+    allocation limits remain active. Unknown roles must not silently opt out.
+    """
+    if job_role not in (None, 'compute', 'controller'):
+        raise ValueError('job monitor role must be compute or controller')
+    return bool(config.get('stuck_detection_enable', True)) and job_role != 'controller'
 
 
 TRANSIENT_START_ERRNOS = frozenset(
@@ -53,8 +73,8 @@ class BestEffortDiagnosticStream:
 class DeferredJobStarts:
     def __init__(self, status, leases, socket_path, monitor, wake_event,
                  retry_seconds=20.0, retry_max_seconds=300.0, clock=None,
-                 memory_available=None, scratch_root=None,
-                 scratch_capacity_gb=0.0):
+                 memory_available=None, prepare_child_environment=None,
+                 cleanup_child_context=None):
         self.status = status
         self.leases = leases
         self.socket_path = socket_path
@@ -64,39 +84,9 @@ class DeferredJobStarts:
         self.retry_max_seconds = max(self.retry_seconds, float(retry_max_seconds))
         self.clock = clock or time.monotonic
         self.memory_available = memory_available
-        self.scratch_root = (
-            os.path.realpath(str(scratch_root)) if scratch_root else None
-        )
-        self.scratch_capacity_gb = max(0.0, float(scratch_capacity_gb or 0.0))
+        self.prepare_child_environment = prepare_child_environment
+        self.cleanup_child_context = cleanup_child_context
         self.pending = {}
-
-    def _prepare_job_scratch(self, jobid):
-        if not self.scratch_root:
-            return None
-        safe_jobid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(jobid))
-        if not safe_jobid:
-            raise ValueError("empty ZSlurm job id for scratch directory")
-        root = os.path.realpath(self.scratch_root)
-        path = os.path.realpath(os.path.join(root, "job-" + safe_jobid))
-        if os.path.commonpath([root, path]) != root:
-            raise ValueError("job scratch path escaped allocation root")
-        os.makedirs(path, mode=0o700, exist_ok=True)
-        if not os.path.isdir(path) or not os.access(path, os.W_OK):
-            raise OSError(errno.EACCES, "job scratch is not writable", path)
-        return path
-
-    @staticmethod
-    def _cleanup_job_scratch(path):
-        if not path:
-            return
-        try:
-            shutil.rmtree(path)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            DeferredJobStarts.log(
-                f"scratch cleanup failed for {path}: {error}"
-            )
 
     @staticmethod
     def log(message):
@@ -159,19 +149,24 @@ class DeferredJobStarts:
         jobid, name, command, cwd, original_env, cores, mem, _ = entry['job']
         logfile = None
         prepared = False
+        child_context = None
         started = threading.Event()
         child = {}
-        job_scratch = None
 
         def monitor_when_spawned():
             started.wait()
             process = child.get('process')
             if process is not None:
-                try:
-                    self.monitor(jobid, process, cores, mem,
-                                 child['logfile'], child['logfile_path'])
-                finally:
-                    self._cleanup_job_scratch(child.get('job_scratch'))
+                monitor_args = [
+                    jobid, process, cores, mem,
+                    child['logfile'], child['logfile_path'],
+                ]
+                if child.get('context') is not None:
+                    monitor_args.append(child['context'])
+                monitor_options = {}
+                if child.get('monitor_role') is not None:
+                    monitor_options['job_role'] = child['monitor_role']
+                self.monitor(*monitor_args, **monitor_options)
 
         try:
             # Never chdir the multi-threaded chief. Slow/failing shared-storage
@@ -183,19 +178,24 @@ class DeferredJobStarts:
             args = shlex.split(command)
             env = original_env
             if isinstance(env, dict):
-                env = {k: v for k, v in env.items() if not k.startswith('SLURM')}
-                env.update({k: v for k, v in os.environ.items() if k.startswith('SLURM')})
-                job_scratch = self._prepare_job_scratch(jobid)
-                if job_scratch:
-                    env.update({
-                        'ZSLURM_SCRATCH_ROOT': job_scratch,
-                        'ZSLURM_SCRATCH_ALLOCATION_ROOT': self.scratch_root,
-                        'ZSLURM_SCRATCH_CAPACITY_GB': str(self.scratch_capacity_gb),
-                        'TMPDIR': job_scratch,
-                        'TMP': job_scratch,
-                        'TEMP': job_scratch,
-                        'TEMPDIR': job_scratch,
-                    })
+                env = zslurm_gpu.child_environment(env, os.environ)
+            else:
+                env = zslurm_gpu.child_environment({}, os.environ)
+            # This is a one-job launch option, not an inheritable environment
+            # default. A controller's submitted compute children must retain
+            # ordinary stuck detection, as must jobs inheriting chief env.
+            monitor_role = original_env.get(MONITOR_ROLE_ENV) if isinstance(original_env, dict) else None
+            stuck_detection_enabled({}, monitor_role)  # validate before spawn
+            env.pop(MONITOR_ROLE_ENV, None)
+            # The submitted environment was captured on the controller. Never
+            # pass its temporary or scratch directory to a worker allocation.
+            for name in (
+                'ZSLURM_SCRATCH_ROOT', 'ZSLURM_SCRATCH_DIR',
+                'TMPDIR', 'TMP', 'TEMP', 'TEMPDIR',
+            ):
+                env.pop(name, None)
+            if self.prepare_child_environment is not None:
+                child_context = self.prepare_child_environment(env, jobid)
 
             with self.status.lock:
                 if self.pending.get(jobid) is not entry:
@@ -203,8 +203,7 @@ class DeferredJobStarts:
                 lease_env = self.leases.prepare_job(jobid, cores, mem)
                 prepared = True
                 lease_env[zslurm_lease.ENV_SOCKET] = self.socket_path
-                if isinstance(env, dict):
-                    env.update(lease_env)
+                env.update(lease_env)
                 # Start the monitor thread BEFORE spawning. A thread creation
                 # failure must never leave an unmonitored child or spawn twice.
                 monitor = threading.Thread(target=monitor_when_spawned)
@@ -213,14 +212,16 @@ class DeferredJobStarts:
                     args, stdout=logfile, stderr=logfile, cwd=cwd, env=env,
                     preexec_fn=os.setpgrp,
                 )
-                self.status.running_processes[jobid] = process
-                self.pending.pop(jobid)
                 child.update(
                     process=process, logfile=logfile,
-                    logfile_path=logfile_path, job_scratch=job_scratch,
+                    logfile_path=logfile_path, context=child_context,
+                    monitor_role=monitor_role,
                 )
                 logfile = None  # The monitor now owns/cleans the open handle.
+                child_context = None  # The monitor now owns/cleans the context.
                 prepared = False  # The live child now owns its lease.
+                self.status.running_processes[jobid] = process
+                self.pending.pop(jobid)
             self.log(f'{jobid} - START; INFO: {cores} {mem} {command} {logfile_path}')
         except Exception as error:
             if prepared:
@@ -247,10 +248,16 @@ class DeferredJobStarts:
                 self.log(f'{jobid} - START FAILED: {error}')
         finally:
             started.set()  # Failed spawn: the waiting monitor exits without reporting.
+            if child_context is not None and self.cleanup_child_context is not None:
+                try:
+                    self.cleanup_child_context(child_context)
+                except Exception as error:
+                    self.log(
+                        f'{jobid} - child-context cleanup failed after '
+                        f'unsuccessful start: {error}'
+                    )
             if logfile is not None:
                 try:
                     logfile.close()
                 except OSError:
                     pass
-            if child.get('process') is None:
-                self._cleanup_job_scratch(job_scratch)

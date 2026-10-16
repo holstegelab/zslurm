@@ -312,9 +312,8 @@ def _host_aliases():
 def resolve_instance_name(instance=None):
     names = get_instance_names()
     if instance:
-        if instance in names:
-            return instance        
-    # No instance provided: prefer env var; else single discovered instance    
+        return instance if instance in names else None
+    # Only an omitted name may select the sole discovered instance.
     if len(names) == 1:
         return names[0]
     return None
@@ -576,21 +575,15 @@ def _parse_scontrol_json_nodes(s):
     return out
 
 
-def _safe_int(value):
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _collect_states_by_scratch(nodes, scratch_feature="scratch-node"):
+def _collect_states_by_scratch(nodes, feature_name="scratch-node"):
     parts = {}
-    feature = str(scratch_feature or "scratch-node")
     for nd in nodes:
         pset = nd.get("partitions") or []
         if not pset:
             pset = ["(none)"]
-        has_scratch = feature in (nd.get("features") or set())
+        has_scratch = bool(
+            feature_name and feature_name in (nd.get("features") or set())
+        )
         key = "scratch" if has_scratch else "no_scratch"
         st = nd.get("state") or "UNKNOWN"
         for p in pset:
@@ -618,13 +611,15 @@ def _collect_states_by_scratch(nodes, scratch_feature="scratch-node"):
     return parts
 
 
-def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60, scratch_feature="scratch-node"):
-    global _scratch_parts_cache_ts, _scratch_parts_cache, _scratch_parts_cache_feature
+def slurm_partition_state_counts_by_scratch(
+    cache_ttl_sec=60, feature_name="scratch-node"
+):
+    global _scratch_parts_cache_ts, _scratch_parts_cache
+    global _scratch_parts_cache_feature
     now = time.time()
-    feature = str(scratch_feature or "scratch-node")
     if (
         _scratch_parts_cache is not None
-        and _scratch_parts_cache_feature == feature
+        and _scratch_parts_cache_feature == feature_name
         and (now - _scratch_parts_cache_ts) < float(cache_ttl_sec)
     ):
         return _scratch_parts_cache
@@ -648,10 +643,10 @@ def slurm_partition_state_counts_by_scratch(cache_ttl_sec=60, scratch_feature="s
                 nodes = []
         except Exception:
             nodes = []
-    parts = _collect_states_by_scratch(nodes or [], feature)
+    parts = _collect_states_by_scratch(nodes or [], feature_name=feature_name)
     _scratch_parts_cache = parts
     _scratch_parts_cache_ts = now
-    _scratch_parts_cache_feature = feature
+    _scratch_parts_cache_feature = feature_name
     return parts
 
 

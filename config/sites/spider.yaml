@@ -1,21 +1,49 @@
-# Spider pilot defaults. Copy/merge into ~/.zslurm/config.yaml and review the
-# enabled autogrow cap before starting the manager.
+# Spider pilot defaults. Copy or merge into ~/.zslurm/config.yaml and review
+# the enabled engine cap before starting the manager.
 cluster_site: spider
 default_partition: normal
-staging_partition: staging
+# Spider has no physical staging partition. Archive-source workflows require a
+# separately configured backend/pilot class; dCache and S3 transfers use normal
+# compute pilots.
+staging_partition: __disabled__
+staging_autogrow_enable: false
+# GPU jobs use the same manager with a separate device-accounted worker class.
+# Growth stays disabled until an operator sets a cap and an explicit allocation
+# profile (cores, mem_gb, gpus, optional gpu_type) in node_profiles below.
+gpu_partition: gpu_a100_22c
+autogrow_max_gpu_nodes: 0
+consolidation_min_gpu_engines: 0
 enable_ssd_prompt: true
+# All normal nodes expose local XFS through TMPDIR. The dedicated SSD prompt
+# maps an affirmative answer to --constraint=ssd; suppress the arbitrary
+# free-form feature prompt on Spider.
+enable_feature_prompt: false
 ssd_feature_name: ssd
-# Spider binds this allocation's local SSD at $TMPDIR. The chief validates the
-# path inside the Slurm pilot before advertising SSD capacity to ZSlurm.
-ssd_scratch_root: "$TMPDIR"
-# Spider grants 80 decimal GB of scratch per requested core. A 30-core pilot
-# therefore receives about 2235 GiB; keep a small safety margin below that.
-ssd_capacity_gb: 2200
+# Spider's Slurm allocation binds node-local XFS to TMPDIR=/tmp. This is
+# intentionally opt-in so a Snellius pilot never mistakes ordinary /tmp for
+# schedulable scratch.
+scratch_use_tmpdir: true
+# Spider grants 80 decimal GB of scratch per requested core, or about 74.5 GiB.
+# Advertise 73 GiB/core to retain a small margin while scaling with dynamic
+# 2-30-core partial pilots (2190 GiB for a 30-core pilot).
+scratch_capacity_gb_per_core: 73
+# Spider project storage is CephFS; Snellius GPFS RDMA counters are not a
+# meaningful I/O signal here.
+gpfs_io_enable: false
 
 # Spider's Slurm policy grants 8 GB per allocated core. These values describe
-# a 30-core partial pilot allocation, not all physical resources on the node.
+# the upper bound of a partial pilot, not all physical resources on the node.
 default_engine_cores: 30
 autogrow_engine_cores: 30
+autogrow_dynamic_engine_cores: true
+# Submit demand-backed partial pilots even when no node is wholly IDLE; Slurm
+# can place them on MIXED nodes or keep them pending until capacity is available.
+autogrow_require_idle_nodes: false
+autogrow_engine_min_cores: 2
+autogrow_engine_memory_mb_per_core: 8000
+autogrow_engine_memory_headroom_fraction: 0.08
+autogrow_engine_memory_cap_fraction: 0.99
+autogrow_engine_memory_static_reserve_mb: 100
 node_profiles:
   normal:
     cores: 30
@@ -25,8 +53,14 @@ autogrow_prefer_partitions:
 autogrow_fallback_partition: normal
 autogrow_fat_partitions: []
 
-# At 30 cores per partial pilot this permits at most 450 allocated cores across
-# running and queued compute pilots. Runtime control can lower/disable the cap.
+# Autogrow is demand-backed and counts running plus queued compute pilots
+# against this cap. At the 30-core ceiling, 15 pilots request at most 450 cores.
 autogrow_enable: true
 autogrow_max_compute_nodes: 15
 maintenance_window_enable: false
+# Only demand-backed compute autogrow uses this policy. Manual/staging pilots
+# keep their existing walltime behavior. The actual minimum is at least the
+# longest runnable request and the end-of-life drain horizon, plus headroom.
+autogrow_time_min_enable: true
+autogrow_time_min_sec: 43200
+autogrow_time_min_headroom_sec: 3600

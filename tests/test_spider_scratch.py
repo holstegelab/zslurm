@@ -1,4 +1,5 @@
 import ast
+import getpass
 import math
 import os
 import pathlib
@@ -22,7 +23,7 @@ def load_selected_functions(*names):
     ]
     module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
     namespace = {
-        "config": {}, "math": math, "os": os, "shutil": shutil,
+        "config": {}, "getpass": getpass, "math": math, "os": os, "shutil": shutil,
         "sys": sys, "traceback": traceback, "xtime": lambda: "now",
     }
     exec(compile(module, str(CHIEF_PATH), "exec"), namespace)
@@ -44,14 +45,14 @@ class SpiderScratchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             detected = self.namespace["detect_scratch_path"](
                 "123",
-                {"cluster_site": "spider", "ssd_scratch_root": "$TMPDIR"},
                 {"SLURM_JOB_ID": "123", "TMPDIR": scratch},
+                allow_tmpdir=True,
             )
         self.assertEqual(detected, os.path.realpath(scratch))
 
     def test_capacity_is_bounded_per_partial_pilot(self):
         capacity = self.namespace["configured_scratch_capacity_gb"](
-            {"ssd_capacity_gb": 2200}
+            {"scratch_capacity_gb": 2200}, 30
         )
         usage = SimpleNamespace(
             total=12 * 1024 ** 4,
@@ -62,14 +63,14 @@ class SpiderScratchTests(unittest.TestCase):
                 "/tmp", capacity
             )
         self.assertEqual(total, 2200.0)
-        self.assertEqual(used, 2048.0)
+        self.assertEqual(used, 0.0)
 
-    def test_spider_capacity_has_safe_default_for_existing_configs(self):
+    def test_spider_capacity_scales_with_partial_pilot_size(self):
         capacity = self.namespace["configured_scratch_capacity_gb"](
-            {"cluster_site": "spider"}
+            {"scratch_capacity_gb_per_core": 73}, 2
         )
 
-        self.assertEqual(capacity, 2200.0)
+        self.assertEqual(capacity, 146.0)
 
 
 if __name__ == "__main__":

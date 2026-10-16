@@ -49,6 +49,176 @@ class EngineHoldAccountingTests(unittest.TestCase):
         self.assertFalse(self.zslurm._slurm_reason_is_hold("Priority"))
         self.assertFalse(self.zslurm._slurm_reason_is_hold(None))
 
+    def test_failed_cancellation_preserves_engine_and_jobs(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        engine.slurm_job_id = "9004"
+        manager.engine_by_clusterid["123_4"] = engine
+        engine.jobs.add("running-job")
+        before = set(engine.jobs)
+        with mock.patch.object(z, "Popen", return_value=fake_process(
+                returncode=1, stderr=b"Munge socket unavailable")) as popen, \
+                mock.patch.object(manager, "_unregister") as unregister:
+            self.assertFalse(manager.cancel_cid("123_4"))
+        popen.assert_called_once_with(
+            ["scancel", "9004"], stdout=z.subprocess.PIPE, stderr=z.subprocess.PIPE)
+        unregister.assert_not_called()
+        self.assertIs(manager.engine_by_clusterid["123_4"], engine)
+        self.assertFalse(engine.stopping)
+        self.assertEqual(engine.jobs, before)
+        self.assertIn("Munge socket unavailable", z.gb.log_file.getvalue())
+
+    def test_missing_scancel_preserves_registration(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        manager.engine_by_clusterid["123_4"] = engine
+        with mock.patch.object(z, "Popen", side_effect=FileNotFoundError("scancel")):
+            self.assertFalse(manager.cancel_cid("123_4"))
+        self.assertIs(manager.engine_by_clusterid["123_4"], engine)
+        self.assertFalse(engine.stopping)
+
+    def test_successful_cancellation_without_unregister_marks_stopping(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        manager.engine_by_clusterid["123_4"] = engine
+        with mock.patch.object(z, "Popen", return_value=fake_process()):
+            self.assertTrue(manager.cancel_cid("123_4", unregister_after=False))
+        self.assertTrue(engine.stopping)
+        self.assertIs(manager.engine_by_clusterid["123_4"], engine)
+
+    def test_stop_slurm_reports_failed_ids_without_claiming_termination(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        for cid in ("123_4", "123_5"):
+            manager.engine_by_clusterid[cid] = z.Engine(cluster_id=cid, partition="compute")
+        with mock.patch.object(manager, "cancel_cid", side_effect=[False, True]), \
+                mock.patch.object(z, "set_status_message"), \
+                mock.patch.object(z, "set_progress_bar"), \
+                mock.patch.object(z, "stop_progress_bar"), \
+                mock.patch.object(z.time, "sleep"):
+            self.assertEqual(manager.stop_slurm(z.gb, 2), ["123_5"])
+        log = z.gb.log_file.getvalue()
+        self.assertIn("allocations may still run", log)
+        self.assertNotIn("engines stopped", log)
+
+    def test_stop_all_propagates_failed_cancellations(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        with mock.patch.object(manager, "count_cluster_engines", return_value=1), \
+                mock.patch.object(manager, "stop_slurm", return_value=["123_4"]), \
+                mock.patch.object(manager, "check_local_engine", return_value=False):
+            self.assertEqual(manager.stop_all(), ["123_4"])
+
+    def test_timeout_preserves_jobs_until_fresh_repeated_slurm_absence(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        engine.lastseen = z.time.time() - z.TIMEOUT - 1
+        engine.jobs.add("running-job")
+        manager.engine_by_clusterid[engine.cluster_id] = engine
+        manager.last_observed_cids = {engine.cluster_id}
+        with mock.patch.object(manager, "_slurm_terminal_confirmed", return_value=True) as terminal, \
+                mock.patch.object(manager, "cancel_cid", return_value=False) as cancel, \
+                mock.patch.object(manager, "_unregister") as unregister:
+            self.assertFalse(manager.reconcile_timed_out_engine(engine, True))
+            self.assertTrue(engine.stopping)
+            cancel.assert_called_once_with("123_4", unregister_after=False)
+            # Neither a failed query nor a single disappearance is enough.
+            manager.last_observed_cids = set()
+            engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+            self.assertFalse(manager.reconcile_timed_out_engine(engine, None))
+            engine.missing_hits = 1
+            self.assertFalse(manager.reconcile_timed_out_engine(engine, True))
+            unregister.assert_not_called()
+            self.assertEqual(engine.jobs, {"running-job"})
+            self.assertEqual(cancel.call_count, 1)  # retries are throttled
+            engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+            terminal.return_value = False
+            self.assertFalse(manager.reconcile_timed_out_engine(engine, True))
+            unregister.assert_not_called()
+            terminal.return_value = True
+            self.assertTrue(manager.reconcile_timed_out_engine(engine, True))
+            unregister.assert_called_once()
+
+    def test_successful_cancel_does_not_requeue_a_still_visible_worker(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        engine.lastseen = z.time.time() - z.TIMEOUT - 1
+        manager.last_observed_cids = {engine.cluster_id}
+        with mock.patch.object(manager, "cancel_cid", return_value=True), \
+                mock.patch.object(manager, "_unregister") as unregister:
+            self.assertFalse(manager.reconcile_timed_out_engine(engine, True))
+            unregister.assert_not_called()
+
+    def test_terminal_accounting_requires_exact_identity_and_terminal_state(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(cluster_id="123_4", partition="compute")
+        engine.slurm_job_id = "9004"
+        manager.engine_by_clusterid["123_4"] = engine
+        for output, expected in [
+                (b"9004|123_4|COMPLETED\n", True),
+                (b"9004|123_4|CANCELLED by 123\n", True),
+                (b"9004|123_4|RUNNING\n", False),
+                (b"9004|123_4|PENDING\n", False),
+                (b"9004|123_4|COMPLETING\n", False),
+                (b"9004|123_4.batch|COMPLETED\n", False),
+                (b"9005|123_4|COMPLETED\n", False),
+                (b"9004|123_5|COMPLETED\n", False),
+                (b"123|123|COMPLETED\n", False),
+                (b"9004|123_4|COMPLETED\n9004|123_4|RUNNING\n", False),
+                (b"9004|123_4|COMPLETED\n9004|123_5|RUNNING\n", False),
+                (b"9004|COMPLETED\n", False),
+                (b"9004|123_4|COMPLETED|extra\n", False),
+                (b"", False)]:
+            with self.subTest(output=output), mock.patch.object(
+                    z, "Popen", return_value=fake_process(stdout=output)) as popen:
+                self.assertEqual(manager._slurm_terminal_confirmed("123_4"), expected)
+                popen.assert_called_once_with(
+                    ["sacct", "-n", "-X", "-j", "9004", "-P",
+                     "--format=JobIDRaw,JobID,State"],
+                    stdout=z.subprocess.PIPE, stderr=z.subprocess.PIPE)
+        with mock.patch.object(z, "Popen", return_value=fake_process(
+                returncode=1, stdout=b"9004|123_4|COMPLETED\n")):
+            self.assertFalse(manager._slurm_terminal_confirmed("123_4"))
+
+    def test_terminal_accounting_spider_array_uses_canonical_jobid(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        # An unmaterialized array task is addressed as 123_4, but Spider's
+        # JobIDRaw column reports the shared base 123 for all array siblings.
+        for output, expected in [
+                (b"123|123_4|CANCELLED\n", True),
+                (b"123_4|123_4|COMPLETED\n", True),
+                (b"123|123_5|COMPLETED\n123|123_4|FAILED\n", True),
+                (b"123|123|COMPLETED\n123|123_4|TIMEOUT\n", True),
+                (b"123|123_5|COMPLETED\n", False),
+                (b"123|123|COMPLETED\n", False),
+                (b"123|123_4.batch|COMPLETED\n", False),
+                (b"123|123_4|COMPLETED\n123|123_4|RUNNING\n", False),
+                (b"9005|123_4|COMPLETED\n", False),
+                (b"123|123_4|COMPLETED\nbroken row\n", False)]:
+            with self.subTest(output=output), mock.patch.object(
+                    z, "Popen", return_value=fake_process(stdout=output)) as popen:
+                self.assertEqual(manager._slurm_terminal_confirmed("123_4"), expected)
+                self.assertEqual(popen.call_args.args[0][4], "123_4")
+
+    def test_terminal_accounting_non_array_requires_exact_jobid(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        for output, expected in [
+                (b"456|456|COMPLETED\n", True),
+                (b"456|456_1|COMPLETED\n", False),
+                (b"457|456|COMPLETED\n", False),
+                (b"456|456|COMPLETED\n456|456|FAILED\n", False)]:
+            with self.subTest(output=output), mock.patch.object(
+                    z, "Popen", return_value=fake_process(stdout=output)):
+                self.assertEqual(manager._slurm_terminal_confirmed("456"), expected)
+
     def test_controller_never_reconciles_queued_engines(self):
         tree = ast.parse(ZSLURM_PATH.read_text())
         controller = next(
@@ -66,6 +236,7 @@ class EngineHoldAccountingTests(unittest.TestCase):
 
         self.assertNotIn("hold_or_cancel_queued", calls)
         self.assertNotIn("release_held", calls)
+        self.assertIn("reconcile_imported_orphan_engine", calls)
 
     def test_failed_hold_stays_queued_without_cancellation(self):
         manager = self.zslurm.EngineManager()
@@ -136,10 +307,10 @@ class EngineHoldAccountingTests(unittest.TestCase):
         manager.held_engine_cids = {"123_0", "123_1"}
         output = "\n".join(
             [
-                "9000|123|0|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|JobHeldUser",
-                "9001|123|1|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|Priority",
-                "9002|123|2|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|JobHeldAdmin",
-                "9003|123|3|test-instance|5-00:00:00|R|tcn1|genoa|00:00:00|scratch-node|None",
+                "9000|123|0|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|JobHeldUser",
+                "9001|123|1|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|Priority",
+                "9002|123|2|test-instance|5-00:00:00|PD||genoa|01:00:00|scratch-node|192|JobHeldAdmin",
+                "9003|123|3|test-instance|5-00:00:00|R|tcn1|genoa|00:00:00|scratch-node|192|None",
             ]
         )
 
@@ -165,6 +336,63 @@ class EngineHoldAccountingTests(unittest.TestCase):
         self.assertEqual(
             [row[0] for row in manager.queued_engines_detail], ["123_1"]
         )
+
+    def test_pending_array_siblings_keep_distinct_capacity_and_cancel_targets(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        # Spider returns the shared base JobID for unmaterialized array tasks.
+        rows = [f"123|123|{task}|test-instance|5-00:00:00|PD||normal|60|(null)|30|Priority"
+                for task in range(18)]
+        # Name and exact-ID selectors may return the same allocation twice.
+        output = ("\n".join(rows + rows) + "\n").encode()
+        with mock.patch.object(z, "Popen", return_value=fake_process(stdout=output)):
+            manager._check_cluster_engines()
+        self.assertEqual(manager.cluster_queued_engines, 18)
+        self.assertEqual(len(manager.queued_engine_capacity_by_cid), 18)
+        self.assertEqual(set(manager.engine_by_clusterid), {f"123_{i}" for i in range(18)})
+        for cid, engine in manager.engine_by_clusterid.items():
+            self.assertEqual(engine.slurm_job_id, cid)
+        with mock.patch.object(z, "Popen", return_value=fake_process()) as popen:
+            self.assertTrue(manager.cancel_cid("123_7", unregister_after=False))
+        self.assertEqual(popen.call_args.args[0], ["scancel", "123_7"])
+
+    def test_registered_pilot_is_observed_by_id_when_slurm_name_has_suffix(self):
+        z = self.zslurm
+        manager = z.EngineManager()
+        engine = z.Engine(
+            engine_id="worker-1",
+            cluster_id="777",
+            partition="compute",
+            managed=True,
+            instance="test-instance",
+        )
+        manager.engine_by_id[engine.engine_id] = engine
+        manager.engine_by_clusterid[engine.cluster_id] = engine
+        custom_name_row = (
+            "777|777|N/A|test-instance-recall-wide|23:45:00|R|worker-1|"
+            "normal|00:00:00|(null)|30|None\n"
+        ).encode("utf-8")
+
+        with mock.patch.object(
+            z,
+            "Popen",
+            side_effect=[
+                fake_process(stdout=b""),
+                fake_process(stdout=custom_name_row),
+            ],
+        ) as popen:
+            manager._check_cluster_engines()
+
+        self.assertEqual(len(popen.call_args_list), 2)
+        self.assertIn("--name", popen.call_args_list[0].args[0])
+        self.assertIn("--jobs", popen.call_args_list[1].args[0])
+        self.assertIn("777", popen.call_args_list[1].args[0])
+        self.assertTrue(engine.managed)
+        self.assertEqual(engine.missing_hits, 0)
+        self.assertEqual(engine.observed_hits, 1)
+        self.assertEqual(manager.cluster_running_engines, 1)
+        self.assertEqual(manager.cluster_running_by_partition, {"normal": 1})
+        self.assertEqual(engine.timeleft, 23 * 3600 + 45 * 60)
 
 
 if __name__ == "__main__":

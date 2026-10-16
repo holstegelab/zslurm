@@ -15,6 +15,7 @@ except:
 import socket
 import threading
 import re
+import shutil
 
 
 class ReuseAddrXMLRPCServer(SimpleXMLRPCServer):
@@ -32,7 +33,9 @@ import getpass
 import traceback
 
 import zslurm_shared
+import zslurm_gpu
 from zslurm_version import VERSION
+from zslurm_startup import MONITOR_ROLE_ENV, controller_monitor_supported
 import atexit
 try:
     import ipyparallel
@@ -63,6 +66,67 @@ DEFAULT_NODE_PROFILES = {
     "fat_genoa": {"cores": 192, "mem_gb": 1440},
     "fat_rome": {"cores": 128, "mem_gb": 960},
 }
+
+
+def _prepare_engine_runtime(runtime_dir=None, python_executable=None,
+                            environ=None):
+    """Pin the pilot launcher and worker interpreter for Slurm children.
+
+    ``sbatch`` copies a script into its spool directory, so the launcher's
+    location cannot reliably be inferred from ``BASH_SOURCE`` on the worker.
+    Resolve the scripts while the manager is still in its installed runtime
+    and export their exact paths. Explicit environment overrides remain
+    authoritative for relocated or split installations.
+    """
+    env = os.environ if environ is None else environ
+    runtime_dir = os.path.abspath(
+        runtime_dir if runtime_dir is not None
+        else os.path.dirname(os.path.realpath(__file__))
+    )
+    python_executable = os.path.abspath(
+        python_executable if python_executable is not None else sys.executable
+    )
+
+    launcher = env.get("ZSLURM_ENGINE_LAUNCHER")
+    if not launcher:
+        installed_launcher = os.path.join(runtime_dir, "slurm_to_zslurm")
+        launcher = (
+            installed_launcher
+            if os.path.isfile(installed_launcher)
+            else shutil.which("slurm_to_zslurm", path=env.get("PATH"))
+        )
+    if not launcher:
+        # Preserve the historical error path. The bounded sbatch stderr is
+        # now logged by the caller, making an incomplete install diagnosable.
+        launcher = "slurm_to_zslurm"
+
+    if os.path.isfile(python_executable) and os.access(python_executable, os.X_OK):
+        env.setdefault("ZSLURM_ENGINE_PYTHON", python_executable)
+        env.setdefault("ZSLURM_ENGINE_ENV_BIN", os.path.dirname(python_executable))
+
+    if not env.get("ZSLURM_CHIEF_PATH"):
+        installed_chief = os.path.join(runtime_dir, "zslurm_chief")
+        chief = (
+            installed_chief
+            if os.path.isfile(installed_chief)
+            else shutil.which("zslurm_chief", path=env.get("PATH"))
+        )
+        if chief:
+            env["ZSLURM_CHIEF_PATH"] = chief
+    return launcher
+
+
+def _engine_submission_environment(environ=None):
+    """Do not export a parent allocation's memory limits into nested sbatch.
+
+    Slurm sets the requested memory mode for the child but can leave the other
+    inherited mode untouched (per-node manager -> per-CPU Spider pilot, or the
+    reverse on Snellius). Keep the manager's own environment unchanged.
+    """
+    env = dict(os.environ if environ is None else environ)
+    for key in ('SLURM_MEM_PER_NODE', 'SLURM_MEM_PER_CPU', 'SLURM_MEM_PER_GPU'):
+        env.pop(key, None)
+    return env
 
 # On a non-SSD engine, let an ssd_use=no job absorb up to ten percent of a
 # node-equivalent more CPU/memory packing imbalance than ssd_use=possible work.
@@ -344,18 +408,35 @@ class Status(object):
         
         self.autogrow_last_action_compute_ts = 0.0
         self.autogrow_last_action_staging_ts = 0.0
+        self.autogrow_last_action_gpu_ts = 0.0
+        self.gpu_partition = None
+        self.gpu_slurm_partitions = set()
+        self.slurm_partitions = None
+        self.partition_warnings = []
 
         self.autogrow_prefer_partitions = list(DEFAULT_AUTOGROW_PREFER_PARTITIONS)
         self.autogrow_debug = True
         
         self.node_profiles = dict(DEFAULT_NODE_PROFILES)
         self.cluster_site = "generic"
+        # Explicit, instance-loaded exclusions for physical compute pilots.
+        # Keep this separate from staging's dynamic archive-failure list.
+        self.compute_pilot_exclude_nodes = ()
         self.default_partition = "normal"
         self.staging_partition = "staging"
         self.enable_ssd_prompt = False
+        self.enable_feature_prompt = True
         self.ssd_feature_name = "scratch-node"
+        self.gpfs_io_enable = True
         self.default_engine_cores = 0
         self.autogrow_engine_cores = 0
+        self.autogrow_dynamic_engine_cores = False
+        self.autogrow_require_idle_nodes = True
+        self.autogrow_engine_min_cores = 1
+        self.autogrow_engine_memory_mb_per_core = 0.0
+        self.autogrow_engine_memory_headroom_fraction = 0.0
+        self.autogrow_engine_memory_cap_fraction = 1.0
+        self.autogrow_engine_memory_static_reserve_mb = 0.0
         self.archive_job_partitions = ["archive", "staging"]
         self.autogrow_fallback_partition = "genoa"
         self.autogrow_fat_partitions = ["fat_genoa", "fat_rome"]
@@ -373,6 +454,7 @@ class Status(object):
         self.phase_reports_file = None
         self.reports_lock = threading.RLock()
         self.autogrow_plan = None
+        self.autogrow_plan_detail = None
 
         # Agent / programmatic-control interface (see docs/agent-interface-plan.md).
         # Mutating control RPCs (set_budgets/set_scheduler_mode/set_autogrow/
@@ -388,12 +470,14 @@ class Status(object):
         self.handover_secret = secrets.token_urlsafe(32)
         self.handover_mode = "ACTIVE"
         self.handover_source_instance = None
+        self.handover_import_job_evidence = None
         self.handover_target = None
         self.handover_preserve_engines = False
         self.handover_saved_autogrow = None
         self.handover_saved_autoconsolidate = None
         self.handover_expected_cluster_ids = set()
         self.handover_registered_cluster_ids = set()
+        self.handover_terminal_cluster_ids = set()
         self.handover_owned_aliases = set()
 
 
@@ -565,6 +649,11 @@ def _cfg_node_profiles(value, default=None):
             "cores": _cfg_int(prof.get("cores"), 0),
             "mem_gb": _cfg_float(prof.get("mem_gb"), 0.0),
         }
+        if 'gpus' in prof or 'gpu_type' in prof:
+            out[part].update(gpus=max(0, _cfg_int(prof.get('gpus'), 0)),
+                             gpu_type=str(prof.get('gpu_type', '') or ''),
+                             has_ssd=_cfg_bool(prof.get('has_ssd'), False),
+                             ssd_gb=max(0.0, _cfg_float(prof.get('ssd_gb'), 0)))
     return out or copy.deepcopy(default)
 
 
@@ -590,23 +679,37 @@ def _cluster_defaults(config=None):
 
     defaults = {
         "cluster_site": site,
+        "compute_pilot_exclude_nodes": [],
         "default_partition": "normal",
         "staging_partition": "staging",
+        "gpu_partition": None,
         "enable_ssd_prompt": False,
+        "enable_feature_prompt": True,
         "ssd_feature_name": "scratch-node",
+        "gpfs_io_enable": True,
         "autogrow_prefer_partitions": [("normal", False)],
         "node_profiles": {},
         "autogrow_fallback_partition": "normal",
         "autogrow_fat_partitions": [],
         "maintenance_window_enable": False,
+        "autogrow_time_min_enable": False,
         "default_engine_cores": 0,
         "autogrow_engine_cores": 0,
+        "autogrow_dynamic_engine_cores": False,
+        "autogrow_require_idle_nodes": True,
+        "autogrow_engine_min_cores": 1,
+        "autogrow_engine_memory_mb_per_core": 0.0,
+        "autogrow_engine_memory_headroom_fraction": 0.0,
+        "autogrow_engine_memory_cap_fraction": 1.0,
+        "autogrow_engine_memory_static_reserve_mb": 0.0,
+        "autogrow_max_nonssd_fraction": 0.5,
         "autogrow_enable": False,
         "autogrow_max_compute_nodes": 0,
     }
     if site == "snellius":
         defaults.update({
             "default_partition": "genoa",
+            "gpu_partition": "gpu_a100",
             "enable_ssd_prompt": True,
             "autogrow_prefer_partitions": list(
                 DEFAULT_AUTOGROW_PREFER_PARTITIONS
@@ -625,11 +728,12 @@ def _cluster_defaults(config=None):
         # describes the allocation, not the physical RAM installed in a node.
         defaults.update({
             "default_partition": "normal",
+            "gpu_partition": "gpu_a100_22c",
+            "staging_partition": "__disabled__",
             "enable_ssd_prompt": True,
+            "enable_feature_prompt": False,
             "ssd_feature_name": "ssd",
-            # Spider exposes allocation-local scratch through $TMPDIR and marks
-            # the corresponding worker nodes with the `ssd` feature. Keep
-            # every automatically created pilot on that capability class.
+            "gpfs_io_enable": False,
             "autogrow_prefer_partitions": [("normal", True)],
             "node_profiles": {
                 "normal": {"cores": 30, "mem_gb": 240},
@@ -637,21 +741,164 @@ def _cluster_defaults(config=None):
             "autogrow_fallback_partition": "normal",
             "default_engine_cores": 30,
             "autogrow_engine_cores": 30,
+            "autogrow_dynamic_engine_cores": True,
+            # Spider schedules partial allocations into free cores on MIXED
+            # nodes.  Requiring a completely IDLE node would strand runnable
+            # work instead of letting Slurm queue/backfill the pilot.
+            "autogrow_require_idle_nodes": False,
+            "autogrow_time_min_enable": True,
+            "autogrow_engine_min_cores": 2,
+            "autogrow_engine_memory_mb_per_core": 8000.0,
+            "autogrow_engine_memory_headroom_fraction": 0.08,
+            "autogrow_engine_memory_cap_fraction": 0.99,
+            "autogrow_engine_memory_static_reserve_mb": 100.0,
+            # Every current Spider normal node has the configured SSD feature,
+            # so non-SSD moderation is irrelevant for this one-class fleet.
+            "autogrow_max_nonssd_fraction": 1.0,
             "autogrow_enable": True,
             "autogrow_max_compute_nodes": 15,
         })
     return defaults
 
 
-def _apply_cluster_config(config):
+def _optional_partition(value):
+    return str(value).strip() if value and str(value).strip() != '__disabled__' else None
+
+
+def _cfg_compute_pilot_exclude_nodes(value):
+    """Validate explicit Slurm hostnames before building an sbatch command.
+
+    A config value is a YAML list or a comma-separated string. Slurm hostlist
+    ranges and arbitrary sbatch syntax are deliberately not accepted here:
+    every excluded physical node must be named explicitly.
+    """
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        names = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        names = value
+    else:
+        raise ValueError("compute_pilot_exclude_nodes must be a list of node names or comma-separated string")
+    if len(names) > 64:
+        raise ValueError("compute_pilot_exclude_nodes may contain at most 64 nodes")
+    checked = []
+    for name in names:
+        if not isinstance(name, str):
+            raise ValueError("compute_pilot_exclude_nodes contains a non-string node name")
+        name = name.strip()
+        if not name or len(name) > 255 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            raise ValueError("compute_pilot_exclude_nodes contains an invalid node name")
+        checked.append(name)
+    return tuple(sorted(set(checked)))
+
+
+def _discover_slurm_partitions():
+    """Validate physical routes when Slurm is available; never query per job."""
+    try:
+        result = subprocess.run(['sinfo', '-h', '-o', '%P|%G'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode:
+            return None
+        names, gpu_names = set(), set()
+        for line in result.stdout.splitlines():
+            partition, gres = line.strip().split('|', 1)
+            name = partition.rstrip('*')
+            names.add(name)
+            if 'gpu:' in gres or gres.strip() == 'gpu':
+                gpu_names.add(name)
+        return (names, gpu_names) if names else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def _worker_kind(partition):
+    if partition == getattr(status, 'staging_partition', None):
+        return 'archive'
+    if (partition == getattr(status, 'gpu_partition', None)
+            or partition in getattr(status, 'gpu_slurm_partitions', set())
+            or status.node_profiles.get(partition, {}).get('gpus', 0)):
+        return 'gpu'
+    return 'compute'
+
+
+def worker_partition_choices():
+    choices = {'compute': status.default_partition}
+    for kind, name in (('archive', status.staging_partition), ('gpu', status.gpu_partition)):
+        if _optional_partition(name):
+            choices[kind] = name
+    return choices
+
+
+def resolve_worker_partition(partition):
+    partition = str(partition or '').strip()
+    if partition in ('compute', 'archive', 'gpu'):
+        if partition not in worker_partition_choices():
+            raise ValueError('No ' + partition + ' worker partition configured')
+        partition = worker_partition_choices()[partition]
+    names = partition.split(',')
+    if status.slurm_partitions is not None and set(names) - status.slurm_partitions:
+        raise ValueError('Unknown Slurm partition(s): ' + partition)
+    kinds = {_worker_kind(name) for name in names}
+    if 'gpu' in kinds and len(names) != 1:
+        raise ValueError('Select one GPU Slurm partition with its own profile')
+    kind = next(iter(kinds))
+    if kind == 'gpu':
+        profile = status.node_profiles.get(partition, {})
+        if min(float(profile.get('cores', 0)), float(profile.get('mem_gb', 0)),
+               int(profile.get('gpus', 0))) <= 0:
+            raise ValueError('Configure cores, mem_gb and gpus in node_profiles[' + partition + ']')
+    return partition, kind
+
+
+def _cpu_io_display(host_cpu_pct, gpfs_io_pct, gpfs_io_enable=True):
+    """Return the site-appropriate TUI label and compact value."""
+    host_text = "%.0f" % float(host_cpu_pct)
+    if not gpfs_io_enable:
+        return "Host CPU (%): ", host_text
+    gpfs_text = (
+        "%.0f" % float(numpy.mean(gpfs_io_pct))
+        if len(gpfs_io_pct) > 0
+        else "n/a"
+    )
+    return "CPU/GPFS (%): ", "%s | %s" % (host_text, gpfs_text)
+
+
+def _apply_cluster_config(config, *, discover_partitions=False):
+    """Apply site policy; live startup explicitly requests Slurm discovery.
+
+    Static application can inspect a Snellius policy from Spider (and vice
+    versa) without mistaking the host for the requested target site.
+    """
     cfg = config if isinstance(config, dict) else {}
     defaults = _cluster_defaults(cfg)
+    compute_pilot_exclude_nodes = _cfg_compute_pilot_exclude_nodes(
+        cfg.get("compute_pilot_exclude_nodes", defaults["compute_pilot_exclude_nodes"]))
 
     status.cluster_site = defaults["cluster_site"]
+    status.compute_pilot_exclude_nodes = compute_pilot_exclude_nodes
     status.default_partition = str(cfg.get("default_partition", defaults["default_partition"]) or defaults["default_partition"])
-    status.staging_partition = str(cfg.get("staging_partition", defaults["staging_partition"]) or defaults["staging_partition"])
+    status.staging_partition = _optional_partition(cfg.get('staging_partition', defaults['staging_partition']))
+    status.gpu_partition = _optional_partition(cfg.get('gpu_partition', defaults['gpu_partition']))
+    discovery = _discover_slurm_partitions() if discover_partitions else None
+    status.slurm_partitions = discovery[0] if discovery is not None else None
+    status.gpu_slurm_partitions = discovery[1] if discovery is not None else set()
+    status.partition_warnings = []
+    if discovery is not None:
+        for attribute in ('staging_partition', 'gpu_partition'):
+            name = getattr(status, attribute)
+            if name and (name not in status.slurm_partitions or
+                         (attribute == 'gpu_partition' and name not in status.gpu_slurm_partitions)):
+                status.partition_warnings.append(attribute + '=' + name + ' is unavailable; route disabled')
+                setattr(status, attribute, None)
     status.enable_ssd_prompt = _cfg_bool(cfg.get("enable_ssd_prompt"), defaults["enable_ssd_prompt"])
+    status.enable_feature_prompt = _cfg_bool(
+        cfg.get("enable_feature_prompt"), defaults["enable_feature_prompt"]
+    )
     status.ssd_feature_name = str(cfg.get("ssd_feature_name", defaults["ssd_feature_name"]) or "")
+    status.gpfs_io_enable = _cfg_bool(
+        cfg.get("gpfs_io_enable"), defaults["gpfs_io_enable"]
+    )
     status.autogrow_prefer_partitions = _cfg_autogrow_prefer_partitions(
         cfg.get("autogrow_prefer_partitions"),
         defaults["autogrow_prefer_partitions"],
@@ -673,6 +920,16 @@ def _apply_cluster_config(config):
         defaults["maintenance_window_enable"],
     )
     status.maintenance_time_min_sec = max(0, _cfg_int(cfg.get("maintenance_time_min_sec"), 12 * 3600))
+    status.autogrow_time_min_enable = _cfg_bool(
+        cfg.get("autogrow_time_min_enable"),
+        defaults["autogrow_time_min_enable"],
+    )
+    status.autogrow_time_min_sec = max(
+        0, _cfg_int(cfg.get("autogrow_time_min_sec"), 12 * 3600)
+    )
+    status.autogrow_time_min_headroom_sec = max(
+        60, _cfg_int(cfg.get("autogrow_time_min_headroom_sec"), 3600)
+    )
     status.default_engine_cores = max(
         0,
         _cfg_int(
@@ -685,6 +942,65 @@ def _apply_cluster_config(config):
         _cfg_int(
             cfg.get("autogrow_engine_cores"),
             defaults["autogrow_engine_cores"],
+        ),
+    )
+    status.autogrow_dynamic_engine_cores = _cfg_bool(
+        cfg.get("autogrow_dynamic_engine_cores"),
+        defaults["autogrow_dynamic_engine_cores"],
+    )
+    status.autogrow_require_idle_nodes = _cfg_bool(
+        cfg.get("autogrow_require_idle_nodes"),
+        defaults["autogrow_require_idle_nodes"],
+    )
+    status.autogrow_engine_min_cores = max(
+        1,
+        _cfg_int(
+            cfg.get("autogrow_engine_min_cores"),
+            defaults["autogrow_engine_min_cores"],
+        ),
+    )
+    status.autogrow_engine_memory_mb_per_core = max(
+        0.0,
+        _cfg_float(
+            cfg.get("autogrow_engine_memory_mb_per_core"),
+            defaults["autogrow_engine_memory_mb_per_core"],
+        ),
+    )
+    status.autogrow_engine_memory_headroom_fraction = min(
+        0.99,
+        max(
+            0.0,
+            _cfg_float(
+                cfg.get("autogrow_engine_memory_headroom_fraction"),
+                defaults["autogrow_engine_memory_headroom_fraction"],
+            ),
+        ),
+    )
+    status.autogrow_engine_memory_cap_fraction = min(
+        1.0,
+        max(
+            0.0,
+            _cfg_float(
+                cfg.get("autogrow_engine_memory_cap_fraction"),
+                defaults["autogrow_engine_memory_cap_fraction"],
+            ),
+        ),
+    )
+    status.autogrow_engine_memory_static_reserve_mb = max(
+        0.0,
+        _cfg_float(
+            cfg.get("autogrow_engine_memory_static_reserve_mb"),
+            defaults["autogrow_engine_memory_static_reserve_mb"],
+        ),
+    )
+    status.autogrow_max_nonssd_fraction = min(
+        1.0,
+        max(
+            0.0,
+            _cfg_float(
+                cfg.get("autogrow_max_nonssd_fraction"),
+                defaults["autogrow_max_nonssd_fraction"],
+            ),
         ),
     )
     status.autogrow_enable = _cfg_bool(
@@ -885,7 +1201,8 @@ class Job(object):
         priority=DEFAULT_JOB_PRIORITY,
         dcache_download_slots=0,
         dcache_upload_slots=0,
-        s3_download_slots=0
+        s3_download_slots=0,
+        ngpus=0,
     ):
         self.job_name = job_name
         self.jobid = jobid
@@ -924,6 +1241,8 @@ class Job(object):
         self.output_file = info_output_file
         self.comment = comment
         self.owner = owner
+        self.ngpus = int(ngpus)
+        self.gpu_devices = []
         try:
             value = DEFAULT_JOB_PRIORITY if priority is None else priority
             self.base_priority = int(value)
@@ -1102,6 +1421,15 @@ class JobManager(object):
         # rule matches a cwd.  Unlike the legacy one-shot queue reorder, these
         # rules also apply to jobs submitted after the operator creates them.
         self.cwd_priority_overrides = OrderedDict()
+        # Explicit application-owned controller namespaces. Empty by default;
+        # never infer this role from inherited workflow environment variables.
+        self.controller_owner_prefixes = []
+
+        # Soft placement hints, not grants/leases. At most one pilot per
+        # partition accumulates CPU/memory for aged higher-priority work.
+        # Recomputed after manager handover; no job/resource ownership changes.
+        self.capacity_waits = {}
+        self.capacity_wait_cooldowns = {}
 
         # Compact terminal outcomes used by dependencies.  Finished Job objects
         # are retained separately for queue/report output and may be trimmed per
@@ -1635,7 +1963,10 @@ class JobManager(object):
                     'autogrow_enable': bool(status.autogrow_enable),
                     'autoconsolidate_enable': bool(status.autoconsolidate_enable),
                     'autogrow_max_compute_nodes': int(cfg.get('autogrow_max_compute_nodes', 0) or 0),
+                    'compute_pilot_exclude_nodes': list(_cfg_compute_pilot_exclude_nodes(
+                        getattr(status, 'compute_pilot_exclude_nodes', ()))),
                     'cwd_priority_overrides': self.list_cwd_priority_overrides(),
+                    'controller_owner_prefixes': list(self.controller_owner_prefixes),
                 },
                 'pending_jobs': n_pending,
                 'budgeted_pending_jobs': n_budget_pending,
@@ -1774,6 +2105,52 @@ class JobManager(object):
             return (max(priorities) if priorities else DEFAULT_JOB_PRIORITY) + 1
         finally:
             self.lock.release()
+
+    @staticmethod
+    def _validate_controller_owner_prefix(prefix):
+        if (not isinstance(prefix, str) or not prefix or len(prefix) > 256
+                or not re.fullmatch(r'[A-Za-z0-9_.:/-]+', prefix)):
+            raise ValueError('a nonempty literal controller owner prefix is required')
+        return prefix
+
+    def _apply_owner_controller_role_locked(self, job):
+        if (job.state not in queue_states or not any(
+                str(getattr(job, 'owner', '') or '').startswith(prefix)
+                for prefix in self.controller_owner_prefixes)):
+            return False
+        env = getattr(job, 'env', None) or {}
+        if not isinstance(env, dict) or env.get(MONITOR_ROLE_ENV) not in (None, 'controller'):
+            raise ValueError('controller owner conflicts with an explicit monitor role')
+        changed = env.get(MONITOR_ROLE_ENV) != 'controller'
+        # Do not mutate the caller's environment mapping (or another job's).
+        job.env = dict(env, **{MONITOR_ROLE_ENV: 'controller'})
+        return changed
+
+    def register_controller_owner_prefix(self, prefix):
+        """Adopt queued/future controllers without restarting existing jobs.
+
+        Registration is explicit and additive. Existing RUNNING jobs are not
+        hotpatched. Reject an in-flight untagged grant rather than changing its
+        environment after the chief might already have received it.
+        """
+        prefix = self._validate_controller_owner_prefix(prefix)
+        with self.lock:
+            matching = [j for j in self.jobs_by_id.values()
+                if str(getattr(j, 'owner', '') or '').startswith(prefix)]
+            for job in matching:
+                env = getattr(job, 'env', None) or {}
+                if not isinstance(env, dict) or env.get(MONITOR_ROLE_ENV) not in (None, 'controller'):
+                    raise ValueError('controller owner conflicts with an explicit monitor role')
+                if job.state == 'ASSIGNED' and env.get(MONITOR_ROLE_ENV) != 'controller':
+                    raise ValueError('untagged controller grant is in flight; inspect before retrying')
+            if prefix not in self.controller_owner_prefixes:
+                self.controller_owner_prefixes.append(prefix)
+            changed = sum(self._apply_owner_controller_role_locked(j) for j in matching)
+            self._eligible_cache_ts = 0.0
+            return dict(prefix=prefix, prefixes=list(self.controller_owner_prefixes),
+                matched=len(matching), queued_tagged=changed,
+                queued_jobids=[str(j.jobid) for j in matching if j.state in queue_states],
+                running_unmodified=sum(j.state == 'RUNNING' for j in matching))
 
     def set_cwd_priority_override(self, pattern, priority):
         normalized = str(pattern or '').strip()
@@ -1977,6 +2354,9 @@ class JobManager(object):
                 runtime = (now - job.starttime) if getattr(job, 'starttime', None) else 0.0
                 out.append({
                     'jobid': str(job.jobid),
+                    'owner': getattr(job, 'owner', None),
+                    'requested_monitor_role': (getattr(job, 'env', None) or {}).get(
+                        MONITOR_ROLE_ENV, 'compute'),
                     'name': job.job_name,
                     'state': st,
                     'partition': job.partition,
@@ -2010,6 +2390,8 @@ class JobManager(object):
                         getattr(job, 's3_download_slots', 0.0) or 0.0
                     ),
                     'priority': int(getattr(job, 'priority', 0) or 0),
+                    'gpus': job.ngpus,
+                    'gpu_devices': list(job.gpu_devices),
                     'dependency': getattr(job, 'dependency', None),
                     'dependency_state': dependency_state,
                     'dependency_reason': dependency_reason,
@@ -2297,11 +2679,18 @@ class JobManager(object):
         ssd_gb=0,
         owner=None,
         idempotency_key=None,
-        priority=DEFAULT_JOB_PRIORITY
+        priority=DEFAULT_JOB_PRIORITY,
+        ngpus=None,
     ):
         # weird xml-rpc problem?
         if len(env) == 1 and "data" in env:
             env = env["data"]
+
+        # The old CCS GPU client put ngpus in the maintained token position.
+        # Reject that ambiguity instead of deduplicating unrelated GPU jobs.
+        if partition == 'gpu' and isinstance(idempotency_key, (int, float)):
+            raise ValueError('Legacy GPU submission protocol: update zsbatch before submitting GPU jobs')
+        ngpus = zslurm_gpu.gpu_count(partition, ngpus)
 
         def transfer_slots_from_env(name):
             try:
@@ -2366,10 +2755,12 @@ class JobManager(object):
                     priority,
                     dcache_download_slots,
                     dcache_upload_slots,
-                    s3_download_slots
+                    s3_download_slots,
+                    ngpus,
                 )
                 job.dependency_spec = dependency_spec
                 self._apply_priority_override_locked(job)
+                self._apply_owner_controller_role_locked(job)
                 self.jobs_by_id[jobid] = job
                 self.total_jobs[partition] = self.total_jobs.get(partition, 0) + 1
                 self._eligible_cache_ts = 0.0
@@ -2407,9 +2798,18 @@ class JobManager(object):
             )
         return jobid
 
-    def cancel_job(self, jobid, requeue=False):
+    def cancel_job(self, jobid, requeue=False, expected_state=None):
+        # Compare-and-cancel under the dispatch lock. An earlier queued
+        # observation must never accidentally authorize killing started work.
+        if expected_state not in (None, 'PENDING', 'REQUEUED') or (expected_state is not None and requeue):
+            raise ValueError('conditional cancellation supports PENDING or REQUEUED without requeue only')
         self.lock.acquire()
         try:
+            if expected_state is not None:
+                observed = self.jobs_by_id.get(jobid)
+                state = getattr(observed, 'state', None)
+                if state != expected_state:
+                    return {'cancelled': False, 'jobid': str(jobid), 'state': state}
             job = None
             if jobid in self.jobs_by_id:
                 job = self.jobs_by_id[jobid]
@@ -2459,11 +2859,13 @@ class JobManager(object):
                 add_log_line(
                     gb, "Attempt to cancel unknown job (id: %s)." % jobid, YELLOW
                 )
+            if expected_state is not None:
+                return {'cancelled': True, 'jobid': str(jobid), 'state': 'CANCELLED'}
         finally:
             self.lock.release()
 
     def list_done_jobs(self, last_seen_jobid=None, owner=None,
-                           include_priority=False):
+                           include_priority=False, include_gpus=False):
         def serialize(job):
             if not job.starttime is None:
                 runtime = job.endtime - job.starttime
@@ -2490,7 +2892,8 @@ class JobManager(object):
                 job.cwd,
                 job.comment,
             ] + ([int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY))]
-                 if include_priority else [])
+                 if include_priority else []) + ([job.ngpus, list(getattr(job, 'last_gpu_devices', []))]
+                 if include_gpus else [])
 
         jobs = []
         target_jobid = None if last_seen_jobid is None else str(last_seen_jobid)
@@ -2567,8 +2970,8 @@ class JobManager(object):
     def queue_stats(self):
         # Aggregate cores/mem by status and partition
         totals = {
-            'running': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
-            'pending': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
+            'running': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0, 'gpus': 0},
+            'pending': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0, 'gpus': 0},
         }
         by_part = {}
         states = {}
@@ -2590,8 +2993,8 @@ class JobManager(object):
                 mem_mb = 0.0
             if part not in by_part:
                 by_part[part] = {
-                    'running': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
-                    'pending': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0},
+                    'running': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0, 'gpus': 0},
+                    'pending': {'jobs': 0, 'cores': 0.0, 'mem_mb': 0.0, 'gpus': 0},
                 }
             is_pending = (st in queue_states) or (st == 'ASSIGNED')
             if st == 'RUNNING':
@@ -2607,6 +3010,7 @@ class JobManager(object):
                     b['jobs'] += 1
                     b['cores'] += cores
                     b['mem_mb'] += mem_mb
+                    b['gpus'] += j.ngpus
 
         qb = getattr(engines, 'cluster_queued_by_partition', {}) or {}
         rb = getattr(engines, 'cluster_running_by_partition', {}) or {}
@@ -2621,6 +3025,9 @@ class JobManager(object):
             'queued_age_by_partition_by_scratch': dict(qa_s),
             'running_total': int(getattr(engines, 'cluster_running_engines', 0)),
             'queued_total': int(getattr(engines, 'cluster_queued_engines', 0)),
+            'running_gpu': engines.cluster_running_engines_gpu,
+            'queued_gpu': engines.cluster_queued_engines_gpu,
+            'held_gpu': engines.cluster_held_engines_gpu,
             'held_total': int(getattr(engines, 'cluster_held_engines', 0)),
             'manager_held_total': int(len(getattr(engines, 'held_engine_cids', set()) or set())),
             'external_held_total': int(len(getattr(engines, 'external_held_engines_detail', []) or [])),
@@ -2634,7 +3041,7 @@ class JobManager(object):
             'engines': engines_info,
         }
 
-    def list_jobs(self, owner=None, include_priority=False):
+    def list_jobs(self, owner=None, include_priority=False, include_gpus=False):
         jobs = []
         for job in list(self.jobs_by_id.values()):
             if getattr(job, 'state', None) not in active_job_states:
@@ -2671,10 +3078,36 @@ class JobManager(object):
                     job.cwd,
                     job.comment
                 ] + ([int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY))]
-                     if include_priority else [])
+                     if include_priority else []) + ([job.ngpus, list(job.gpu_devices)]
+                     if include_gpus else [])
             )
 
         return jobs
+
+    def _engine_headroom_locked(self, nodeid, *, exclude_jobid=None):
+        """Actual lease/grant headroom, independent of a chief's free counters.
+
+        RUNNING leases may be smaller than immutable job maxima. ASSIGNED
+        grants hold their full initial shape even before start acknowledgement.
+        The canonical job table also survives handover and lost RPC replies.
+        Caller holds the job lock; do not mutate resource telemetry here.
+        """
+        engine = engines.engine_by_id.get(nodeid)
+        if engine is None:
+            return float('inf'), float('inf')
+        used_cpu = used_mem = 0.0
+        for key, job in self.jobs_by_id.items():
+            if (str(key) == str(exclude_jobid) or job.node_id != nodeid
+                    or job.state not in ('RUNNING', 'ASSIGNED')):
+                continue
+            if job.state == 'RUNNING':
+                used_cpu += float(getattr(job, 'held_ncpu', job.ncpu))
+                used_mem += float(getattr(job, 'held_mem', job.mem))
+            else:
+                used_cpu += float(job.ncpu)
+                used_mem += float(job.mem)
+        return (max(0.0, float(getattr(engine, 'cores', float('inf'))) - used_cpu),
+                max(0.0, float(getattr(engine, 'totmem', float('inf'))) - used_mem))
 
     def request_jobs(self, myid, current_cpu, current_mem, partition):
         phaseout_window = None
@@ -2686,6 +3119,12 @@ class JobManager(object):
             totmem = 64000
         else:
             engine = engines.engine_by_id[myid]
+            # A newly registered Slurm pilot still has the historical five-day
+            # placeholder until squeue observes its actual allocation. Do not
+            # dispatch a long job during that startup window on a shorter pilot.
+            if (engine.cluster_id not in (None, False, '')
+                    and getattr(engine, 'slurm_state', None) != 'R'):
+                return []
             phaseout_window = None
             if engine.status == PHASING_OUT:
                 # Not a flat refusal any more: an engine waiting on one long job can
@@ -2703,9 +3142,9 @@ class JobManager(object):
                     engine.backfill_announced = True
                     add_log_line(
                         gb,
-                        f"Phase-out backfill: engine {engine.engine_id} waits "
-                        f"{int(phaseout_window / 60)}m on its last job; accepting work "
-                        f"that fits inside that window.",
+                        f"Phase-out backfill: engine {engine.engine_id} has an estimated "
+                        f"{int(phaseout_window / 60)}m backfill window; accepting work "
+                        f"that fits with the placement margin.",
                         CYAN,
                     )
             # Do not start or assign work to unmanaged cluster engines (seen as missing in squeue)
@@ -2735,11 +3174,31 @@ class JobManager(object):
         walltime_buffer = float(status.config.get(
             "job_walltime_buffer_sec",
             getattr(status, 'job_walltime_buffer_sec', 900.0)))
+        if e is not None and e.partition != partition:
+            return []
+        if partition == 'gpu' and (e is None or not e.gpu_devices):
+            return []
 
         self.lock.acquire()
         try:
             queued = []
             assigned = []
+            # A lost grant reply leaves ASSIGNED jobs on this engine. Replay
+            # those exact holdings before considering new work; never let a
+            # later request claim their slots again or deassign them to itself.
+            own_assigned = [j for j in self.jobs_by_id.values()
+                            if j.state == 'ASSIGNED' and j.node_id == myid]
+            try:
+                current_cpu, current_mem = float(current_cpu), float(current_mem)
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(current_cpu) or not math.isfinite(current_mem):
+                return []
+            free_cpu, free_mem = self._engine_headroom_locked(myid)
+            current_cpu = max(0.0, min(free_cpu,
+                current_cpu - sum(float(j.ncpu) for j in own_assigned)))
+            current_mem = max(0.0, min(free_mem,
+                current_mem - sum(float(j.mem) for j in own_assigned)))
 
             jobs_view = self._jobs_in_priority_order(
                 lastin_first=(status.lastin_first and partition != 'archive')
@@ -2853,9 +3312,38 @@ class JobManager(object):
                 profile_regret_cache[cache_key] = regret
                 return regret
 
-            def eligible(job):
+            protected_job = None
+
+            def _fits_free_capacity(job):
+                # Do not preclaim a job that fits the pilot's total resources
+                # but cannot start in its currently free slot. Such a grant
+                # can wait for hours behind long-running jobs and hide both
+                # backlog and fitting backfill from other pilots/autogrowth.
+                if job.ncpu > current_cpu or job.mem > current_mem:
+                    return False
+                if job.ngpus > len(zslurm_gpu.available_devices(e)):
+                    return False
+                if (protected_job is not None
+                        and protected_job.state in queue_states
+                        and job is not protected_job
+                        and job.priority < protected_job.priority):
+                    # Backfill only the surplus, so successive completions can
+                    # accumulate a slot. Equal/higher priority still wins.
+                    return (job.ncpu <= max(0.0, current_cpu - protected_job.ncpu)
+                            and job.mem <= max(0.0, current_mem - protected_job.mem)
+                            and job.ngpus <= max(0, len(zslurm_gpu.available_devices(e)) - protected_job.ngpus))
+                return True
+
+            def eligible(job, check_free=True):
                 if job.partition != partition:
                     return False
+                self._apply_owner_controller_role_locked(job)
+                if (isinstance(getattr(job, 'env', None), dict)
+                        and job.env.get(MONITOR_ROLE_ENV) == 'controller'
+                        and not controller_monitor_supported(getattr(e, 'chief_version', None))):
+                    return False
+                if job.state == 'ASSIGNED' and job.node_id == myid:
+                    return False  # Own grants are replayed, not reallocated.
                 if (
                     job.state != 'ASSIGNED'
                     and not self._dependency_allows_run_locked(job)
@@ -2878,13 +3366,16 @@ class JobManager(object):
                     return False
                 if job.mem > totmem:
                     return False
+                if job.ngpus > len(e.gpu_devices if e is not None else []):
+                    return False
+                if check_free and job.state != 'ASSIGNED' and not _fits_free_capacity(job):
+                    return False
                 if not _ssd_ok(job, e):
                     return False
                 if job.state != 'ASSIGNED':
-                    # ASSIGNED jobs already hold their durable and transfer
-                    # reservations. Rechecking start-use here would double-count
-                    # them and could make a lost-response retry impossible at a
-                    # full budget.
+                    # ASSIGNED grants already hold their durable and transfer
+                    # reservations. Rechecking start-use here would double
+                    # count them and can block recovery after a lost RPC reply.
                     if job.active_start_use_add > 0 and (self.active_inuse + job.active_start_use_add) > self.active_total:
                         return False
                     if job.dcache_start_use_add > 0 and (self.dcache_inuse + job.dcache_start_use_add) > self.dcache_total:
@@ -2895,6 +3386,91 @@ class JobManager(object):
                         return False
                 return True
 
+            # Current-capacity-only packing can continually refill single
+            # holes with small jobs and starve a larger higher-priority job.
+            # Briefly protect its CPU/memory on ONE busy pilot, leaving it
+            # PENDING and available to every other pilot/autogrow. Never charge
+            # transfer/storage/SSD counters or change the start handshake.
+            min_age = max(0.0, float(status.config.get(
+                'capacity_wait_min_age_sec', 600.0)))
+            max_wait = max(0.0, float(status.config.get(
+                'capacity_wait_max_sec', 1800.0)))
+            cooldown = max(0.0, float(status.config.get(
+                'capacity_wait_cooldown_sec', 300.0)))
+
+            def _active_wait_engine(engine):
+                return (engine is not None
+                        and engine.partition == partition
+                        and not getattr(engine, 'stopping', False)
+                        and getattr(engine, 'status', None) != PHASING_OUT
+                        and (engine.cluster_id in (None, False, '') or (
+                            getattr(engine, 'managed', False)
+                            and getattr(engine, 'slurm_state', None) == 'R')))
+
+            wait = self.capacity_waits.get(partition)
+            if wait is not None:
+                target = self.jobs_by_id.get(wait['jobid'])
+                host = engines.engine_by_id.get(wait['nodeid'])
+                expired = now_ts >= wait['deadline']
+                invalid = (max_wait <= 0 or expired or target is None
+                           or target.state not in queue_states
+                           or target.partition != partition
+                           or not _active_wait_engine(host))
+                if not invalid:
+                    invalid = (target.ncpu > host.cores or target.mem > host.totmem
+                               or target.reqtime + walltime_buffer > host.timeleft
+                               or not self._dependency_allows_run_locked(target))
+                if invalid:
+                    self.capacity_waits.pop(partition, None)
+                    if expired:
+                        self.capacity_wait_cooldowns[partition] = now_ts + cooldown
+                    add_log_line(gb, f"Capacity wait released: job {wait['jobid']} "
+                                 f"on {wait['nodeid']} ({'expired' if expired else 'ineligible/claimed'}).", CYAN)
+                    wait = None
+                elif wait['nodeid'] == myid:
+                    if eligible(target, check_free=False):
+                        protected_job = target
+                    else:
+                        self.capacity_waits.pop(partition, None)
+                        wait = None
+
+            if (wait is None and max_wait > 0 and _active_wait_engine(e)
+                    and now_ts >= self.capacity_wait_cooldowns.get(partition, 0)
+                    and any(j.node_id == myid and j.state == 'RUNNING'
+                            for j in self.jobs_by_id.values())):
+                # Only contend with genuinely runnable lower-priority backfill.
+                # Fresh/non-runnable/oversize jobs never block fitting work.
+                fitting_priority = min((j.priority for j in jobs_view
+                    if j.state in queue_states and eligible(j)), default=None)
+                if fitting_priority is not None:
+                    for target in jobs_view:
+                        if (target.state not in queue_states
+                                or target.priority <= fitting_priority
+                                or now_ts - float(getattr(target, 'submit_ts', now_ts)) < min_age
+                                or not eligible(target, check_free=False)
+                                or _fits_free_capacity(target)):
+                            continue
+                        duration = min(max_wait, max(0.0,
+                            timeleft - target.reqtime - walltime_buffer))
+                        if duration <= 0:
+                            continue
+                        wait = dict(jobid=target.jobid, nodeid=myid,
+                                    deadline=now_ts + duration)
+                        self.capacity_waits[partition] = wait
+                        protected_job = target
+                        add_log_line(gb, f"Capacity wait: job {target.jobid} remains PENDING; "
+                                     f"accumulate {target.ncpu} cores/{target.mem} MB on {myid} "
+                                     f"for at most {duration:.0f}s.", CYAN)
+                        break
+
+
+            for job in own_assigned:
+                if (job.partition == partition
+                        and job.reqtime + walltime_buffer <= timeleft
+                        and job.ncpu <= cores and job.mem <= totmem
+                        and _ssd_ok(job, e)):
+                    allres.append((job.jobid, job.job_name, job.command, job.cwd,
+                                   zslurm_gpu.execution_environment(job), job.ncpu, job.mem, job.state))
 
             while len(queued) < (status.prio_fillmem_context + float(current_cpu)):
                 try: 
@@ -2942,7 +3518,7 @@ class JobManager(object):
                                 or job_candidate.archive_start_use_add == 0
                             )
                             and self._dcache_transfer_fits_locked(job_candidate)
-                        ) and _ssd_ok(job_candidate, e):
+                        ) and _ssd_ok(job_candidate, e) and _fits_free_capacity(job_candidate):
                             # Pipeline priority is strict. Memory/CPU packing
                             # optimizes only within the same priority band.
                             try:
@@ -3013,30 +3589,24 @@ class JobManager(object):
                     )
                     and self._dcache_transfer_fits_locked(job)
                     and _ssd_ok(job, e)
+                    and _fits_free_capacity(job)
                 ):
+
+                    zslurm_gpu.reserve_devices(e, job)
 
                     self.active_inuse += job.active_start_use_add
                     self.dcache_inuse += job.dcache_start_use_add
                     self.archive_inuse += job.archive_start_use_add
                     self._reserve_dcache_transfer_locked(job)
 
-                    if not (job.ncpu <= current_cpu and job.mem <= current_mem):
-                        add_log_line(
-                            gb,
-                            f"Job {job.job_name} (id: {job.jobid}) assigned to node {myid} ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
-                            BLUE,
-                        )
-                    else:
-                        add_log_line(
-                            gb,
-                            f"Job {job.job_name} (id: {job.jobid}) granted to node {myid} (ASSIGNED; awaiting start acknowledgement) ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
-                            BLUE,
-                        )
-                    # request_jobs may take longer than the chief's RPC timeout.
-                    # Never publish RUNNING from this response-producing call:
-                    # the chief first has to receive the grant and acknowledge it
-                    # through can_run_assigned_job(). A lost response therefore
-                    # leaves a recoverable ASSIGNED job, not a RUNNING ghost.
+                    add_log_line(
+                        gb,
+                        f"Job {job.job_name} (id: {job.jobid}) granted to node {myid} (ASSIGNED; awaiting start acknowledgement) ({current_cpu - job.ncpu:.1f}/{current_mem - job.mem:.2f} remaining)",
+                        BLUE,
+                    )
+                    # A slow request_jobs response can be lost after this
+                    # method commits. Publish only ASSIGNED here; RUNNING is
+                    # committed by the chief's idempotent acknowledgement.
                     job.assigned(myid)
 
                     current_cpu -= job.ncpu
@@ -3047,7 +3617,7 @@ class JobManager(object):
                         job.job_name,
                         job.command,
                         job.cwd,
-                        job.env,
+                        zslurm_gpu.execution_environment(job),
                         job.ncpu,
                         job.mem,
                         job.state,
@@ -3068,6 +3638,8 @@ class JobManager(object):
                         if not self._dcache_transfer_fits_locked(job):
                             continue
                         if not _ssd_ok(job, e):
+                            continue
+                        if not _fits_free_capacity(job):
                             continue
                         new_queued.append(job)
                     queued = new_queued
@@ -3091,8 +3663,7 @@ class JobManager(object):
                 for job in assigned:
                     # FIXME; assume 5 days of time                    
                     if (                                                
-                        job.ncpu <= current_cpu
-                        and job.mem <= current_mem  
+                        _fits_free_capacity(job)
                         and _ssd_ok(job, e)
                     ):
                         # Ask the previous engine to drop assignment and reassign to this engine.
@@ -3158,16 +3729,26 @@ class JobManager(object):
                         self.archive_inuse = max(0.0, self.archive_inuse)
                         self._release_dcache_transfer_locked(job)
                         job.node_id = None
+                        zslurm_gpu.release_devices(engines.job_lease_engine(engine_id), job)
                         job.state = "PENDING"
         finally:
             self.lock.release()
 
-    def can_run_assigned_job(self, nodeid, jobid):
+    def can_run_assigned_job(self, nodeid, jobid, expected_gpu_devices=None):
         self.lock.acquire()
         try:
             res = False  # DROP
             if jobid in self.jobs_by_id:
                 job = self.jobs_by_id[jobid]
+                if getattr(job, 'ngpus', 0):
+                    try:
+                        expected = zslurm_gpu.device_ids(expected_gpu_devices)
+                    except (ValueError, TypeError):
+                        return False
+                    if expected != job.gpu_devices:
+                        # A stale source grant may race a re-grant after
+                        # handover. Do not start it OR free the newer grant.
+                        return False
                 # Only the engine currently assigned to this job may start it
                 engine = engines.engine_by_id.get(nodeid, None)
                 if engine and engine.stopping:
@@ -3196,7 +3777,19 @@ class JobManager(object):
                         if has_ssd and need > 0.0 and free_ssd < need:
                             ssd_ok = False
 
-                    if ssd_ok:
+                    free_cpu, free_mem = self._engine_headroom_locked(
+                        nodeid, exclude_jobid=jobid)
+                    capacity_ok = (getattr(job, 'ncpu', 0) <= free_cpu
+                                   and getattr(job, 'mem', 0) <= free_mem)
+                    monitor_ok = not (isinstance(getattr(job, 'env', None), dict)
+                        and job.env.get(MONITOR_ROLE_ENV) == 'controller') or controller_monitor_supported(
+                            getattr(engine, 'chief_version', None))
+                    gpu_ok = (not getattr(job, 'ngpus', 0) or (engine is not None
+                        and engine.partition == 'gpu'
+                        and len(job.gpu_devices) == job.ngpus
+                        and engine.gpu_allocations.get(jobid) == job.gpu_devices
+                        and set(job.gpu_devices).issubset(engine.gpu_devices)))
+                    if ssd_ok and capacity_ok and monitor_ok and gpu_ok:
                         self.job_start(nodeid, jobid)
                         res = True
                     else:
@@ -3215,12 +3808,11 @@ class JobManager(object):
                         except Exception:
                             pass
                         job.node_id = None
+                        zslurm_gpu.release_devices(engine, job)
                         job.state = "PENDING"
                 elif job.state == "RUNNING" and job.node_id == nodeid:
-                    # Idempotent acknowledgement: if the manager committed the
-                    # transition but the XML-RPC response was lost, a retry by
-                    # the same chief may claim the already-held grant without
-                    # reserving resources a second time.
+                    # If the first acknowledgement response was lost, the
+                    # same chief may retry without starting or reserving twice.
                     res = True
         finally:
             self.lock.release()
@@ -3387,9 +3979,13 @@ class JobManager(object):
             future_mem_mb = (
                 float(engine.res_mem_reserved_mb) - old_mem_mb + target_mem_mb
             )
+            free_cpu, free_mem = self._engine_headroom_locked(
+                nodeid, exclude_jobid=key)
             if (
                 future_cpu > float(engine.cores) + 1e-9
                 or future_mem_mb > float(engine.totmem) + 1e-9
+                or target_cpu > free_cpu + 1e-9
+                or target_mem_mb > free_mem + 1e-9
             ):
                 return {
                     'ok': False,
@@ -3435,7 +4031,7 @@ class JobManager(object):
             )
             job.started(node_id)
             self._eligible_cache_ts = 0.0
-            e = engines.engine_by_id.get(node_id, None)
+            e = engines.job_lease_engine(node_id)
             if e is not None:
                 e.res_cpu_reserved += float(job.held_ncpu)
                 e.res_mem_reserved_mb += float(job.held_mem)
@@ -3469,8 +4065,9 @@ class JobManager(object):
                         self.active_inuse -= job.active_start_use_add
                         self.archive_inuse -= job.archive_start_use_add
                         self.dcache_inuse -= job.dcache_start_use_add
-                    e = engines.engine_by_id.get(job.node_id, None)
+                    e = engines.job_lease_engine(job.node_id)
                     if e is not None:
+                        zslurm_gpu.release_devices(e, job)
                         e.res_cpu_reserved -= float(
                             getattr(job, 'held_ncpu', job.ncpu)
                         )
@@ -3825,15 +4422,25 @@ def ping():
         "lastin_first": bool(status.lastin_first),
         "prio_fillmem_context": int(status.prio_fillmem_context),
         "submit_job_priority": True,
+        "gpu_jobs": True,
+        "gpu_submit_protocol": 1,
         "default_job_priority": DEFAULT_JOB_PRIORITY,
         "list_jobs_priority": True,
         "cwd_priority_overrides": True,
+        "controller_owner_roles": True,
         "targeted_job_status": True,
+        "conditional_pending_cancel": True,
+        "conditional_cancel_states": ["PENDING", "REQUEUED"],
+        "conditional_autoconsolidate": True,
         "directional_dcache_slots": True,
         "s3_download_slots": True,
         "gpfs_io_metrics": True,
         "job_dependencies": True,
         "job_dependency_types": sorted(SUPPORTED_DEPENDENCY_TYPES),
+        "compute_pilot_node_exclusions": True,
+        "compute_pilot_exclude_nodes": list(_cfg_compute_pilot_exclude_nodes(
+            getattr(status, 'compute_pilot_exclude_nodes', ()))),
+        "list_pilot_allocations": True,
         "control_enabled": bool(getattr(status, 'enable_control_rpc', False)),
         "explicit_handover": True,
         "handover_mode": str(getattr(status, 'handover_mode', 'ACTIVE')),
@@ -3858,6 +4465,8 @@ def get_status_json():
             status, 'handover_expected_cluster_ids', set()) or set()),
         'registered_chiefs': len(getattr(
             status, 'handover_registered_cluster_ids', set()) or set()),
+        'terminal_chiefs': len(getattr(
+            status, 'handover_terminal_cluster_ids', set()) or set()),
     }
     return result
 
@@ -3949,6 +4558,34 @@ def set_autogrow(token=None, enable=None, max_compute_nodes=None):
             "autogrow_max_compute_nodes": int(cfg.get('autogrow_max_compute_nodes', 0) or 0)}
 
 
+def set_autoconsolidate(token=None, enable=None, expected_current=None,
+                       expected_manager_uuid=None):
+    """Explicitly restore/toggle idle retirement on the identified live primary.
+
+    No jobs are cancelled here. The existing demand-aware consolidation loop
+    selects excess engines and waits for their running work to finish. Refuse
+    stale state and handover endpoints rather than silently changing a successor.
+    """
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    with jobs.lock, engines.lock:
+        if (type(enable) is not bool or type(expected_current) is not bool
+                or not expected_manager_uuid
+                or expected_manager_uuid != status.manager_uuid
+                or status.handover_mode not in ('ACTIVE', 'TARGET_ACTIVE')
+                or bool(status.autoconsolidate_enable) != expected_current):
+            return {"ok": False, "code": 3,
+                    "error": "exact active primary and unchanged boolean consolidation state required"}
+        status.autoconsolidate_enable = enable
+        # Preserve an explicit post-transfer adjustment if activation is replayed.
+        if status.handover_mode == 'TARGET_ACTIVE':
+            status.handover_saved_autoconsolidate = enable
+    add_log_line(gb, f"[agent] autoconsolidate: {expected_current} -> {enable}", CYAN)
+    return {"ok": True, "autoconsolidate_enable": enable,
+            "previous": expected_current, "manager_uuid": status.manager_uuid}
+
+
 def rpc_prioritize(token=None, pattern=None):
     denied = _control_denied(token)
     if denied:
@@ -3971,6 +4608,22 @@ def rpc_deprioritize(token=None, pattern=None):
     jobs.deprioritize(pattern)
     add_log_line(gb, f"[agent] deprioritize '{pattern}' ({len(matched)} jobs, lastin_first={status.lastin_first})", CYAN)
     return {"ok": True, "matched": len(matched), "lastin_first": bool(status.lastin_first)}
+
+
+def rpc_register_controller_owner_prefix(token=None, prefix=None):
+    denied = _control_denied(token)
+    if denied:
+        return denied
+    if _handover_committed_source():
+        return _handover_proxy(False).register_controller_owner_prefix(token, prefix)
+    try:
+        result = jobs.register_controller_owner_prefix(prefix)
+    except (TypeError, ValueError) as error:
+        return {"ok": False, "code": 3, "error": str(error)}
+    add_log_line(gb, f"[agent] controller owner prefix '{prefix}': "
+                 f"{result['queued_tagged']} queued jobs tagged; "
+                 f"{result['running_unmodified']} running jobs unchanged", CYAN)
+    return {"ok": True, **result}
 
 
 def rpc_set_cwd_priority_override(token=None, pattern=None, priority=None):
@@ -4030,10 +4683,14 @@ def list_jobs_detailed(owner=None, states=None):
 
 
 def get_autogrow_plan():
-    """Expose the controller's last autogrow plan (rendered only to curses today)."""
+    """Expose the controller's last rendered and structured autogrow plan."""
     return {"ok": True, "autogrow_plan": getattr(status, 'autogrow_plan', None),
+            "autogrow_plan_detail": getattr(status, 'autogrow_plan_detail', None),
             "autogrow_enable": bool(status.autogrow_enable),
-            "autogrow_max_compute_nodes": int((getattr(status, 'config', {}) or {}).get('autogrow_max_compute_nodes', 0) or 0)}
+            "autogrow_max_compute_nodes": int((getattr(status, 'config', {}) or {}).get('autogrow_max_compute_nodes', 0) or 0),
+            "gpu_autogrow_plan_detail": getattr(status, 'gpu_autogrow_plan_detail', None),
+            "gpu_consolidation_plan": getattr(status, 'gpu_consolidation_plan', None),
+            "autogrow_max_gpu_nodes": int(status.config.get('autogrow_max_gpu_nodes', 0))}
 
 
 # ---- Phase 3/4: repair + fleet (write, gated) ------------------------------
@@ -4068,7 +4725,10 @@ def grow(token=None, n=1, partition=None, stime=None, constraint="", cores=0):
                      f"constraint={constraint or '-'}, t={walltime})", YELLOW)
     # start_slurm returns Engine objects (not XML-RPC serializable) or None on error;
     # surface only the serializable cluster ids + count.
-    started = engines.start_slurm(gb, n, walltime, part, constraint or "", cores)
+    try:
+        started = engines.start_slurm(gb, n, walltime, part, constraint or "", cores)
+    except ValueError as error:
+        return {"ok": False, "code": 3, "error": str(error)}
     cluster_ids = [str(getattr(e, 'cluster_id', '')) for e in (started or [])]
     return {"ok": bool(started), "requested": n, "partition": part, "cores": cores,
             "constraint": constraint or None, "stime": walltime,
@@ -4121,6 +4781,7 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(get_job_states, "get_job_states")
         server.register_function(queue_stats, "queue_stats")
         server.register_function(list_nodes, "list_nodes")
+        server.register_function(list_pilot_allocations, "list_pilot_allocations")
         # Agent / programmatic interface (see docs/agent-interface-plan.md)
         server.register_function(ping, "ping")
         server.register_function(health, "health")
@@ -4131,8 +4792,12 @@ def thread_start_job_server(port, rpc_path):
         server.register_function(set_transfer_limits, "set_transfer_limits")
         server.register_function(set_scheduler_mode, "set_scheduler_mode")
         server.register_function(set_autogrow, "set_autogrow")
+        server.register_function(set_autoconsolidate, "set_autoconsolidate")
         server.register_function(rpc_prioritize, "prioritize")
         server.register_function(rpc_deprioritize, "deprioritize")
+        server.register_function(
+            rpc_register_controller_owner_prefix, "register_controller_owner_prefix"
+        )
         server.register_function(
             list_cwd_priority_overrides, "list_cwd_priority_overrides"
         )
@@ -4174,13 +4839,18 @@ class Engine(object):
         managed=False,
         instance=None,
         slurm_partition=None,
+        gpu_devices=None,
     ):
         self.engine_id = engine_id
         self.cluster_id = cluster_id
         self.instance = instance
         self.managed = managed
         self.partition = partition
-        # ``partition`` is the manager-side job partition (compute/archive).
+        self.gpu_devices = zslurm_gpu.device_ids(gpu_devices)
+        self.gpu_allocations = {}
+        self.planned_gpus = len(self.gpu_devices)
+        self.phaseout_reason = None
+        # ``partition`` is the manager-side class (compute/archive/gpu).
         # Keep the actual Slurm partition as well so queued workers, which have
         # not registered yet, can still be selected by the cancellation UI.
         self.slurm_partition = slurm_partition
@@ -4240,6 +4910,11 @@ class EngineManager(object):
         self.cluster_queued_engines_archive = 0
         self.cluster_running_engines_archive = 0
         self.cluster_held_engines_archive = 0
+        self.cluster_queued_engines_gpu = 0
+        self.cluster_running_engines_gpu = 0
+        self.cluster_held_engines_gpu = 0
+        self.cluster_queued_by_partition = {}
+        self.cluster_running_by_partition = {}
         self.cluster_held_by_partition = {}
         self.cluster_queued_age_by_partition = {}
         self.cluster_queued_age_by_partition_by_scratch = {}
@@ -4249,6 +4924,7 @@ class EngineManager(object):
         # hold through explicit administrative control. The automatic controllers do
         # not hold, release, or cancel queued engine allocations.
         self.queued_engines_detail = []   # [(cid, partition, age_sec, is_scratch)] -- excludes held
+        self.queued_engine_capacity_by_cid = {}  # cid -> (cores, expected schedulable MB)
         self.held_engine_cids = set()     # cids successfully held by this manager
         self.actual_held_engine_cids = set()  # all cids Slurm currently reports held
         self.held_engines_detail = []     # manager-held [(cid, partition, age_sec, is_scratch)]
@@ -4265,8 +4941,10 @@ class EngineManager(object):
             if engine is not None:
                 if engine.status == PHASING_OUT:
                     engine.status = ""
+                    engine.phaseout_reason = None
                     return f"Engine {cmd} is no longer phasing out."
                 engine.status = PHASING_OUT
+                engine.phaseout_reason = 'manual'
                 return f"Engine {cmd} is now phasing out."
 
             partition_map = {
@@ -4276,6 +4954,8 @@ class EngineManager(object):
                 "compute": "compute",
                 "comp": "compute",
                 "c": "compute",
+                "gpu": "gpu",
+                "g": "gpu",
             }
 
             partition_hint = None
@@ -4298,7 +4978,7 @@ class EngineManager(object):
                 part = (getattr(candidate, "partition", "") or "").lower()
                 if target_partition == "archive":
                     return part == "archive"
-                return part != "archive"
+                return part == target_partition
 
             if nr_of_engines == 0:
                 return "No engines selected for phase change (0 requested)."
@@ -4313,6 +4993,7 @@ class EngineManager(object):
                 selected = candidates[: nr_of_engines]
                 for item in selected:
                     item.status = PHASING_OUT
+                    item.phaseout_reason = 'manual'
                 count = len(selected)
                 if count == 0:
                     return f"No {target_partition} engines available to phase out."
@@ -4339,6 +5020,7 @@ class EngineManager(object):
             selected = candidates[:desired]
             for item in selected:
                 item.status = ""
+                item.phaseout_reason = None
             count = len(selected)
             if count == 0:
                 return f"No phased-out {target_partition} engines to restore."
@@ -4355,17 +5037,36 @@ class EngineManager(object):
                 )
             return msg
 
+    def job_lease_engine(self, eid):
+        """Account callbacks before an imported chief has registered.
+
+        Placeholders stay out of engine_by_id, so the scheduler cannot dispatch
+        work to an unregistered chief. A forwarded start/completion may arrive
+        first, however; its existing lease belongs to the uniquely identified
+        imported placeholder and must not be leaked or silently unreserved.
+        """
+        engine = self.engine_by_id.get(eid)
+        if engine is not None:
+            return engine
+        if (not eid or eid == '?' or getattr(status, 'handover_mode', '') not in
+                ('TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE')):
+            return None
+        expected = set(getattr(status, 'handover_expected_cluster_ids', set()) or set())
+        matches = [item for cid, item in list(self.engine_by_clusterid.items())
+                   if str(cid) in expected and item.engine_id == eid]
+        return matches[0] if len(matches) == 1 else None
+
     def job_running(self, eid, job):
-        engine = self.engine_by_id.get(eid, None)
+        engine = self.job_lease_engine(eid)
         if engine:
             engine.jobs.add(job)
 
     def job_stopped(self, eid, job):
-        engine = self.engine_by_id.get(eid, None)
+        engine = self.job_lease_engine(eid)
         if engine:
             engine.jobs.discard(job)
 
-    def list_nodes(self):
+    def list_nodes(self, include_gpus=False):
         result = []
         for e in list(self.engine_by_id.values()):
             result.append(
@@ -4395,7 +5096,9 @@ class EngineManager(object):
                     float(getattr(e, 'gpfs_io_pct', 0.0)),
                     bool(getattr(e, 'gpfs_io_available', False)),
                     getattr(e, 'chief_version', None),
-                )
+                ) + ((len(e.gpu_devices),
+                      sum(len(owned) for owned in e.gpu_allocations.values()),
+                      list(e.gpu_devices)) if include_gpus else ())
             )
         return result
 
@@ -4424,39 +5127,76 @@ class EngineManager(object):
     def _check_cluster_engines(self):
         # After an explicit handover, imported allocations retain the old
         # Slurm job name.  Query all logical instance names represented by our
-        # placeholders, while still excluding the user's independent managers.
+        # placeholders.  Registered pilots may also have been submitted with a
+        # human-readable suffix in their Slurm name.  Query their exact Slurm
+        # ids as a second selector so a harmless display-name difference cannot
+        # demote a live chief to ``managed=False`` and strand runnable work.
         instance_names = {str(status.instance_name)}
         for known_engine in self.engine_by_clusterid.values():
             known_instance = getattr(known_engine, 'instance', None)
             if known_instance:
                 instance_names.add(str(known_instance))
-        args = [
-            "squeue", "-h", "-r", "--user", getpass.getuser(),
-            "--name", ",".join(sorted(instance_names)),
-            "-O",
+        output_format = (
             "jobid:|,arrayjobid:|,arraytaskid:|,name:|,timeleft:|,statecompact:|,"
-            "nodelist:|,partition:|,pendingtime:|,feature:|,reason",
-        ]
-        try:
-            p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            output, error = p.communicate()
-            if p.returncode not in (None, 0):
-                if isinstance(error, bytes):
-                    error = error.decode("utf-8", errors="replace")
-                add_log_line(
-                    gb,
-                    "Unable to query Slurm engine allocations (exit %s): %s"
-                    % (p.returncode, str(error or "").strip()),
-                    RED,
+            "nodelist:|,partition:|,pendingtime:|,feature:|,numcpus:|,reason"
+        )
+        selectors = [["--name", ",".join(sorted(instance_names))]]
+        known_slurm_ids = sorted({
+            str(getattr(engine, "slurm_job_id", None) or cid)
+            for cid, engine in self.engine_by_clusterid.items()
+            if (
+                engine is not None
+                and cid not in (None, "", False)
+                and re.fullmatch(
+                    r"\d+(?:_\d+)?",
+                    str(getattr(engine, "slurm_job_id", None) or cid),
                 )
-                return
-            if isinstance(output, bytes):
-                output = output.decode("utf-8")
-        except OSError:
-            # lets assume this is temporary
-            return
+            )
+        })
+        if known_slurm_ids:
+            selectors.append(["--jobs", ",".join(known_slurm_ids)])
 
-        output = [e.strip().split("|") for e in output.split("\n") if e]
+        output_lines = []
+        for selector in selectors:
+            args = [
+                "squeue", "-h", "-r", "--user", getpass.getuser(),
+            ] + selector + ["-O", output_format]
+            try:
+                p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                query_output, error = p.communicate()
+                if p.returncode not in (None, 0):
+                    if isinstance(error, bytes):
+                        error = error.decode("utf-8", errors="replace")
+                    add_log_line(
+                        gb,
+                        "Unable to query Slurm engine allocations (exit %s): %s"
+                        % (p.returncode, str(error or "").strip()),
+                        RED,
+                    )
+                    return
+                if isinstance(query_output, bytes):
+                    query_output = query_output.decode("utf-8")
+            except OSError:
+                # A failed observation is never evidence that a pilot vanished.
+                return
+            output_lines.extend(
+                line.strip() for line in query_output.split("\n") if line
+            )
+
+        # A manager-named registered pilot is returned by both selectors.  The
+        # Pending array siblings can share the raw JobID (their array base).
+        # Use ArrayJobID + ArrayTaskID when present, not raw JobID alone.
+        output = []
+        seen_slurm_job_ids = set()
+        for line in output_lines:
+            fields = line.split("|")
+            task = fields[2].strip() if len(fields) > 2 else ""
+            slurm_job_id = (f"{fields[1].strip()}_{task}"
+                            if task and task != "N/A" else fields[0].strip())
+            if slurm_job_id in seen_slurm_job_ids:
+                continue
+            seen_slurm_job_ids.add(slurm_job_id)
+            output.append(fields)
 
         z = defaultdict(int)
 
@@ -4470,10 +5210,12 @@ class EngineManager(object):
         nrunning_archive = 0
         nheld = 0
         nheld_archive = 0
+        nqueue_gpu = nrunning_gpu = nheld_gpu = 0
         queued_by = defaultdict(int)
         running_by = defaultdict(int)
         held_by = defaultdict(int)
         queued_engines_detail = []  # (cid, partition, age_sec, is_scratch) for non-R, non-staging, non-held engine allocations
+        queued_capacity_by_cid = {}
         held_detail = []            # same tuple for allocations this manager actually holds
         external_held_detail = []   # actual Slurm holds not owned by this manager
         actual_held_cids = set()
@@ -4482,7 +5224,7 @@ class EngineManager(object):
 
 
         try:
-            for slurm_job_id, jid_raw, atask, cname, ctime, cstate, cnode, cpartition, cpending, cfeatures, creason in output:
+            for slurm_job_id, jid_raw, atask, cname, ctime, cstate, cnode, cpartition, cpending, cfeatures, cnumcpus, creason in output:
                 task = (atask or "").strip()
                 if task and task != "N/A":
                     cid = f"{jid_raw}_{task}"
@@ -4500,11 +5242,7 @@ class EngineManager(object):
                 # the user can cancel them before a worker has registered.
                 engine = self.engine_by_clusterid.get(cid)
                 if engine is None:
-                    local_partition = (
-                        "archive"
-                        if cpartition == getattr(status, "staging_partition", "staging")
-                        else "compute"
-                    )
+                    local_partition = _worker_kind(cpartition)
                     engine = Engine(
                         cluster_id=cid,
                         partition=local_partition,
@@ -4515,13 +5253,20 @@ class EngineManager(object):
                     self.engine_by_clusterid[cid] = engine
                 engine.slurm_partition = cpartition
                 engine.slurm_state = cstate
-                engine.slurm_job_id = str(slurm_job_id or "").strip() or cid
+                raw_id = str(slurm_job_id or "").strip()
+                # Never use the shared array base as a single-pilot cancel/
+                # hold/query target. Materialized unique job IDs remain valid.
+                engine.slurm_job_id = cid if raw_id == jid_raw and task and task != "N/A" else (raw_id or cid)
+                expected_cores, expected_mem_mb = _autogrow_engine_capacity(
+                    cpartition, cnumcpus
+                )
+                if expected_cores > 0.0:
+                    engine.cores = expected_cores
+                if expected_mem_mb > 0.0:
+                    engine.totmem = expected_mem_mb
                 if engine.engine_id == "?":
-                    engine.partition = (
-                        "archive"
-                        if cpartition == getattr(status, "staging_partition", "staging")
-                        else "compute"
-                    )
+                    engine.partition = _worker_kind(cpartition)
+                    engine.planned_gpus = int(status.node_profiles.get(cpartition, {}).get('gpus', 0))
 
                 # indicate this engine is observed; apply gating to reduce flapping                
                 engine.missing_hits = 0
@@ -4533,7 +5278,10 @@ class EngineManager(object):
                         f"Engine {engine.engine_id} @ {engine.cluster_id} is managed again after {engine.observed_hits} observations.",
                         CYAN,
                     )
-                if cstate == "R":
+                if cstate in {"R", "PD"}:
+                    # For queued pilots this is the planned allocation limit.
+                    # Treating a one-day request as the five-day default can
+                    # mask long-job demand just as much as an expiring pilot.
                     engine.timeleft = parse_timeleft(ctime)
 
                 try:
@@ -4564,12 +5312,15 @@ class EngineManager(object):
                 except Exception:
                     _is_scratch = False
                 is_archive = cpartition == getattr(status, 'staging_partition', 'staging')
+                is_gpu = _worker_kind(cpartition) == 'gpu'
                 is_held = cstate != "R" and _slurm_reason_is_hold(creason)
 
                 if cstate == "R":
                     # Count running engines even if not yet registered; they occupy cluster capacity.
                     if is_archive:
                         nrunning_archive += 1
+                    elif is_gpu:
+                        nrunning_gpu += 1
                     else:
                         nrunning += 1
                     running_by[cpartition] += 1
@@ -4580,6 +5331,8 @@ class EngineManager(object):
                     held_by[cpartition] += 1
                     if is_archive:
                         nheld_archive += 1
+                    elif is_gpu:
+                        nheld_gpu += 1
                     else:
                         nheld += 1
                         detail = (cid, cpartition, float(age_sec), _is_scratch)
@@ -4592,6 +5345,8 @@ class EngineManager(object):
                 else:
                     if is_archive:
                         nqueue_archive += 1
+                    elif is_gpu:
+                        nqueue_gpu += 1
                     else:
                         nqueue += 1
                         # Remember each still-queued compute engine allocation with
@@ -4599,6 +5354,9 @@ class EngineManager(object):
                         # surplus ones instead of growing while shrinking.
                         queued_engines_detail.append(
                             (cid, cpartition, float(age_sec), _is_scratch)
+                        )
+                        queued_capacity_by_cid[cid] = (
+                            float(engine.cores), float(engine.totmem)
                         )
                     queued_by[cpartition] += 1
 
@@ -4645,6 +5403,9 @@ class EngineManager(object):
         self.cluster_queued_engines_archive = nqueue_archive
         self.cluster_running_engines_archive = nrunning_archive
         self.cluster_held_engines_archive = nheld_archive
+        self.cluster_queued_engines_gpu = nqueue_gpu
+        self.cluster_running_engines_gpu = nrunning_gpu
+        self.cluster_held_engines_gpu = nheld_gpu
         self.last_observed_cids = set(observed_cluster_ids)
         stale_holds = (
             expected_held_cids.intersection(observed_cluster_ids)
@@ -4666,6 +5427,7 @@ class EngineManager(object):
             self.cluster_running_by_partition = dict(running_by)
             self.cluster_held_by_partition = dict(held_by)
             self.queued_engines_detail = list(queued_engines_detail)
+            self.queued_engine_capacity_by_cid = dict(queued_capacity_by_cid)
             self.held_engines_detail = list(held_detail)
             self.external_held_engines_detail = list(external_held_detail)
             self.actual_held_engine_cids = set(actual_held_cids)
@@ -4678,6 +5440,7 @@ class EngineManager(object):
             self.cluster_running_by_partition = {}
             self.cluster_held_by_partition = {}
             self.queued_engines_detail = []
+            self.queued_engine_capacity_by_cid = {}
             self.held_engines_detail = []
             self.external_held_engines_detail = []
             self.actual_held_engine_cids = set()
@@ -4694,9 +5457,10 @@ class EngineManager(object):
             self.last_squeue_ts = time.time()
         except Exception:
             pass
+        return True
 
     def _matches_cluster_group(self, engine, group=None):
-        """Match a worker against the UI groups compute/staging/all."""
+        """Match a worker against the UI groups compute/staging/gpu/all."""
         target = str(group or "all").strip().lower()
         if target in ("all", "*"):
             return True
@@ -4708,8 +5472,31 @@ class EngineManager(object):
         if target in ("staging", "archive"):
             return manager_partition == "archive" or slurm_partition == staging_partition
         if target == "compute":
-            return manager_partition != "archive" and slurm_partition != staging_partition
+            return manager_partition == "compute" and slurm_partition != staging_partition
+        if target == 'gpu':
+            return manager_partition == 'gpu' or _worker_kind(slurm_partition) == 'gpu'
         return False
+
+    def cancel_pending_gpu_engine(self, cid):
+        """Cancel only a still-PENDING, idle managed GPU pilot, never its array."""
+        with self.lock:
+            engine = self.engine_by_clusterid.get(str(cid))
+            if (engine is None or engine.partition != 'gpu' or not engine.managed
+                    or engine.slurm_state not in ('PD', 'PENDING') or engine.jobs
+                    or engine.gpu_allocations or engine.stopping
+                    or str(cid) in self.actual_held_engine_cids):
+                return False
+            target = str(engine.slurm_job_id or engine.cluster_id)
+            process = Popen(['scancel', '--state=PENDING', target],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process.communicate()
+            if process.returncode not in (None, 0):
+                return False
+            # A zero return code may mean the task started in the meantime.
+            # Mark draining, keep the placeholder until Slurm confirms absence.
+            engine.status = PHASING_OUT
+            engine.phaseout_reason = 'consolidation'
+            return True
 
     def count_cluster_engines(self, group=None):
         with self.lock:
@@ -4795,7 +5582,12 @@ class EngineManager(object):
             set_status_message(gb, "Local engine terminated", GREEN)
 
     # FIXME
-    def start_slurm(self, gb, n, stime, partition, constraint, cores):
+    def start_slurm(self, gb, n, stime, partition, constraint, cores,
+                    minimum_runtime_seconds=None):
+        partition, worker_kind = resolve_worker_partition(partition)
+        gpu_profile = status.node_profiles.get(partition, {}) if worker_kind == 'gpu' else None
+        if gpu_profile is not None:
+            cores = int(gpu_profile['cores'])
         self.lock.acquire()
         started_engines = []
         try:
@@ -4805,29 +5597,35 @@ class EngineManager(object):
                 )
             else:
                 set_status_message(gb, "Starting SLURM engines", YELLOW)
-                # Ask for `stime` but let backfill shorten it to whatever fits before
-                # the next (invisible) maintenance reservation -- see the note in
-                # zslurm_shared. An engine shorter than the floor spends more on
-                # startup and drain than it returns, so below that we stay queued
-                # and the capacity simply comes back after the window.
+                # Autogrow can supply a workload-aware floor computed before
+                # taking the engine lock. Other callers retain the site's
+                # maintenance policy. An explicit floor at/above stime means
+                # no shortening, NOT fallback to a smaller legacy floor.
                 time_min = None
-                if bool(getattr(status, 'maintenance_window_enable', True)):
+                if minimum_runtime_seconds is not None:
+                    time_min = zslurm_shared.submission_time_min(
+                        stime, minimum_runtime_seconds)
+                elif bool(getattr(status, 'maintenance_window_enable', True)):
                     time_min = zslurm_shared.submission_time_min(
                         stime,
                         getattr(status, 'maintenance_time_min_sec',
                                 zslurm_shared.DEFAULT_TIME_MIN_SECONDS))
-                    if time_min:
-                        add_log_line(
-                            gb,
-                            "Requesting engine walltime %s with --time-min %s; Slurm "
-                            "truncates it to what fits before the next reservation"
-                            % (stime, time_min),
-                            YELLOW,
-                        )
+                if time_min:
+                    add_log_line(
+                        gb,
+                        "Requesting engine walltime %s with --time-min %s; Slurm "
+                        "may shorten the allocation for backfill"
+                        % (stime, time_min),
+                        YELLOW,
+                    )
                 # Build sbatch command as a list to avoid quoting issues
                 args = [
                     "sbatch", "-N", "1", "-p", str(partition),
                 ]
+                if gpu_profile is not None:
+                    gpu_type = str(gpu_profile.get('gpu_type', '') or '')
+                    gres = 'gpu:' + ((gpu_type + ':') if gpu_type else '') + str(gpu_profile['gpus'])
+                    args.extend(['--gres=' + gres, '--mem=' + str(int(float(gpu_profile['mem_gb']) * 1024))])
                 if cores > 0:
                     args.append(f"--cpus-per-task={int(cores)}")
                 else:
@@ -4854,11 +5652,19 @@ class EngineManager(object):
                         args.append("--exclude=" + ",".join(sorted(set(filter(None, xlist)))))
                     lpartition = "archive"
                 else:
-                    lpartition = "compute"
+                    lpartition = worker_kind
+                    if worker_kind == 'compute':
+                        excluded_nodes = _cfg_compute_pilot_exclude_nodes(
+                            getattr(status, 'compute_pilot_exclude_nodes', ()))
+                        if excluded_nodes:
+                            args.append("--exclude=" + ",".join(excluded_nodes))
 
-                # Add command to run under sbatch and its arguments
+                # Resolve the runtime before calling sbatch. Slurm copies the
+                # launcher into a spool directory, so use the absolute,
+                # manager-runtime-pinned command and its arguments.
+                engine_launcher = _prepare_engine_runtime()
                 args.extend([
-                    "slurm_to_zslurm",
+                    engine_launcher,
                     "-a", str(status.address),
                     "-p", str(status.port),
                     "--instance", str(status.instance_name),
@@ -4867,25 +5673,36 @@ class EngineManager(object):
                 if cores > 0:
                     args.extend(["-c", str(int(cores))])
 
-                eid = Popen(
-                    args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                ).communicate()[0]
-                if isinstance(eid, bytes):
-                    eid = eid.decode("utf-8")
+                stdout, stderr = Popen(
+                    args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env=_engine_submission_environment(),
+                ).communicate()
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode("utf-8", errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", errors="replace")
 
-                eid = eid.strip()
+                eid = stdout.strip()
                 try:
                     log_cmd = " ".join(shlex.quote(str(a)) for a in args)
                 except Exception:
                     log_cmd = "sbatch ..."
                 add_log_line(gb, "Queueing engines (%s) using: " % eid + log_cmd, GREEN)
                 if "error" in eid or not eid:
-                    add_log_line(gb, "Error during SLURM submission.", RED)
+                    detail = " ".join(stderr.strip().split())[:1000]
+                    suffix = ": " + detail if detail else "."
+                    add_log_line(gb, "Error during SLURM submission" + suffix, RED)
                     return
+
+                planned_cores, planned_mem_mb = _autogrow_engine_capacity(
+                    partition, cores
+                )
 
                 if n == 1:
                     self.engine_by_clusterid[eid] = Engine(
                         cluster_id=eid,
+                        cores=planned_cores,
+                        totmem=planned_mem_mb,
                         partition=lpartition,
                         managed=True,
                         instance=status.instance_name,
@@ -4898,6 +5715,8 @@ class EngineManager(object):
                         cid = eid + "_" + str(i)                        
                         self.engine_by_clusterid[cid] = Engine(
                             cluster_id=cid,
+                            cores=planned_cores,
+                            totmem=planned_mem_mb,
                             partition=lpartition,
                             managed=True,
                             instance=status.instance_name,
@@ -4905,6 +5724,12 @@ class EngineManager(object):
                         )
                         self.engine_by_clusterid[cid].slurm_state = "PENDING"
                         started_engines.append(self.engine_by_clusterid[cid])
+                for engine in started_engines:
+                    engine.timeleft = parse_timeleft(str(stime))
+                    if gpu_profile is not None:
+                        engine.planned_gpus = int(gpu_profile['gpus'])
+                        engine.has_ssd = bool(gpu_profile.get('has_ssd', False))
+                        engine.ssd_total_gb = float(gpu_profile.get('ssd_gb', 0))
                 time.sleep(3)
                 set_status_message(gb, "SLURM engines queued", GREEN)
                 add_log_line(gb, str(n) + " SLURM engines queued", MAGENTA)
@@ -4914,10 +5739,11 @@ class EngineManager(object):
 
     # FIXME: jobs running removal, priority of cancelling less active nodes
     def stop_slurm(self, gb, n, group=None):
+        failed = []
         self.lock.acquire()
         try:
             target = str(group or "all").strip().lower()
-            if target not in ("all", "*", "compute", "staging", "archive"):
+            if target not in ("all", "*", "compute", "staging", "archive", "gpu"):
                 set_status_message(gb, "Unknown engine group: " + target, YELLOW)
                 return
 
@@ -4987,26 +5813,34 @@ class EngineManager(object):
 
                     set_progress_bar(gb, 0.0)
                     for pos, eid in enumerate(stop_engines):
-                        self.cancel_cid(eid)
+                        if not self.cancel_cid(eid):
+                            failed.append(eid)
                         set_progress_bar(gb, float(pos + 1) / float(n))
 
                     time.sleep(2)
                     stop_progress_bar(gb)
-                    set_status_message(gb, "SLURM engines stopped", GREEN)
-                    add_log_line(gb, f"{n} {group_label} SLURM engines stopped", MAGENTA)
+                    if failed:
+                        message = f"SLURM cancellation failed for {failed}; allocations may still run"
+                        set_status_message(gb, message, RED)
+                        add_log_line(gb, message, RED)
+                    else:
+                        message = f"Cancellation requested for {n} {group_label} SLURM engines; termination not yet confirmed"
+                        set_status_message(gb, message, YELLOW)
+                        add_log_line(gb, message, YELLOW)
         finally:
             self.lock.release()
+        return failed
 
     def cancel_cid(self, cid, unregister_after=True):
         self.lock.acquire()
         try:
-            cmd = "scancel " + str(cid)
-            args = shlex.split(cmd)
-            add_log_line(gb, "Cancelling using command: " + cmd, CYAN)
-            p = Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            log_output(p.stdout, gb, WHITE)
-            log_output(p.stderr, gb, RED)
-            p.wait()
+            control_id = self._slurm_control_id(cid)
+            add_log_line(gb, "Cancelling using command: scancel " + control_id, CYAN)
+            if not self._run_cluster_control(
+                    gb, ["scancel", control_id], f"cancel engine {cid}"):
+                # Keep the chief and its jobs registered for a later retry.
+                # A failed Slurm request is not evidence of termination.
+                return False
 
             if cid in self.engine_by_clusterid:
                 e = self.engine_by_clusterid[cid]
@@ -5015,6 +5849,7 @@ class EngineManager(object):
                     e.stopping = True
                     if unregister_after:
                         self._unregister(e, reason="Engine stopped")
+            return True
         finally:
             self.lock.release()
 
@@ -5121,33 +5956,140 @@ class EngineManager(object):
             add_log_line(gb, f"Released {len(done)} held engine allocation(s): {shown}", GREEN)
         return done
 
-    def _is_cid_present(self, cid):
-        """Return True if the given Slurm cluster job id is still present in squeue."""
+    def _slurm_terminal_confirmed(self, cid):
+        """Check the exact allocation; absence from a name-filtered queue is insufficient."""
+        cid = str(cid)
+        control_id = self._slurm_control_id(cid)
+        if (not re.fullmatch(r"\d+(?:_\d+)?", cid)
+                or not re.fullmatch(r"\d+(?:_\d+)?", control_id)):
+            return False
         try:
-            cids = getattr(self, 'last_observed_cids', set()) or set()
-            return str(cid) in cids
-        except Exception:
+            process = Popen(
+                ["sacct", "-n", "-X", "-j", control_id, "-P", "--format=JobIDRaw,JobID,State"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, _ = process.communicate()
+            if process.returncode != 0:
+                return False
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8")
+            # Spider reports JobIDRaw=array base for an unmaterialized task,
+            # e.g. 123|123_4|CANCELLED. JobID is the canonical task identity;
+            # raw ID alone can identify a sibling or the array parent instead.
+            expected_raw_ids = {control_id}
+            if "_" in cid:
+                expected_raw_ids.add(cid.split("_", 1)[0])
+            matches = []
+            for line in stdout.splitlines():
+                if not line.strip():
+                    continue
+                fields = [field.strip() for field in line.split("|")]
+                if len(fields) != 3 or not all(fields):
+                    return False
+                raw_id, job_id, state = fields
+                if job_id == cid:
+                    if raw_id not in expected_raw_ids:
+                        return False
+                    matches.append(state)
+                elif raw_id == control_id:
+                    # One physical ID must not identify two canonical tasks.
+                    return False
+            terminal = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
+                        "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
+            return len(matches) == 1 and matches[0].split()[0] in terminal
+        except (OSError, UnicodeError):
             return False
 
-    def _wait_for_cid_termination(self, cid, timeout_seconds=60, poll_interval=2):
-        """Wait up to timeout_seconds for the Slurm job cid to disappear from squeue."""
-        if cid is None or cid is False:
-            return
-        start = time.time()
-        while time.time() - start < timeout_seconds:
-            if not self._is_cid_present(cid):
-                add_log_line(gb, f"Confirmed SLURM job {cid} is no longer present.", CYAN)
-                return
-            time.sleep(poll_interval)
-        add_log_line(gb, f"Timed out waiting for SLURM job {cid} to disappear; proceeding.", YELLOW)
+    def _imported_orphan_terminal_candidate(self, engine, slurm_snapshot_ok):
+        """Require an imported, unregistered chief absent from fresh Slurm snapshots."""
+        if (slurm_snapshot_ok is not True
+                or getattr(status, 'handover_mode', '') != 'TARGET_MIGRATING'):
+            return False
+        cid = str(getattr(engine, 'cluster_id', '') or '')
+        eid = str(getattr(engine, 'engine_id', '') or '')
+        expected = getattr(status, 'handover_expected_cluster_ids', set()) or set()
+        registered = getattr(status, 'handover_registered_cluster_ids', set()) or set()
+        terminal = getattr(status, 'handover_terminal_cluster_ids', set()) or set()
+        if (not re.fullmatch(r"\d+(?:_\d+)?", cid)
+                or not eid or eid == '?'
+                or cid not in expected or cid in registered or cid in terminal
+                or self.engine_by_clusterid.get(cid) is not engine
+                or eid in self.engine_by_id
+                or any(item is engine for item in self.engine_by_id.values())
+                or cid in self.last_observed_cids
+                or engine.missing_hits < SQUEUE_MISSING_TOLERANCE):
+            return False
+        # engine_removed acts on the chief ID. Never requeue another pilot's
+        # lease if a malformed import gave two placeholders the same ID.
+        return sum(item is not None and item.engine_id == eid
+                   for item in self.engine_by_clusterid.values()) == 1
+
+    def reconcile_imported_orphan_engine(self, engine, slurm_snapshot_ok):
+        """Requeue leases of a terminal imported pilot that never re-registered."""
+        with self.lock:
+            if not self._imported_orphan_terminal_candidate(engine, slurm_snapshot_ok):
+                return False
+            cid = str(engine.cluster_id)
+            now = time.monotonic()
+            last_check = getattr(engine, 'last_orphan_terminal_check', None)
+            if (last_check is not None and 0 <= now - last_check < 60):
+                return False
+            engine.last_orphan_terminal_check = now
+        if not self._slurm_terminal_confirmed(cid):
+            return False
+        with self.lock:
+            # A chief may have registered while sacct ran. Recheck ownership
+            # and the latest squeue observation before changing any job state.
+            if not self._imported_orphan_terminal_candidate(engine, slurm_snapshot_ok):
+                return False
+            self._unregister(engine, "Imported chief lost; Slurm termination confirmed")
+            status.handover_terminal_cluster_ids.add(cid)
+            _maybe_finish_chief_migration()
+            add_log_line(
+                gb, f"Requeued leases of terminal imported pilot {cid}; "
+                "chief never re-registered.", YELLOW)
+            return True
+
+    def reconcile_timed_out_engine(self, engine, slurm_snapshot_ok):
+        """Fence a silent chief; requeue only after fresh Slurm absence evidence.
+
+        Use the controller's shared query rather than blocking its refresh loop
+        waiting for a cached snapshot to change. Failed observations never prove
+        termination. Cancellation acceptance also does not prove termination.
+        """
+        with self.lock:
+            now = time.time()
+            if now - engine.lastseen <= TIMEOUT:
+                return False
+            engine.stopping = True
+            cid = engine.cluster_id
+            if cid is False:
+                self.stop_local(gb)
+                return True
+            if cid is None:
+                return False
+            if (slurm_snapshot_ok is True
+                    and cid not in self.last_observed_cids
+                    and engine.missing_hits >= SQUEUE_MISSING_TOLERANCE
+                    and self._slurm_terminal_confirmed(cid)):
+                self._unregister(engine, "Engine timed out; Slurm termination confirmed")
+                return True
+            # Keep jobs owned by this chief while cancellation is unresolved.
+            # Retry failures without flooding Slurm on the five-second loop.
+            last_attempt = getattr(engine, "last_timeout_cancel_attempt", None)
+            if last_attempt is None or now - last_attempt >= 60:
+                engine.last_timeout_cancel_attempt = now
+                self.cancel_cid(cid, unregister_after=False)
+            return False
 
     def stop_all(self):
+        failed = []
         if self.count_cluster_engines() > 0:
             add_log_line(gb, "Terminating SLURM engines.", RED)
-            self.stop_slurm(gb, self.count_cluster_engines())
+            failed = self.stop_slurm(gb, self.count_cluster_engines())
         if self.check_local_engine():
             add_log_line(gb, "Terminating local engine.", RED)
             self.stop_local(gb)
+        return failed
 
 
     def failed_node(self, myip, partition, cluster_jobid):        
@@ -5170,26 +6112,43 @@ class EngineManager(object):
         ssd_used_gb,
         logical_instance=None,
         chief_version=None,
+        gpu_devices=None,
     ):
+        devices = zslurm_gpu.device_ids(gpu_devices)
+        if (partition == 'gpu') != bool(devices):
+            raise ValueError('GPU workers require explicit devices; CPU/archive workers must not register devices')
         self.lock.acquire()
         try:
+            if (str(cluster_jobid) in getattr(status, 'handover_terminal_cluster_ids', set())
+                    and getattr(status, 'handover_mode', '') in
+                    ('TARGET_MIGRATING', 'TARGET_ACTIVE')):
+                # Reconciliation fenced this exact terminated allocation. A
+                # late RPC from its old chief must not resurrect its leases.
+                return 'DENIED'
             myid = zslurm_shared.short_name(myip)
 
-            myx = myid
-            counter = 1
-            while myx in self.engine_by_id:
-                counter += 1
-                myx = f"{myid}-{counter}"
-            myid = myx
-
             prev = self.engine_by_clusterid.get(cluster_jobid, None) if cluster_jobid not in (None, "", False) else None
-            if (
-                prev is not None
-                and getattr(prev, 'engine_id', None) in self.engine_by_id
-                and self.engine_by_id.get(prev.engine_id) is prev
-            ):
-                # Idempotent re-registration after a lost migration response.
+            if prev is not None and any(not set(owned).issubset(devices)
+                    for owned in prev.gpu_allocations.values()):
+                raise ValueError('GPU registration would drop reserved devices')
+            if prev is not None and getattr(prev, 'engine_id', None) not in (None, '', '?'):
+                # Running jobs retain this ID across handover. Chiefs on the
+                # same hostname may migrate in any order; never swap their
+                # imported names, including before either chief registers.
                 myid = prev.engine_id
+            else:
+                reserved_ids = set(self.engine_by_id)
+                reserved_ids.update(
+                    engine.engine_id
+                    for engine in self.engine_by_clusterid.values()
+                    if engine is not None and getattr(engine, 'engine_id', None) not in (None, '', '?')
+                )
+                myx = myid
+                counter = 1
+                while myx in reserved_ids:
+                    counter += 1
+                    myx = f"{myid}-{counter}"
+                myid = myx
             if prev is not None:
                 # Reuse placeholder to preserve managed/observed state
                 e = prev
@@ -5198,7 +6157,7 @@ class EngineManager(object):
                 e.totmem = totmem
                 e.partition = partition
                 if getattr(status, 'handover_mode', '') not in (
-                        'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'):
+                        'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE') and partition != 'gpu':
                     e.status = ""
             else:
                 e = Engine(myid, cores, totmem, partition)
@@ -5208,8 +6167,15 @@ class EngineManager(object):
                 if cluster_jobid not in (None, "", False):
                     self.engine_by_clusterid[cluster_jobid] = e
 
+            # A live registration is a heartbeat, especially for a late chief
+            # reusing an imported placeholder.  Its source-side timestamp may
+            # already be older than TIMEOUT; never cancel it between this
+            # registration and its first poll.  Keep intentional stop fences.
+            e.lastseen = time.time()
             self.engine_by_id[myid] = e
-            if myid == zslurm_shared.short_name(status.address) or cluster_jobid == "":
+            # Spider may place a partial Slurm pilot on the manager's host.
+            # Allocation identity, not hostname equality, determines locality.
+            if cluster_jobid in (None, "", False):
                 e.cluster_id = False
             else:
                 e.cluster_id = cluster_jobid
@@ -5242,6 +6208,8 @@ class EngineManager(object):
                 prev is not None
                 and getattr(status, 'handover_mode', '') in (
                     'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'))
+            e.gpu_devices = devices
+            e.planned_gpus = len(devices)
             e.has_ssd = False
             e.ssd_total_gb = float(ssd_total_gb)
             e.ssd_used_gb = float(ssd_used_gb)            
@@ -5264,6 +6232,8 @@ class EngineManager(object):
 
         except Exception as e:
             add_log_line(gb, "Exception in register: " + str(e), RED)
+            if partition == 'gpu':
+                raise
         finally:
             self.lock.release()
         return myid
@@ -5562,7 +6532,7 @@ def _migration_command_payload():
 
 def register(*args):
     myid = engines.register(*args)
-    if getattr(status, 'handover_mode', '') in (
+    if myid not in (None, 'DENIED') and getattr(status, 'handover_mode', '') in (
             'TARGET_IMPORTED', 'TARGET_MIGRATING', 'TARGET_ACTIVE'):
         try:
             cluster_id = str(args[4])
@@ -5579,6 +6549,11 @@ def register(*args):
 
 def register_versioned(*args):
     """Register a chief carrying a release identity; legacy register stays valid."""
+    return register(*args)
+
+
+def register_gpu_versioned(*args):
+    """Discovery-gated GPU RPC; existing CPU registration positions stay intact."""
     return register(*args)
 
 
@@ -5609,6 +6584,48 @@ def list_nodes(*args):
     if _handover_committed_source():
         return _handover_proxy(False).list_nodes(*args)
     return engines.list_nodes(*args)
+
+
+def list_pilot_allocations():
+    """Read-only registry of physical pilots, including queued placeholders.
+
+    This is a manager observation, not a fresh Slurm query. Callers making a
+    placement decision must reconcile these IDs with squeue/scontrol; a pilot
+    can move from pending to running between the two observations.
+    """
+    if _handover_committed_source():
+        return _handover_proxy(False).list_pilot_allocations()
+    with engines.lock:
+        observed = set(getattr(engines, 'last_observed_cids', set()) or set())
+        allocations = []
+        for cid, engine in sorted(engines.engine_by_clusterid.items(),
+                                  key=lambda item: str(item[0])):
+            if engine is None:
+                continue
+            allocations.append({
+                'cluster_id': str(cid),
+                'slurm_job_id': str(getattr(engine, 'slurm_job_id', None) or cid),
+                'partition': str(getattr(engine, 'partition', '') or ''),
+                'slurm_partition': str(getattr(engine, 'slurm_partition', '') or ''),
+                'slurm_state': str(getattr(engine, 'slurm_state', '') or ''),
+                'instance': str(getattr(engine, 'instance', '') or ''),
+                'managed': bool(getattr(engine, 'managed', False)),
+                'observed_in_last_squeue': str(cid) in observed,
+            })
+    return {
+        'ok': True,
+        'schema_version': 1,
+        'instance': str(getattr(status, 'instance_name', '') or ''),
+        'manager_uuid': str(getattr(status, 'manager_uuid', '') or ''),
+        'owned_instance_names': sorted({
+            str(name) for name in (
+                [getattr(status, 'instance_name', '')]
+                + list(getattr(status, 'handover_owned_aliases', set()) or set())
+                + [row['instance'] for row in allocations])
+            if name
+        }),
+        'allocations': allocations,
+    }
 
 
 def failed_node(*args):
@@ -5651,6 +6668,7 @@ def _manager_descriptor(instance_name=None, include_secret=False):
         'rpcpath': str(rpcpath),
         'manager_url': f"http://{host}:{port}/{rpcpath}",
         'job_url': f"http://{host}:{port + 1}/{rpcpath}",
+        'gpu_jobs': True,
     }
     if include_secret:
         descriptor['handover_secret'] = str(
@@ -5675,6 +6693,7 @@ def _snapshot_job(job, requeue_assigned=False):
         data['current_cpu_usage'] = 0.0
         data['current_mem_usage'] = 0.0
         data['ssd_alloc_gb'] = 0.0
+        data['gpu_devices'] = []
     return _rpc_safe(data)
 
 
@@ -5707,7 +6726,12 @@ def _build_handover_snapshot(
             continue
         record = copy.deepcopy(getattr(engine, '__dict__', {}))
         record['cluster_id'] = cluster_id
-        record['jobs'] = list(getattr(engine, 'jobs', set()) or set())
+        # Engine.jobs contains Job objects, not RPC-safe IDs. Do not serialize
+        # their repr strings or carry stale/requeued membership into a target.
+        record['jobs'] = [
+            str(job.jobid) for job in jobs.jobs_by_id.values()
+            if job.state == 'RUNNING' and job.node_id == engine.engine_id
+        ]
         record['pending_commands'] = list(
             getattr(engine, 'pending_commands', []) or [])
         engine_records.append(_rpc_safe(record))
@@ -5734,6 +6758,7 @@ def _build_handover_snapshot(
             [pattern, int(priority)]
             for pattern, priority in jobs.cwd_priority_overrides.items()
         ],
+        'controller_owner_prefixes': list(jobs.controller_owner_prefixes),
     }
     scheduler_values = {
         'lastin_first': bool(status.lastin_first),
@@ -5747,6 +6772,10 @@ def _build_handover_snapshot(
         'autogrow_max_compute_nodes': int(
             (getattr(status, 'config', {}) or {}).get(
                 'autogrow_max_compute_nodes', 0) or 0),
+        'autogrow_max_gpu_nodes': int((getattr(status, 'config', {}) or {}).get(
+            'autogrow_max_gpu_nodes', 0) or 0),
+        'compute_pilot_exclude_nodes': list(_cfg_compute_pilot_exclude_nodes(
+            getattr(status, 'compute_pilot_exclude_nodes', ()))),
     }
     finished = []
     for owner, owner_jobs in jobs.finished_jobs_by_owner.items():
@@ -5785,18 +6814,78 @@ def _build_handover_snapshot(
 def _job_from_handover(data):
     job = Job.__new__(Job)
     job.__dict__.update(copy.deepcopy(data or {}))
+    job.__dict__.setdefault('ngpus', 0)
+    job.__dict__.setdefault('gpu_devices', [])
     return job
+
+
+def _validate_gpu_handover_snapshot(snapshot):
+    """Reject corrupt device ownership before mutating an empty target."""
+    records = {str(e.get('engine_id')): e for e in snapshot.get('engines', []) or []}
+    occupied = {}
+    for record in records.values():
+        devices = zslurm_gpu.device_ids(record.get('gpu_devices', []))
+        if devices and record.get('partition') != 'gpu':
+            raise ValueError('Non-GPU engine contains GPU devices')
+    for job in snapshot.get('jobs', []) or []:
+        count = job.get('ngpus', 0)
+        if not count and job.get('partition') != 'gpu':
+            continue  # legacy CPU snapshots need no new fields
+        count = zslurm_gpu.gpu_count(job.get('partition'), count)
+        devices = zslurm_gpu.device_ids(job.get('gpu_devices', []))
+        if job.get('state') != 'RUNNING':
+            if devices:
+                raise ValueError('Unstarted GPU job owns devices in handover snapshot')
+            continue
+        record = records.get(str(job.get('node_id')))
+        if record is None or record.get('partition') != 'gpu':
+            raise ValueError('Running GPU job has no GPU engine in handover snapshot')
+        all_devices = zslurm_gpu.device_ids(record.get('gpu_devices', []))
+        owned = occupied.setdefault(str(job.get('node_id')), set())
+        if len(devices) != count or not set(devices).issubset(all_devices) or owned.intersection(devices):
+            raise ValueError('Invalid GPU reservations in handover snapshot')
+        owned.update(devices)
 
 
 def _apply_handover_snapshot(snapshot):
     """Import a source snapshot into an already-validated empty target."""
+    _validate_gpu_handover_snapshot(snapshot)
     manager = snapshot.get('manager', {}) or {}
     scheduler = snapshot.get('scheduler', {}) or {}
+    # Validate the transferred submission policy before mutating the target.
+    # Legacy snapshots lack this key and therefore retain the target's
+    # instance-loaded policy rather than accidentally clearing it.
+    transferred_exclusions = _cfg_compute_pilot_exclude_nodes(
+        scheduler.get('compute_pilot_exclude_nodes',
+                      getattr(status, 'compute_pilot_exclude_nodes', ())))
+    prefixes = manager.get('controller_owner_prefixes', [])
+    if not isinstance(prefixes, list):
+        raise ValueError('invalid controller owner prefix registry')
+    for prefix in prefixes:
+        jobs._validate_controller_owner_prefix(prefix)
+    if len(set(prefixes)) != len(prefixes):
+        raise ValueError('duplicate controller owner prefix registry')
 
     jobs.jobs_by_id = OrderedDict()
     for data in snapshot.get('jobs', []) or []:
         job = _job_from_handover(data)
         jobs.jobs_by_id[str(job.jobid)] = job
+    # Public, immutable membership from the lock-protected source snapshot.
+    # A pre-handover list_jobs observation can race with new submissions or
+    # completions; it cannot attest to the set that was actually imported.
+    source = snapshot.get('source', {}) or {}
+    status.handover_import_job_evidence = {
+        'schema_version': 1,
+        'handover_id': str(snapshot.get('handover_id', '')),
+        'source_instance': source.get('instance'),
+        'source_uuid': source.get('manager_uuid'),
+        'target_instance': status.instance_name,
+        'target_uuid': status.manager_uuid,
+        'jobs': [
+            {'jobid': str(job.jobid), 'name': job.job_name, 'state': job.state}
+            for job in jobs.jobs_by_id.values()
+        ],
+    }
     jobs.finished_jobs_by_owner = {}
     for owner_record in snapshot.get('finished_jobs', []) or []:
         owner = owner_record.get('owner')
@@ -5815,12 +6904,14 @@ def _apply_handover_snapshot(snapshot):
             'cwd_priority_overrides', []
         ) or []
     )
+    jobs.controller_owner_prefixes = list(prefixes)
     for job in jobs.jobs_by_id.values():
         if not hasattr(job, 'base_priority'):
             job.base_priority = int(getattr(
                 job, 'priority', DEFAULT_JOB_PRIORITY
             ) or 0)
         jobs._apply_priority_override_locked(job)
+        jobs._apply_owner_controller_role_locked(job)
     jobs.jobid_counter = int(manager.get('jobid_counter', jobs.jobid_counter))
     for name in (
         'active_total', 'active_inuse', 'dcache_total', 'dcache_inuse',
@@ -5833,6 +6924,10 @@ def _apply_handover_snapshot(snapshot):
     for name in ('total_jobs', 'running_jobs', 'failed_jobs', 'done_jobs'):
         setattr(jobs, name, dict(manager.get(name, {}) or {}))
     jobs._eligible_cache_ts = 0.0
+    # Capacity waits never own jobs or resources and cannot survive a changed
+    # live pilot registry. Recompute on requests after chiefs re-register.
+    jobs.capacity_waits = {}
+    jobs.capacity_wait_cooldowns = {}
 
     engines.engine_by_id = {}
     engines.engine_by_clusterid = {}
@@ -5848,7 +6943,36 @@ def _apply_handover_snapshot(snapshot):
             record.get('instance')
             or (snapshot.get('source', {}) or {}).get('instance')
             or status.handover_source_instance)
-        engine.jobs = set(record.get('jobs', []) or [])
+        # The job table is authoritative, including when importing a legacy
+        # snapshot whose engine jobs were object repr strings. Rebind canonical
+        # objects and reconstruct actual held leases rather than perpetuating
+        # stale counters. ASSIGNED jobs were returned to PENDING above.
+        engine.jobs = {
+            job for job in jobs.jobs_by_id.values()
+            if job.state == 'RUNNING' and job.node_id == engine.engine_id
+        }
+        engine.res_cpu_reserved = sum(
+            float(getattr(job, 'held_ncpu', job.ncpu))
+            for job in engine.jobs
+        )
+        engine.res_mem_reserved_mb = sum(
+            float(getattr(job, 'held_mem', job.mem))
+            for job in engine.jobs
+        )
+        engine.res_ssd_reserved_gb = sum(
+            float(getattr(job, 'ssd_alloc_gb', 0.0) or 0.0)
+            for job in engine.jobs
+        )
+        engine.gpu_allocations = {}
+        owned = set()
+        for job in engine.jobs:
+            devices = zslurm_gpu.device_ids(job.gpu_devices)
+            if (len(devices) != job.ngpus or not set(devices).issubset(engine.gpu_devices)
+                    or owned.intersection(devices)):
+                raise ValueError('Invalid GPU reservations in handover snapshot')
+            if devices:
+                engine.gpu_allocations[job.jobid] = devices
+                owned.update(devices)
         engine.pending_commands = [
             tuple(command) for command in record.get('pending_commands', []) or []
         ]
@@ -5865,19 +6989,39 @@ def _apply_handover_snapshot(snapshot):
         'autogrow_enable', False))
     status.handover_saved_autoconsolidate = bool(scheduler.get(
         'autoconsolidate_enable', False))
-    status.handover_expected_cluster_ids = set(
+    status.compute_pilot_exclude_nodes = transferred_exclusions
+    registered_cids = set(
         str(value)
         for value in snapshot.get('registered_cluster_ids', []) or [])
+    # Older sources enumerate only engine_by_id above. A chief that vanished
+    # before handover can still own RUNNING leases in engine_by_clusterid; if
+    # omitted here, activation declares migration complete before the target
+    # can prove that allocation terminal and requeue those exact leases.
+    # Preserve the source's registered set (including Snellius IDs) unchanged,
+    # and add only imported, unregistered Slurm pilots with real live leases.
+    orphan_cids = {
+        cid for cid, engine in engines.engine_by_clusterid.items()
+        if (cid not in registered_cids
+            and re.fullmatch(r"\d+(?:_\d+)?", cid)
+            and isinstance(engine.engine_id, str)
+            and engine.engine_id not in ('', '?')
+            and engine.jobs)
+    }
+    status.handover_expected_cluster_ids = registered_cids | orphan_cids
     status.handover_registered_cluster_ids = set()
+    status.handover_terminal_cluster_ids = set()
     status.handover_owned_aliases = set(
         str(value)
         for value in snapshot.get('source_instance_names', []) or [])
     status.autogrow_enable = False
     status.autoconsolidate_enable = False
     if isinstance(getattr(status, 'config', None), dict):
+        status.config['compute_pilot_exclude_nodes'] = list(transferred_exclusions)
         status.config['autogrow_max_compute_nodes'] = int(scheduler.get(
             'autogrow_max_compute_nodes',
             status.config.get('autogrow_max_compute_nodes', 0)) or 0)
+        status.config['autogrow_max_gpu_nodes'] = int(scheduler.get(
+            'autogrow_max_gpu_nodes', status.config.get('autogrow_max_gpu_nodes', 0)) or 0)
 
 
 def receive_handover(secret, handover_id, snapshot):
@@ -5892,6 +7036,13 @@ def receive_handover(secret, handover_id, snapshot):
     if getattr(status, 'handover_mode', 'ACTIVE') != 'ACTIVE':
         return {'ok': False, 'code': 3,
                 'error': f"target is in handover state {status.handover_mode}"}
+    try:
+        _cfg_compute_pilot_exclude_nodes(
+            (snapshot.get('scheduler', {}) or {}).get(
+                'compute_pilot_exclude_nodes',
+                getattr(status, 'compute_pilot_exclude_nodes', ())))
+    except ValueError as error:
+        return {'ok': False, 'code': 3, 'error': str(error)}
 
     jobs.lock.acquire()
     engines.lock.acquire()
@@ -5900,6 +7051,7 @@ def receive_handover(secret, handover_id, snapshot):
                 or engines.engine_by_id or engines.engine_by_clusterid):
             return {'ok': False, 'code': 3,
                     'error': 'target manager is not empty'}
+        _validate_gpu_handover_snapshot(snapshot)
         status.handover_mode = 'TARGET_IMPORTED'
         status.handover_source_instance = (
             snapshot.get('source', {}) or {}).get('instance')
@@ -5958,7 +7110,9 @@ def _maybe_finish_chief_migration():
     expected = set(getattr(status, 'handover_expected_cluster_ids', set()) or set())
     registered = set(
         getattr(status, 'handover_registered_cluster_ids', set()) or set())
-    if expected - registered:
+    terminal = set(
+        getattr(status, 'handover_terminal_cluster_ids', set()) or set())
+    if expected - registered - terminal:
         return False
     if getattr(status, 'handover_mode', '') in (
             'TARGET_IMPORTED', 'TARGET_MIGRATING'):
@@ -5982,9 +7136,11 @@ def abort_received_handover(secret, handover_id):
     engines = EngineManager()
     status.handover_mode = 'ACTIVE'
     status.handover_source_instance = None
+    status.handover_import_job_evidence = None
     status.handover_owned_aliases = set()
     status.handover_expected_cluster_ids = set()
     status.handover_registered_cluster_ids = set()
+    status.handover_terminal_cluster_ids = set()
     status.autogrow_enable = False
     status.autoconsolidate_enable = False
     add_log_line(gb, f"Handover {handover_id}: target import rolled back.", YELLOW)
@@ -6002,6 +7158,10 @@ def handover_to(secret, target_descriptor):
                 'error': f"source is in handover state {status.handover_mode}"}
     if str(target_descriptor.get('manager_uuid') or '') == str(status.manager_uuid):
         return {'ok': False, 'code': 3, 'error': 'cannot hand over to self'}
+    if not target_descriptor.get('gpu_jobs') and (
+            any(job.ngpus for job in jobs.jobs_by_id.values())
+            or any(engine.partition == 'gpu' for engine in engines.engine_by_clusterid.values())):
+        return {'ok': False, 'code': 3, 'error': 'GPU jobs/workers require a GPU-capable handover target'}
     required = ('instance', 'manager_uuid', 'manager_url', 'job_url',
                 'advertise_host', 'base_port', 'rpcpath', 'handover_secret')
     missing = [key for key in required if not target_descriptor.get(key)]
@@ -6160,16 +7320,196 @@ def initiate_handover(old_instance):
         source_proxy = zslurm_shared.TimeoutServerProxy(
             zslurm_shared.get_job_url(instance=old_name),
             timeout=300, allow_none=True)
-        return source_proxy.handover_to(
+        result = source_proxy.handover_to(
             str(old_secret), _manager_descriptor(
                 status.instance_name, include_secret=True))
+        evidence = getattr(status, 'handover_import_job_evidence', None)
+        if (isinstance(result, dict) and result.get('ok')
+                and isinstance(evidence, dict)
+                and evidence.get('handover_id') == result.get('handover_id')):
+            result['source_job_evidence'] = copy.deepcopy(evidence)
+        return result
     except Exception as error:
         return {'ok': False, 'code': 2,
                 'error': f"could not contact old instance {old_name}: {error}"}
 
 
-def compute_autogrow_plan(all_engines, partition):    
+def _partial_engine_schedulable_memory_mb(cores):
+    """Mirror the chief's memory envelope for a partial Slurm allocation."""
+    try:
+        cores = max(0, int(cores))
+        per_core = max(
+            0.0,
+            float(getattr(status, 'autogrow_engine_memory_mb_per_core', 0.0)),
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    if cores <= 0 or per_core <= 0.0:
+        return 0.0
+    hard_limit_mb = float(cores) * per_core
+    reserve_mb = max(
+        0.0,
+        float(getattr(status, 'autogrow_engine_memory_static_reserve_mb', 0.0)),
+    )
+    headroom = min(
+        0.99,
+        max(
+            0.0,
+            float(getattr(status, 'autogrow_engine_memory_headroom_fraction', 0.0)),
+        ),
+    )
+    cap_fraction = min(
+        1.0,
+        max(
+            0.0,
+            float(getattr(status, 'autogrow_engine_memory_cap_fraction', 1.0)),
+        ),
+    )
+    return max(
+        0.0,
+        min(
+            cap_fraction * hard_limit_mb,
+            (1.0 - headroom) * max(0.0, hard_limit_mb - reserve_mb),
+        ),
+    )
+
+
+def _autogrow_engine_capacity(partition, requested_cores):
+    """Return the capacity a queued engine is expected to advertise."""
+    prof = status.node_profiles.get(str(partition)) or {}
+    if _worker_kind(str(partition)) == 'gpu':
+        memory = float(prof.get('mem_gb', 0)) * 1024
+        return float(prof.get('cores', 0)), zslurm_gpu.worker_memory_mb(memory, memory, status.config)
+    if bool(getattr(status, 'autogrow_dynamic_engine_cores', False)):
+        try:
+            cores = max(0, int(requested_cores))
+        except (TypeError, ValueError):
+            cores = 0
+        memory_mb = _partial_engine_schedulable_memory_mb(cores)
+        if cores > 0 and memory_mb > 0.0:
+            return float(cores), float(memory_mb)
+    return (
+        max(0.0, float(prof.get('cores', 0.0) or 0.0)),
+        max(0.0, float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0),
+    )
+
+
+def _autogrow_requested_engine_cores(
+        eligible, best_part, size_cpu, size_mem_mb, raw_best_nodes):
+    """Size one partial pilot to demand, while retaining a configured hard cap."""
+    configured = max(0, int(getattr(status, 'autogrow_engine_cores', 0) or 0))
+    if configured <= 0 or not bool(
+            getattr(status, 'autogrow_dynamic_engine_cores', False)):
+        return configured
+    profile = status.node_profiles.get(str(best_part)) or {}
+    profile_cores = max(0, int(float(profile.get('cores', 0.0) or 0.0)))
+    maximum = min(configured, profile_cores) if profile_cores > 0 else configured
+    minimum = min(
+        maximum,
+        max(1, int(getattr(status, 'autogrow_engine_min_cores', 1) or 1)),
+    )
+    if int(raw_best_nodes or 0) > 1:
+        return maximum
+
+    largest_cpu = max(
+        [max(0.0, float(getattr(job, 'ncpu', 0.0) or 0.0)) for job in eligible]
+        or [0.0]
+    )
+    largest_mem_mb = max(
+        [max(0.0, float(getattr(job, 'mem', 0.0) or 0.0)) for job in eligible]
+        or [0.0]
+    )
+    needed_cpu = int(math.ceil(max(float(size_cpu), largest_cpu, 0.0)))
+    needed_mem_mb = max(float(size_mem_mb), largest_mem_mb, 0.0)
+    memory_cores = 0
+    for candidate in range(1, maximum + 1):
+        if _partial_engine_schedulable_memory_mb(candidate) + 1e-9 >= needed_mem_mb:
+            memory_cores = candidate
+            break
+    if memory_cores == 0 and needed_mem_mb > 0.0:
+        memory_cores = maximum
+    return min(maximum, max(minimum, needed_cpu, memory_cores))
+
+
+def _autogrow_runtime_residual(eligible, capacities, walltime_buffer):
+    """Lower bounds on demand restricted to sufficiently long-lived pilots.
+
+    Each duration prefix must fit in capacity with at least that much runtime.
+    A descending event sweep avoids scanning the whole fleet for every job or
+    counting the same demand twice. It supplements CPU/RAM/SSD accounting;
+    actual assignment still performs the full individual placement checks.
+    Capacity tuples are (seconds, free CPU, free MB, has SSD, is queued).
+    Keep the existing running-capacity tolerance, but do not inflate queued
+    allocations or SSD-only capacity.
+    """
+    def residual(pending, fleet, running_margin):
+        groups = defaultdict(lambda: [0.0, 0.0])
+        for job in pending:
+            cutoff = float(job.reqtime) + walltime_buffer
+            groups[cutoff][0] += float(job.ncpu)
+            groups[cutoff][1] += float(job.mem)
+        supply = sorted(fleet, key=lambda c: c[0], reverse=True)
+        index = 0
+        free_cpu = free_mem = demand_cpu = demand_mem = 0.0
+        need_cpu = need_mem = 0.0
+        for cutoff, (cpu, mem) in sorted(groups.items(), reverse=True):
+            demand_cpu += cpu
+            demand_mem += mem
+            while index < len(supply) and supply[index][0] >= cutoff:
+                _, cpu, mem, _, is_queued = supply[index]
+                margin = 1.0 if is_queued else running_margin
+                free_cpu += cpu * margin
+                free_mem += mem * margin
+                index += 1
+            need_cpu = max(need_cpu, demand_cpu - free_cpu)
+            need_mem = max(need_mem, demand_mem - free_mem)
+        return need_cpu, need_mem
+
+    cpu, mem = residual(eligible, capacities, 1.1)
+    ssd_cpu, ssd_mem = residual(
+        [j for j in eligible
+         if str(getattr(j, 'ssd_use', 'no') or 'no') == 'required'],
+        [c for c in capacities if c[3]], 1.0,
+    )
+    return dict(cpu=cpu, mem_mb=mem, ssd_cpu=ssd_cpu, ssd_mem_mb=ssd_mem)
+
+
+def _autogrow_minimum_runtime(eligible, walltime_buffer):
+    """Useful backfill floor, not a promise that queued work will fit later.
+
+    Only runnable jobs that fit the maximum pilot runtime enter this snapshot.
+    Keep the longest request, placement margin and startup/drain headroom;
+    per-worker assignment must still check the actual remaining allocation.
+    Round up to whole minutes so Slurm cannot round below the computed floor.
+    None preserves legacy/manual site policy; even an over-maximum explicit
+    floor must reach start_slurm so it cannot revert to a shorter legacy one.
+    """
+    if not getattr(status, 'autogrow_time_min_enable', False) or not eligible:
+        return None
+    headroom = max(
+        float(status.autogrow_time_min_headroom_sec), walltime_buffer
+    )
+    floor = max(
+        float(status.autogrow_time_min_sec),
+        max(float(j.reqtime) for j in eligible) + headroom,
+    )
+    if bool(getattr(status, 'engine_drain_before_end_enable', True)):
+        drain = float(status.config.get(
+            'engine_drain_before_end_sec',
+            getattr(status, 'engine_drain_before_end_sec', 12 * 3600.0),
+        ))
+        floor = max(floor, drain + headroom)
+    return int(math.ceil(floor / 60.0)) * 60
+
+
+def compute_autogrow_plan(all_engines, partition):
     eligible = []
+    unserviceable = []
+    walltime_buffer = float(status.config.get(
+        'job_walltime_buffer_sec',
+        getattr(status, 'job_walltime_buffer_sec', 900.0),
+    ))
+    fresh_runtime = parse_timeleft(status.autogrow_runtime_default)
     download_available = max(
         0.0, jobs.dcache_download_total - jobs.dcache_download_inuse
     )
@@ -6192,17 +7532,32 @@ def compute_autogrow_plan(all_engines, partition):
                 s3_download_available
             )
         ):
+            # A fresh default pilot cannot run these jobs. Keep them pending,
+            # and do not let them consume this plan's transfer-slot budget.
+            if float(j.reqtime) + walltime_buffer > fresh_runtime:
+                unserviceable.append(j)
+                continue
             eligible.append(j)
             download_need, upload_need = jobs._dcache_slot_needs(j)
             download_available -= download_need
             upload_available -= upload_need
             s3_download_available -= jobs._s3_download_slot_need(j)
 
-    unique_part = list(set([part_name for part_name,_ in status.autogrow_prefer_partitions]))
+    if not eligible and unserviceable:
+        return dict(
+            has_eligible=False, eligible_n=0, plan_nodes=0, best_nodes=0,
+            unserviceable_runtime_n=len(unserviceable),
+            plan_reason='pending job walltime exceeds the default fresh pilot runtime; no usable growth',
+        )
+
+    unique_part = list(set(part_name for part_name, _ in status.autogrow_prefer_partitions
+                           if _worker_kind(part_name) == 'compute'))
     fallback_part = str(getattr(status, 'autogrow_fallback_partition', '') or '')
+    if _worker_kind(fallback_part) != 'compute':
+        fallback_part = next((p for p in status.node_profiles if _worker_kind(p) == 'compute'), '')
     fallback_prof = status.node_profiles.get(fallback_part) or {}
     if not fallback_prof and status.node_profiles:
-        fallback_part = next(iter(status.node_profiles.keys()))
+        fallback_part = next((p for p in status.node_profiles if _worker_kind(p) == 'compute'), '')
         fallback_prof = status.node_profiles.get(fallback_part) or {}
 
     #Reserved resources
@@ -6222,34 +7577,76 @@ def compute_autogrow_plan(all_engines, partition):
     queue_cpu_cap = 0.0
     queue_mem_cap_mb = 0.0
 
-    for part_name in unique_part:
-        nqueued_engines = engines.cluster_queued_by_partition.get(part_name, 0)      
-        prof = status.node_profiles.get(part_name)
-        if prof is None:
+    queued_detail_counts = defaultdict(int)
+    queued_capacity = getattr(engines, 'queued_engine_capacity_by_cid', {}) or {}
+    runtime_capacity = []
+    now = time.time()
+    for engine in all_engines:
+        if engine.partition != partition or getattr(engine, 'stopping', False):
             continue
-        
-        queue_cpu_cap += nqueued_engines * float(prof.get('cores', 0.0))
-        queue_mem_cap_mb += nqueued_engines * float(prof.get('mem_gb', 0.0)) * 1024.0
+        if (getattr(engine, 'cluster_id', None) not in (None, False)
+                and not getattr(engine, 'managed', True)):
+            continue
+        remaining = float(getattr(engine, 'timeleft', fresh_runtime))
+        if getattr(engine, 'status', '') == PHASING_OUT:
+            remaining = min(remaining, phaseout_backfill_window(engine, now))
+        runtime_capacity.append((
+            remaining,
+            max(0.0, float(getattr(engine, 'cores', 0.0))
+                - float(getattr(engine, 'res_cpu_reserved', 0.0))),
+            max(0.0, float(getattr(engine, 'totmem', 0.0))
+                - float(getattr(engine, 'res_mem_reserved_mb', 0.0))),
+            bool(getattr(engine, 'has_ssd', False)), False,
+        ))
+    for detail in list(getattr(engines, 'queued_engines_detail', []) or []):
+        try:
+            cid, part_name, _age, _scratch = detail
+        except (TypeError, ValueError):
+            continue
+        if part_name not in unique_part:
+            continue
+        queued_detail_counts[part_name] += 1
+        prof = status.node_profiles.get(part_name) or {}
+        capacity = queued_capacity.get(str(cid))
+        try:
+            queued_cores = float(capacity[0])
+            queued_mem_mb = float(capacity[1])
+        except (TypeError, ValueError, IndexError):
+            queued_cores = float(prof.get('cores', 0.0) or 0.0)
+            queued_mem_mb = float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
+        queue_cpu_cap += max(0.0, queued_cores)
+        queue_mem_cap_mb += max(0.0, queued_mem_mb)
+        queued_engine = (getattr(engines, 'engine_by_clusterid', {}) or {}).get(str(cid))
+        remaining = float(getattr(queued_engine, 'timeleft', fresh_runtime))
+        runtime_capacity.append((
+            remaining, max(0.0, queued_cores), max(0.0, queued_mem_mb),
+            bool(_scratch), True,
+        ))
+
+    # Preserve compatibility with old snapshots or transient squeue rows that do
+    # not yet expose per-allocation capacity: only those unmatched allocations use
+    # the full configured profile as a conservative legacy fallback.
+    for part_name in unique_part:
+        nqueued_engines = int(
+            (getattr(engines, 'cluster_queued_by_partition', {}) or {}).get(
+                part_name, 0
+            ) or 0
+        )
+        unmatched = max(0, nqueued_engines - queued_detail_counts[part_name])
+        prof = status.node_profiles.get(part_name) or {}
+        queue_cpu_cap += unmatched * float(prof.get('cores', 0.0) or 0.0)
+        queue_mem_cap_mb += (
+            unmatched * float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
+        )
+        # Old snapshots expose counts only. Preserve their existing capacity
+        # credit at the configured future runtime rather than inventing an age.
+        runtime_capacity.extend((
+            fresh_runtime, float(prof.get('cores', 0.0) or 0.0),
+            float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0, False, True,
+        ) for _ in range(unmatched))
 
         
     fat_partitions = list(getattr(status, 'autogrow_fat_partitions', []) or [])
-
-    # Largest single-node cpu / mem across the known profiles (for the "only grow
-    # if we can fill an engine" gate -- must consider BOTH axes, else a memory-bound
-    # backlog with a small core count never triggers growth).
-    largest_cores = 0
-    largest_mem_mb = 0.0
-    try:
-        if status.node_profiles:
-            largest_cores = max(int((prof or {}).get('cores', 0) or 0) for prof in status.node_profiles.values())
-            largest_mem_mb = max(float((prof or {}).get('mem_gb', 0.0) or 0.0) for prof in status.node_profiles.values()) * 1024.0
-    except Exception:
-        largest_cores = 0
-        largest_mem_mb = 0.0
-    if largest_cores <= 0:
-        largest_cores = int(fallback_prof.get('cores', 0) or 0)
-    if largest_mem_mb <= 0.0:
-        largest_mem_mb = float(fallback_prof.get('mem_gb', 0.0) or 0.0) * 1024.0
 
     # Smallest mem/core among the thin (non-fat) profiles: the ceiling of what a
     # cheap node can offer per core. A backlog demanding more GB/core than this
@@ -6304,15 +7701,17 @@ def compute_autogrow_plan(all_engines, partition):
         if not is_scratch:
             continue
         prof = status.node_profiles.get(str(queued_part)) or {}
-        if not prof:
-            continue
+        capacity = queued_capacity.get(str(_cid))
         try:
+            queued_cpu = max(0.0, float(capacity[0]))
+            queued_mem_mb = max(0.0, float(capacity[1]))
+        except (TypeError, ValueError, IndexError):
+            if not prof:
+                continue
             queued_cpu = max(0.0, float(prof.get('cores', 0.0) or 0.0))
             queued_mem_mb = max(
                 0.0, float(prof.get('mem_gb', 0.0) or 0.0) * 1024.0
             )
-        except (TypeError, ValueError):
-            continue
         queued_ssd_cpu += queued_cpu
         queued_ssd_mem_mb += queued_mem_mb
 
@@ -6331,6 +7730,13 @@ def compute_autogrow_plan(all_engines, partition):
     #The 1.1 is to not overgrow the cluster too much and have to shrink it too soon.
     required_cpu = max(0.0, pend_cpu - free_cpu_total * 1.1 - queue_cpu_cap)
     required_mem_mb = max(0.0, pend_mem_mb - free_mem_total_mb * 1.1 - queue_mem_cap_mb)
+    runtime_residual = _autogrow_runtime_residual(
+        eligible, runtime_capacity, walltime_buffer,
+    )
+    required_cpu = max(required_cpu, runtime_residual['cpu'])
+    required_mem_mb = max(required_mem_mb, runtime_residual['mem_mb'])
+    ssd_required_cpu = max(ssd_required_cpu, runtime_residual['ssd_cpu'])
+    ssd_required_mem_mb = max(ssd_required_mem_mb, runtime_residual['ssd_mem_mb'])
 
     # Memory-per-core pressure for info only
     avail_mpc = ((tot_mem_cap_mb + queue_mem_cap_mb) / 1024.0) / max(1.0, (tot_cpu_cap + queue_cpu_cap))
@@ -6342,10 +7748,11 @@ def compute_autogrow_plan(all_engines, partition):
     req_mpc = (required_mem_mb / 1024.0) / max(1.0, required_cpu)
     need_fat = req_mpc > (thin_mpc * 1.05)
 
-    # Only decline to grow when a full engine's worth of work is unmet on NEITHER
-    # axis. Previously this gate was CPU-only, so a memory-bound backlog (many small
-    # cores, lots of RAM) never grew fat nodes even under heavy memory pressure.
-    if (required_cpu <= largest_cores and required_mem_mb <= largest_mem_mb
+    # A sub-node backlog can unlock the entire downstream DAG. Do not make it
+    # wait behind long running jobs until a whole node of demand accumulates.
+    # Existing free and queued capacity has already been deducted above, so only
+    # positive unmet demand grows a pilot; idle fleets still cannot grow.
+    if (required_cpu <= 0.0 and required_mem_mb <= 0.0
             and ssd_required_cpu <= 0.0 and ssd_required_mem_mb <= 0.0
             and tot_cpu_cap > 0):
         return {
@@ -6361,11 +7768,18 @@ def compute_autogrow_plan(all_engines, partition):
             'required_mpc': required_mpc,
             'raw_best_nodes': 0.0,
             'fat_cap_applied': False,
+            'runtime_residual': runtime_residual,
+            'unserviceable_runtime_n': len(unserviceable),
         }
 
     try:
-        parts_states_by_scratch = zslurm_shared.slurm_partition_state_counts_by_scratch(
-            60, getattr(status, 'ssd_feature_name', 'scratch-node')
+        parts_states_by_scratch = (
+            zslurm_shared.slurm_partition_state_counts_by_scratch(
+                60,
+                feature_name=getattr(
+                    status, "ssd_feature_name", "scratch-node"
+                ),
+            )
         )
     except Exception:
         parts_states_by_scratch = {}
@@ -6382,6 +7796,8 @@ def compute_autogrow_plan(all_engines, partition):
             return default
 
     for pref_rank, (part, scratch) in enumerate(status.autogrow_prefer_partitions):
+        if _worker_kind(part) != 'compute':
+            continue
         prof = status.node_profiles.get(part) or {}
         if not prof:
             continue
@@ -6469,7 +7885,8 @@ def compute_autogrow_plan(all_engines, partition):
     # when no scratch is idle, cap plain engines at autogrow_max_nonssd_fraction of
     # the fleet, so a transient scratch shortage cannot drift us onto a mostly-plain
     # cluster. Scratch growth is never capped here (equal cost, always preferred).
-    if best_part is not None and not best_use_scratch:
+    if (best_part is not None and not best_use_scratch
+            and any(scratch for _, scratch in status.autogrow_prefer_partitions)):
         max_nonssd_frac = float(status.config.get(
             "autogrow_max_nonssd_fraction",
             getattr(status, 'autogrow_max_nonssd_fraction', 0.5)))
@@ -6490,13 +7907,19 @@ def compute_autogrow_plan(all_engines, partition):
                 'required_mpc': required_mpc,
                 'raw_best_nodes': 0.0,
                 'fat_cap_applied': False,
+                'runtime_residual': runtime_residual,
+                'unserviceable_runtime_n': len(unserviceable),
                 'plan_reason': 'ssd-preferred: non-SSD engine cap reached, waiting for scratch capacity',
             }
 
-    # Don't queue an engine that has nowhere to start right now: parking a PENDING
-    # engine allocation while the whole cluster is full is wasteful and contradicts
-    # any concurrent phase-out. Wait for a node to free instead.
-    if best_idle <= 0:
+    # Some sites only schedule whole-node pilots and should wait for a currently
+    # idle node.  Spider pilots are partial allocations, however: they can
+    # backfill on MIXED nodes and Slurm (not zslurm) should decide when they run.
+    if best_idle <= 0 and bool(
+            status.config.get(
+                'autogrow_require_idle_nodes',
+                getattr(status, 'autogrow_require_idle_nodes', True),
+            )):
         return {
             'has_eligible': len(eligible) > 0,
             'eligible_n': len(eligible),
@@ -6510,6 +7933,8 @@ def compute_autogrow_plan(all_engines, partition):
             'required_mpc': required_mpc,
             'raw_best_nodes': 0.0,
             'fat_cap_applied': False,
+            'runtime_residual': runtime_residual,
+            'unserviceable_runtime_n': len(unserviceable),
             'plan_reason': 'no idle nodes in any preferred partition',
         }
 
@@ -6534,15 +7959,14 @@ def compute_autogrow_plan(all_engines, partition):
     if best_nodes > 1 and str(best_part) not in getattr(status, 'autogrow_fat_partitions', []):
         best_nodes = max(int(math.ceil(0.2 * best_nodes)), 1)
 
-    # Do not submit more pilots than the occupancy snapshot can place now.
-    # For Spider, best_idle is the number of 30-core slots across IDLE and
-    # MIXED nodes; for exclusive profiles it remains the IDLE-node count.
-    best_nodes = min(best_nodes, best_idle)
-
     fat_cap_applied = False
     if str(best_part) in getattr(status, 'autogrow_fat_partitions', []) and best_nodes > 1:
         best_nodes = 1
         fat_cap_applied = True
+
+    requested_engine_cores = _autogrow_requested_engine_cores(
+        eligible, best_part, size_cpu, size_mem_mb, raw_best_nodes
+    )
 
     plan = {
         'has_eligible': len(eligible) > 0,
@@ -6554,6 +7978,10 @@ def compute_autogrow_plan(all_engines, partition):
         'plan_nodes': best_nodes,
         'best_part': best_part,
         'best_nodes': best_nodes,
+        'engine_cores': requested_engine_cores,
+        'minimum_runtime_seconds': _autogrow_minimum_runtime(
+            eligible, walltime_buffer
+        ),
 
         'needed_cpu': nodes_cpu,
         'needed_mem': nodes_mem,
@@ -6562,9 +7990,173 @@ def compute_autogrow_plan(all_engines, partition):
         'required_mpc': required_mpc,
         'raw_best_nodes': raw_best_nodes,
         'fat_cap_applied': fat_cap_applied,
+        'runtime_residual': runtime_residual,
+        'unserviceable_runtime_n': len(unserviceable),
+        'plan_reason': (
+            'submitted to Slurm queue despite zero fully idle nodes'
+            if best_idle <= 0 else None
+        ),
     }
     
     return plan
+
+def gpu_worker_profile(partition=None):
+    part = partition or status.gpu_partition
+    profile = status.node_profiles.get(part, {})
+    memory = float(profile.get('mem_gb', 0)) * 1024
+    return dict(key=('fresh', part), resources=(float(profile.get('cores', 0)),
+                zslurm_gpu.worker_memory_mb(memory, memory, status.config), int(profile.get('gpus', 0))),
+                runtime=parse_timeleft(status.autogrow_runtime_default),
+                has_ssd=bool(profile.get('has_ssd', False)),
+                ssd_gb=float(profile.get('ssd_gb', 0)))
+
+
+def _gpu_worker_records(all_engines, include_automatic_drains=False):
+    """Credit online/queued capacity once; never credit held or unknown leases."""
+    result, seen = [], set()
+    for engine in list(all_engines) + list(engines.engine_by_clusterid.values()):
+        if id(engine) in seen or engine.partition != 'gpu':
+            continue
+        seen.add(id(engine))
+        if (not engine.managed or engine.stopping
+                or engine.cluster_id in engines.actual_held_engine_cids):
+            continue
+        if engine.status == PHASING_OUT and not (include_automatic_drains
+                and engine.phaseout_reason == 'consolidation' and not engine.end_of_life_drain):
+            continue
+        online = engine.engine_id in engines.engine_by_id
+        if not online and engine.slurm_state not in ('PD', 'PENDING', 'R'):
+            continue
+        # Main's canonical job table includes unacknowledged grants, unlike
+        # res_cpu/res_mem telemetry, and is authoritative across handover.
+        held = [job for job in jobs.jobs_by_id.values()
+                if job.node_id == engine.engine_id and job.state in ('ASSIGNED', 'RUNNING')]
+        used_cpu = sum(float(job.held_ncpu if job.state == 'RUNNING' else job.ncpu) for job in held)
+        used_mem = sum(float(job.held_mem if job.state == 'RUNNING' else job.mem) for job in held)
+        devices = len(zslurm_gpu.available_devices(engine)) if engine.gpu_devices else engine.planned_gpus
+        has_ssd = engine.has_ssd
+        result.append(dict(key=id(engine), engine=engine, online=online,
+            resources=(max(0.0, float(engine.cores) - used_cpu),
+                       max(0.0, float(engine.totmem) - used_mem), devices),
+            runtime=float(engine.timeleft), has_ssd=has_ssd,
+            ssd_gb=max(0.0, engine.ssd_total_gb - engine.res_ssd_reserved_gb)))
+    return result
+
+
+def _gpu_pending_requests(workers, profile=None):
+    requests, unfit = [], 0
+    down = max(0.0, jobs.dcache_download_total - jobs.dcache_download_inuse)
+    up = max(0.0, jobs.dcache_upload_total - jobs.dcache_upload_inuse)
+    s3 = max(0.0, jobs.s3_download_total - jobs.s3_download_inuse)
+    margin = float(status.config.get('job_walltime_buffer_sec', status.job_walltime_buffer_sec))
+    for job in jobs._jobs_in_priority_order(lastin_first=status.lastin_first):
+        if (job.partition != 'gpu' or job.state not in queue_states
+                or not jobs._dependency_allows_run_locked(job)
+                or not all(jobs._resource_fits_locked(getattr(jobs, name + '_total'),
+                    getattr(jobs, name + '_inuse'), getattr(job, name + '_start_use_add'))
+                    for name in ('active', 'dcache', 'archive'))
+                or not jobs._dcache_transfer_fits_locked(job, down, up, s3)):
+            continue
+        request = dict(resources=(float(job.ncpu), float(job.mem), job.ngpus),
+                       runtime=float(job.reqtime) + margin, priority=job.priority,
+                       ssd_required=job.ssd_use == 'required',
+                       ssd_gb=job.ssd_gb if job.ssd_use != 'no' else 0, job=job)
+        candidates = workers + ([profile] if profile is not None else [])
+        if not any(zslurm_gpu.fits(request, worker) for worker in candidates):
+            unfit += 1
+            continue
+        requests.append(request)
+        need_down, need_up = jobs._dcache_slot_needs(job)
+        down -= need_down
+        up -= need_up
+        s3 -= jobs._s3_download_slot_need(job)
+    return requests, unfit
+
+
+def compute_gpu_autogrow_plan(all_engines):
+    with jobs.lock:
+        profile = gpu_worker_profile()
+        valid_profile = bool(status.gpu_partition and min(profile['resources']) > 0)
+        workers = _gpu_worker_records(all_engines)
+        requests, unfit = _gpu_pending_requests(workers, profile if valid_profile else None)
+        nodes, _used, packing_unfit = zslurm_gpu.pack_workers(
+            requests, workers, profile if valid_profile else None)
+        allocated = (engines.cluster_running_engines_gpu + engines.cluster_queued_engines_gpu
+                     + engines.cluster_held_engines_gpu)
+        # Also count newly submitted placeholders before the next squeue poll.
+        allocated = max(allocated, sum(e.partition == 'gpu' and e.managed
+                         for e in engines.engine_by_clusterid.values()))
+        ceiling = max(0, int(status.config.get('autogrow_max_gpu_nodes', 0)))
+        nodes = min(nodes, max(0, ceiling - allocated))
+        minimum = max((r['runtime'] for r in requests), default=0)
+        minimum += float(status.config.get('autogrow_time_min_headroom_sec', 3600))
+        return dict(best_nodes=nodes, best_part=status.gpu_partition,
+                    eligible_n=len(requests), unfit_jobs=unfit + packing_unfit,
+                    allocated_nodes=allocated, max_nodes=ceiling,
+                    minimum_runtime_seconds=minimum)
+
+
+def consolidate_gpu_engines(all_engines, now):
+    """Never drain a busy GPU worker; retire only demand-free idle capacity."""
+    cancel = []
+    with jobs.lock:
+        workers = _gpu_worker_records(all_engines, include_automatic_drains=True)
+        workers.sort(key=lambda w: (not w['online'], w['engine'].status == PHASING_OUT, -w['runtime']))
+        requests, unfit = _gpu_pending_requests(workers)
+        _added, keep, packing_unfit = zslurm_gpu.pack_workers(requests, workers)
+        busy = {id(e) for e in all_engines if e.partition == 'gpu' and
+                (e.jobs or e.gpu_allocations or e.res_cpu_reserved or e.res_mem_reserved_mb)}
+        keep.update(busy)
+        minimum = max(0, int(status.config.get('consolidation_min_gpu_engines', 0)))
+        for worker in workers:
+            if len(keep) >= minimum:
+                break
+            keep.add(worker['key'])
+        if requests and not status.config.get('consolidation_allow_with_queue', status.consolidation_allow_with_queue):
+            keep.update(w['key'] for w in workers)
+        for worker in workers:
+            engine = worker['engine']
+            if worker['key'] in keep and engine.phaseout_reason == 'consolidation':
+                engine.status, engine.phaseout_reason = '', None
+        surplus = [w for w in workers if w['key'] not in keep]
+        if not surplus:
+            status.consolidation_want['gpu'] = None
+        else:
+            want = status.consolidation_want.setdefault('gpu', now)
+            if want is None:
+                want = status.consolidation_want['gpu'] = now
+            hysteresis = float(status.config.get('consolidation_hysteresis_sec', status.consolidation_hysteresis_sec))
+            cooldown = float(status.config.get('consolidation_cooldown_sec', status.consolidation_cooldown_sec))
+            runtime = float(status.config.get('consolidation_min_runtime_sec', status.consolidation_min_runtime_sec))
+            if now - want >= hysteresis and now - status.consolidation_last_action_ts_by_part.get('gpu', 0) >= cooldown:
+                for worker in surplus:
+                    engine = worker['engine']
+                    if worker['online'] and now - engine.starttime >= runtime:
+                        engine.status, engine.phaseout_reason = PHASING_OUT, 'consolidation'
+                        status.consolidation_last_action_ts_by_part['gpu'] = now
+                    elif not worker['online'] and engine.slurm_state in ('PD', 'PENDING'):
+                        cancel.append(engine.cluster_id)
+        result = dict(pending_jobs=len(requests), busy_workers=len(busy), keep_workers=len(keep),
+                      unfit_jobs=unfit + packing_unfit,
+                      draining_workers=sum(e.partition == 'gpu' and e.status == PHASING_OUT for e in all_engines))
+        status.gpu_consolidation_plan = result
+    for cid in cancel:
+        if engines.cancel_pending_gpu_engine(cid):
+            status.consolidation_last_action_ts_by_part['gpu'] = now
+    return result
+
+
+def manage_gpu_growth(all_engines, now):
+    plan = compute_gpu_autogrow_plan(all_engines)
+    status.gpu_autogrow_plan_detail = plan
+    cooldown = float(status.config.get('gpu_autogrow_cooldown_sec', status.autogrow_cooldown_sec))
+    if plan['best_nodes'] and now - status.autogrow_last_action_gpu_ts >= cooldown:
+        started = engines.start_slurm(gb, plan['best_nodes'], status.autogrow_runtime_default,
+            plan['best_part'], None, 0, minimum_runtime_seconds=plan['minimum_runtime_seconds'])
+        if started:
+            status.autogrow_last_action_gpu_ts = now
+    return plan
+
 
 def engine_drain_seconds(engine, now=None):
     """Seconds until this engine runs empty if we assign it no further work.
@@ -6596,31 +8188,29 @@ def engine_drain_seconds(engine, now=None):
 def phaseout_backfill_window(engine, now=None):
     """Runtime a PHASING_OUT engine may still hand out, or 0.0 to hand out none.
 
-    A phased-out engine holds its node until its last job ends. When that job still
-    has hours to run, the rest of the node sits idle for those hours. We can fill
-    that gap, but only with work certain to finish first, so the engine still stops
-    at about the moment it would have stopped anyway -- delaying the phase-out would
-    defeat the point of it.
+    Consolidation/manual drains only backfill inside their current jobs' drain
+    estimate, so backfill does not deliberately delay releasing surplus capacity.
+    End-of-life drains have a different constraint: the remaining Slurm lease.
+    The early (default twelve-hour) drain marker must not blacklist short jobs
+    that fit well inside that lease. Such backfill can extend a busy pilot's
+    useful life, but never its allocation, and still stops when it becomes idle.
 
     Conservative by construction: it returns 0.0, i.e. the old flat refusal, unless
     all of the following hold.
 
       * backfilling is enabled;
-      * the engine is NOT draining because its node walltime is nearly up -- that
-        one is already racing a hard kill and must not be handed more to lose;
+      * the engine is not stopping;
       * the engine still has running work, because letting an empty one die is
         exactly what phasing out is for;
       * at least `min_window` seconds remain after subtracting the margin, so we
         only bother when the reclaimed gap is worth a job's startup cost.
 
-    The margin is subtracted twice over: once from the drain estimate and once from
-    the node walltime, and callers still apply job_walltime_buffer_sec on top.
+    Subtract phaseout_backfill_margin_sec from the applicable horizon; callers
+    apply job_walltime_buffer_sec on top. Estimates are not runtime guarantees.
     """
     if not bool(status.config.get(
             "phaseout_backfill_enable",
             getattr(status, 'phaseout_backfill_enable', True))):
-        return 0.0
-    if getattr(engine, 'end_of_life_drain', False):
         return 0.0
     if getattr(engine, 'stopping', False):
         return 0.0
@@ -6632,11 +8222,16 @@ def phaseout_backfill_window(engine, now=None):
     min_window = float(status.config.get(
         "phaseout_backfill_min_window_sec",
         getattr(status, 'phaseout_backfill_min_window_sec', 3600.0)))
-    window = engine_drain_seconds(engine, now) - margin
-    if window < min_window:
-        return 0.0
     node_left = float(getattr(engine, 'timeleft', 0.0) or 0.0) - margin
-    return max(0.0, min(window, node_left))
+    if (not math.isfinite(margin) or margin < 0.0
+            or not math.isfinite(min_window) or min_window <= 0.0
+            or not math.isfinite(node_left)):
+        return 0.0
+    if getattr(engine, 'end_of_life_drain', False):
+        window = node_left
+    else:
+        window = min(engine_drain_seconds(engine, now) - margin, node_left)
+    return window if window >= min_window else 0.0
 
 
 def thread_check_commands():
@@ -6655,40 +8250,21 @@ def thread_check_commands():
             continue
         engines.lock.acquire()
         try:
-            engines._check_cluster_engines()
+            slurm_snapshot_ok = engines._check_cluster_engines()
             all_engines = list(engines.engine_by_id.values())
+            imported_placeholders = [engine for engine in engines.engine_by_clusterid.values()
+                                     if engine is not None and engine.engine_id != '?'
+                                     and engine.engine_id not in engines.engine_by_id]
         finally:
             engines.lock.release()
+
+        for engine in imported_placeholders:
+            engines.reconcile_imported_orphan_engine(engine, slurm_snapshot_ok)
 
         now = time.time()
         for engine in all_engines:
             if now - engine.lastseen > TIMEOUT:
-                # Attempt to kill SLURM allocation for this engine first without unregistering yet
-                cid = engine.cluster_id
-                # mark as stopping to avoid further assignments/starts and reconciliation
-                engine.stopping = True
-                try:
-                    if cid is False:
-                        # Local engine
-                        engines.stop_local(gb)
-                    elif cid is not None:
-                        engines.cancel_cid(cid, unregister_after=False)
-                except Exception as ex:
-                    import traceback
-                    add_log_line(gb, f"Exception when terminating engine {engine.engine_id} (cid={cid}): {ex}", RED)
-                    add_log_line(gb, traceback.format_exc(), RED)
-                # Wait briefly for the SLURM job to actually disappear
-                try:
-                    engines._wait_for_cid_termination(cid, timeout_seconds=60, poll_interval=2)
-                except Exception as ex:
-                    import traceback
-                    add_log_line(gb, f"Exception while waiting for SLURM job {cid} to disappear: {ex}", YELLOW)
-                    add_log_line(gb, traceback.format_exc(), YELLOW)
-                # Now unregister and requeue jobs
-                engines._unregister(engine, "Engine timed out")
-                add_log_line(
-                    gb, "Engine with id " + engine.engine_id + " timed out", RED
-                )
+                engines.reconcile_timed_out_engine(engine, slurm_snapshot_ok)
 
         used_cpus = []
         used_mem = []
@@ -6731,9 +8307,9 @@ def thread_check_commands():
         status.gpfs_io_pct = numpy.array(gpfs_io_pct, dtype=float)
 
         # End-of-life drain: an engine near its Slurm walltime will be hard-killed,
-        # taking any running job with it. Phase it out early (it then accepts NO new
-        # jobs -- request_jobs returns [] for PHASING_OUT -- and stops once idle) so
-        # work drains gracefully and autogrow replaces the capacity. Runs before
+        # taking any running job with it. Phase it out early; only bounded short
+        # backfill inside the remaining lease may still start, and it stops once
+        # idle. Autogrow replaces long-job capacity. Runs before
         # consolidation so the drain flag is set before the unphase logic below.
         try:
             if bool(getattr(status, 'engine_drain_before_end_enable', True)):
@@ -6768,8 +8344,9 @@ def thread_check_commands():
 
             if status.autoconsolidate_enable and now - autoconsolidate_last_plan_ts > 60:
                 autoconsolidate_last_plan_ts = now
+                consolidate_gpu_engines(all_engines, now)
 
-                parts = set(e.partition for e in all_engines)
+                parts = set(e.partition for e in all_engines if e.partition != 'gpu')
                 for part in parts:
                     part_engines = [e for e in all_engines if e.partition == part]
                     if not part_engines:
@@ -6972,14 +8549,21 @@ def thread_check_commands():
             now = time.time()            
             if autogrow_last_plan_ts < now - 60.0 and status.autogrow_enable:
                 autogrow_last_plan_ts = now
+                gpu_plan = manage_gpu_growth(all_engines, now)
                 
                 plan = compute_autogrow_plan(all_engines, "compute")
+                status.autogrow_plan_detail = dict(plan)
                 cooldown_remaining_compute = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_compute_ts)))
                 
                 if plan.get('best_nodes', 0) > 0:
-                    plan_compute = f"grow: {plan.get('best_nodes', 0)} @ {plan.get('best_part', 'compute')}, cooldown {int(cooldown_remaining_compute)}s left"                                            
+                    plan_compute = (
+                        f"grow: {plan.get('best_nodes', 0)} @ "
+                        f"{plan.get('best_part', 'compute')} "
+                        f"({plan.get('engine_cores', 0) or 'exclusive'} cores), "
+                        f"cooldown {int(cooldown_remaining_compute)}s left"
+                    )
                 else:
-                    plan_compute = f"no nodes needed"
+                    plan_compute = str(plan.get('plan_reason') or "no nodes needed")
 
                 if cooldown_remaining_compute <= 0: # Autogrow cooldown expired, lets see if we need to start some engines
                     if plan.get('best_part',None) is not None:
@@ -7018,7 +8602,12 @@ def thread_check_commands():
                                     status.autogrow_runtime_default,
                                     plan.get('best_part'),
                                     constraint,
-                                    getattr(status, 'autogrow_engine_cores', 0),
+                                    int(plan.get(
+                                        'engine_cores',
+                                        getattr(status, 'autogrow_engine_cores', 0),
+                                    ) or 0),
+                                    minimum_runtime_seconds=plan.get(
+                                        'minimum_runtime_seconds'),
                                 )
                                 status.autogrow_last_action_compute_ts = now
                                 if started:
@@ -7040,10 +8629,14 @@ def thread_check_commands():
                 staging_burst_threshold = max(1, int(getattr(status, 'staging_autogrow_burst_threshold', 50)))
                 staging_base_nodes = max(0, int(getattr(status, 'staging_autogrow_base_nodes', 1)))
                 staging_burst_nodes = max(staging_base_nodes, int(getattr(status, 'staging_autogrow_burst_nodes', 4)))
-                if staging_pending >= staging_burst_threshold:
-                    desired_staging = staging_burst_nodes
-                elif staging_pending > 0:
-                    desired_staging = staging_base_nodes
+                staging_autogrow_enable = bool(status.staging_partition) and _cfg_bool(
+                    status.config.get("staging_autogrow_enable"), True
+                )
+                if staging_autogrow_enable:
+                    if staging_pending >= staging_burst_threshold:
+                        desired_staging = staging_burst_nodes
+                    elif staging_pending > 0:
+                        desired_staging = staging_base_nodes
                 
                 queued_map = getattr(engines, 'cluster_queued_by_partition', {}) or {}
                 running_map = getattr(engines, 'cluster_running_by_partition', {}) or {}
@@ -7052,7 +8645,9 @@ def thread_check_commands():
 
                 cooldown_remaining_staging = max(0.0, float(status.autogrow_cooldown_sec) - (now - float(status.autogrow_last_action_staging_ts)))
 
-                if desired_staging > current_staging:
+                if not staging_autogrow_enable:
+                    plan_staging = "disabled"
+                elif desired_staging > current_staging:
                     plan_staging = f"grow {desired_staging  - current_staging}, cooldown {int(cooldown_remaining_staging)}s left"
                 else:
                     plan_staging = f"no nodes needed"
@@ -7073,7 +8668,8 @@ def thread_check_commands():
                                 plan_staging = "grew: 1" if started else "growth deferred (maintenance window or submission failure)"
 
 
-                status.autogrow_plan =f"Compute: {plan_compute} | Staging: {plan_staging}"              
+                status.autogrow_plan = (f"Compute: {plan_compute} | Staging: {plan_staging}"
+                                       + (f" | GPU: grow {gpu_plan['best_nodes']}" if status.gpu_partition else ''))
 
         except Exception:
             import traceback
@@ -7094,6 +8690,7 @@ def thread_start_manager_server(port, rpc_path):
 
     server.register_function(register, "register")
     server.register_function(register_versioned, "register_versioned")
+    server.register_function(register_gpu_versioned, "register_gpu_versioned")
     server.register_function(failed_node, "failed_node")
     server.register_function(unregister, "unregister")
     server.register_function(poll, "poll")
@@ -7308,6 +8905,19 @@ def thread_display_status(gb, status):
                     curses.color_pair(GREEN),
                 )
 
+                if status.gpu_partition or njobs.get('gpu', 0):
+                    gb.wcom_status.addstr(3, 1, 'GPU jobs: ')
+                    gb.wcom_status.addstr(3, 18, '%d/%d/%d' % (
+                        nrunning.get('gpu', 0), neligible.get('gpu', 0), njobs.get('gpu', 0)),
+                        curses.color_pair(GREEN))
+                    gpu_engines = [e for e in engines.engine_by_id.values() if e.partition == 'gpu']
+                    reserved = sum(len(devices) for e in gpu_engines for devices in e.gpu_allocations.values())
+                    total = sum(len(e.gpu_devices) for e in gpu_engines)
+                    gb.wcom_status.addstr(6, 1, 'GPU R/Q/H: ')
+                    gb.wcom_status.addstr(6, 18, '%d/%d/%d devices %d/%d' % (
+                        engines.cluster_running_engines_gpu, engines.cluster_queued_engines_gpu,
+                        engines.cluster_held_engines_gpu, reserved, total), curses.color_pair(GREEN))
+
 
                 total_ssd_arr = numpy.asarray(getattr(status, 'total_ssd', []), dtype=float)
                 used_ssd_arr = numpy.asarray(getattr(status, 'used_ssd', []), dtype=float)
@@ -7481,16 +9091,17 @@ def thread_display_status(gb, status):
                     xav = float((status.sys_cpu_busy * status.total_cpus).sum() / numpy.sum(status.total_cpus))
                 else:
                     xav = 0.0
-                if len(status.gpfs_io_pct) > 0:
-                    gpfs_text = "%.0f" % float(numpy.mean(status.gpfs_io_pct))
-                else:
-                    gpfs_text = "n/a"
-                
-                gb.wcom_status.addstr(11, 1, "CPU/GPFS (%): ")
+                cpu_io_label, cpu_io_text = _cpu_io_display(
+                    xav,
+                    status.gpfs_io_pct,
+                    bool(getattr(status, "gpfs_io_enable", True)),
+                )
+
+                gb.wcom_status.addstr(11, 1, cpu_io_label)
                 gb.wcom_status.addstr(
                     11,
                     18,
-                    "%.0f | %s" % (xav, gpfs_text),
+                    cpu_io_text,
                     curses.color_pair(GREEN),
                 )
 
@@ -8130,6 +9741,10 @@ def _remove_owned_instance_records():
 
 
 def main(scr, *args, **kwds):
+    # A malformed exclusion must fail before registering an instance record;
+    # otherwise an unusable manager could leave a stale discovery pointer.
+    _cfg_compute_pilot_exclude_nodes(
+        zslurm_shared.get_config().get('compute_pilot_exclude_nodes'))
     cli_args = kwds.get('cli_args')
     requested_recovery = getattr(cli_args, 'recover_instance', None)
     address = zslurm_shared.get_hostname()
@@ -8147,7 +9762,7 @@ def main(scr, *args, **kwds):
 
     status.instance_name = instance_name
     status.config = config
-    _apply_cluster_config(status.config)
+    _apply_cluster_config(status.config, discover_partitions=True)
     jobs.configure_transfer_limits(status.config)
     if 'autogrow_max_compute_nodes' not in status.config:
         status.config['autogrow_max_compute_nodes'] = 40
@@ -8347,34 +9962,44 @@ def main(scr, *args, **kwds):
                 default_partition = str(getattr(status, 'default_partition', 'normal') or 'normal')
                 staging_partition = str(getattr(status, 'staging_partition', 'staging') or 'staging')
                 enable_ssd_prompt = bool(getattr(status, 'enable_ssd_prompt', False))
+                enable_feature_prompt = bool(getattr(status, 'enable_feature_prompt', True))
                 ssd_feature_name = str(getattr(status, 'ssd_feature_name', '') or '')
 
                 partition = enter_command(
-                    gb, f"Enter partition (default={default_partition}): "
+                    gb, f"Partition [{default_partition}] {'/'.join(worker_partition_choices())}: "
                 )
                 if partition == "":
                     partition = default_partition
+                try:
+                    partition, worker_kind = resolve_worker_partition(partition)
+                except ValueError as error:
+                    set_status_message(gb, str(error), YELLOW)
+                    continue
                 if partition == staging_partition:
                     cmd = 1
                     cores = 1
                     constraint = ""
                 else:
                     cmd = get_number(gb, "Number of engines (def=1): ", 1)
-                    if enable_ssd_prompt and ssd_feature_name:
+                    if worker_kind == 'gpu':
+                        constraint = ''
+                    elif enable_ssd_prompt and ssd_feature_name:
                         ans = enter_command(gb, "Reserve SSD scratch node? (Y/n): ")
                         if ans.lower() in ("", "y", "yes", "1"):
                             constraint = ssd_feature_name
                         else:
                             constraint = ""
-                    else:
+                    elif enable_feature_prompt:
                         constraint = enter_command(gb, "Enter feature (default=): ")
+                    else:
+                        constraint = ""
                     default_cores = int(
                         getattr(status, 'default_engine_cores', 0) or 0
                     )
                     default_cores_label = (
                         str(default_cores) if default_cores > 0 else "exclusive"
                     )
-                    cores = get_number(
+                    cores = int(status.node_profiles[partition]['cores']) if worker_kind == 'gpu' else get_number(
                         gb,
                         f"Enter number of cores (default={default_cores_label}): ",
                         default_cores,
@@ -8512,7 +10137,7 @@ def main(scr, *args, **kwds):
 
             elif c == ord("c"):  # STOP SLURM engines
                 group_cmd = enter_command(
-                    gb, "Cancel group [compute/staging/all] (def=all): "
+                    gb, "Cancel group [compute/staging/gpu/all] (def=all): "
                 )
                 group_aliases = {
                     "": "all",
@@ -8523,12 +10148,14 @@ def main(scr, *args, **kwds):
                     "s": "staging",
                     "staging": "staging",
                     "archive": "staging",
+                    "g": "gpu",
+                    "gpu": "gpu",
                 }
                 group = group_aliases.get(str(group_cmd or "").strip().lower())
                 if group is None:
                     set_status_message(
                         gb,
-                        "Engine group must be compute, staging, or all",
+                        "Engine group must be compute, staging, gpu, or all",
                         YELLOW,
                     )
                 else:
@@ -8715,6 +10342,8 @@ def main_headless(args):
     thread. Required for autonomous/agent operation and for testing the agent
     interface (see docs/agent-interface-plan.md). add_log_line() already no-ops
     its window writes when gb.wlog is None, so logging goes to cluster.log only."""
+    _cfg_compute_pilot_exclude_nodes(
+        zslurm_shared.get_config().get('compute_pilot_exclude_nodes'))
     address = zslurm_shared.get_hostname()
     requested_recovery = getattr(args, 'recover_instance', None)
     recovery_config = _prepare_explicit_recovery(
@@ -8729,7 +10358,7 @@ def main_headless(args):
 
     status.instance_name = instance_name
     status.config = config
-    _apply_cluster_config(status.config)
+    _apply_cluster_config(status.config, discover_partitions=True)
     jobs.configure_transfer_limits(status.config)
     if 'autogrow_max_compute_nodes' not in status.config:
         status.config['autogrow_max_compute_nodes'] = 40
@@ -8804,11 +10433,15 @@ def main_headless(args):
         while not stop_event.wait(1.0):
             pass
     finally:
+        failed = []
         try:
             if not getattr(status, 'handover_preserve_engines', False):
-                engines.stop_all()
-        except Exception:
-            pass
+                failed = engines.stop_all()
+        except Exception as exc:
+            add_log_line(gb, f"[manager] shutdown cleanup failed: {exc}", RED)
+            raise
+        if failed:
+            raise RuntimeError(f"Manager exited with unresolved Slurm cancellations: {failed}")
         add_log_line(gb, "[manager] headless shutdown complete", YELLOW)
 
 
@@ -8817,6 +10450,12 @@ def _cli_main():
         prog="zslurm",
         description="zslurm pilot-job meta-scheduler manager")
     parser.add_argument("--version", action="version", version=f"zslurm {VERSION}")
+    parser.add_argument(
+        "--update-config", choices=("spider",), metavar="SITE",
+        help="add missing site settings to the persistent ZSlurm config and exit")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="with --update-config, report changes without writing")
     parser.add_argument("--headless", action="store_true",
                         help="run without the curses UI (RPC servers + controller only); "
                              "for autonomous/agent operation")
@@ -8837,6 +10476,36 @@ def _cli_main():
         help="explicitly restart an unreachable local instance on its existing "
              "ports and RPC path so surviving chiefs can reconnect")
     args, _unknown = parser.parse_known_args()
+    if args.dry_run and not args.update_config:
+        parser.error("--dry-run requires --update-config")
+    if args.update_config:
+        if _unknown or args.headless or args.recover_instance or args.instance_name:
+            parser.error("--update-config cannot be combined with manager options")
+        from zslurm_config import update_site_config
+        try:
+            result = update_site_config(args.update_config, dry_run=args.dry_run)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(2, f"zslurm: config update failed: {error}\n")
+        action = "Would add" if args.dry_run else "Added"
+        print(f"Config: {result['path']}")
+        print(f"{action} {len(result['added'])} missing site keys"
+              + (": " + ", ".join(result["added"]) if result["added"] else "."))
+        if result["backup"]:
+            print(f"Backup: {result['backup']}")
+        if result["conflicts"]:
+            print(
+                "WARNING: kept existing values for conflicting keys: "
+                + ", ".join(result["conflicts"]),
+                file=sys.stderr,
+            )
+        if "autogrow_enable" in result["added"]:
+            print(
+                "NOTE: the Spider template enables autogrow (maximum 15 pilots) "
+                "when the manager is next started.",
+                file=sys.stderr,
+            )
+        print("No running manager was changed; restart it when safe to load the config.")
+        return
     if args.headless:
         main_headless(args)
     else:

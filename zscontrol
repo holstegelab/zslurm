@@ -20,6 +20,7 @@ Subcommands:
   lifo     on|off                                                        depth-first/LIFO toggle
   context  N                                                             greedy memory window (>=1)
   autogrow on|off [--max-nodes N]                                        autoscale + node cap
+  consolidate on|off --expect on|off --manager-uuid UUID                 idle retirement toggle
   prioritize   PATTERN [--yes]                                           move matching name/folder first
   deprioritize PATTERN [--yes]                                           move matching name/folder last
   priority-override list|set|clear ...                                   active cwd priority rules
@@ -107,6 +108,11 @@ def main():
     sp = sub.add_parser("autogrow", help="enable/disable autogrow and set the compute-node cap")
     sp.add_argument("state", choices=["on", "off"], nargs="?", default=None)
     sp.add_argument("--max-nodes", dest="max_nodes", type=int, default=None)
+
+    sp = sub.add_parser("consolidate", help="toggle demand-aware idle retirement on an exact primary")
+    sp.add_argument("state", choices=["on", "off"])
+    sp.add_argument("--expect", choices=["on", "off"], required=True)
+    sp.add_argument("--manager-uuid", required=True)
 
     sp = sub.add_parser("prioritize", help="move jobs matching a name or cwd folder to run first")
     sp.add_argument("pattern")
@@ -319,6 +325,10 @@ def main():
         if args.cmd == "autogrow":
             enable = None if args.state is None else (args.state == "on")
             _finish(proxy.set_autogrow(token, enable, args.max_nodes))
+
+        if args.cmd == "consolidate":
+            _finish(proxy.set_autoconsolidate(token, args.state == "on",
+                args.expect == "on", args.manager_uuid))
 
         if args.cmd in ("prioritize", "deprioritize"):
             # Blast-radius rail: dry-run the match first, refuse huge matches.

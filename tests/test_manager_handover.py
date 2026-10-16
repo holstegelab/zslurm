@@ -46,6 +46,9 @@ class HandoverSnapshotTests(unittest.TestCase):
         z.status.handover_mode = "ACTIVE"
         z.status.handover_target = None
         z.status.handover_owned_aliases = set()
+        z.status.handover_expected_cluster_ids = set()
+        z.status.handover_registered_cluster_ids = set()
+        z.status.handover_terminal_cluster_ids = set()
         z.status.lastin_first = True
         z.status.prio_fillmem_context = 500
         z.status.autogrow_enable = True
@@ -92,6 +95,50 @@ class HandoverSnapshotTests(unittest.TestCase):
         self.assertEqual(
             z.handover_display_label("TARGET_ACTIVE"), "TAKEOVER DONE"
         )
+
+    def assert_submission_token_survives_handover(self, terminal):
+        z = self.zslurm
+        args = ('replayed-call', 'true', '/work', {}, 2, 16000, 21600, 0,
+                None, 0, 0, 0, 0, 0, 0, 'compute', 0, None, '', 'no', 0,
+                'workflow-owner', 'same-request-token', 150)
+        jobid = z.jobs.submit_job(*args)
+        if terminal:
+            job = z.jobs.jobs_by_id.pop(jobid)
+            job.state = 'COMPLETED'
+            z.jobs.finished_jobs_by_owner['workflow-owner'] = [job]
+        with mock.patch.object(z, '_manager_descriptor', return_value={
+                'instance': 'source', 'manager_uuid': 'source-uuid'}):
+            snapshot = z._build_handover_snapshot('token-transfer', {'manager_uuid': 'target-uuid'})
+        # Exercise the actual XML-RPC representation, not an in-process alias
+        # of the old manager's token dictionary.
+        snapshot = xmlrpc.client.loads(xmlrpc.client.dumps((snapshot,), allow_none=True))[0][0]
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z.status.instance_name = 'target'
+        z.status.manager_uuid = 'target-uuid'
+        z._apply_handover_snapshot(snapshot)
+        before_counter = z.jobs.jobid_counter
+        before_counts = dict(z.jobs.total_jobs)
+        self.assertEqual(z.jobs.submit_job(*args), jobid)
+        self.assertEqual(z.jobs.jobid_counter, before_counter)
+        self.assertEqual(z.jobs.total_jobs, before_counts)
+        self.assertEqual(z.jobs.seen_tokens, {'same-request-token': jobid})
+        if terminal:
+            self.assertFalse(z.jobs.jobs_by_id)
+            self.assertEqual(z.jobs.finished_jobs_by_owner['workflow-owner'][0].jobid, jobid)
+        else:
+            self.assertEqual(list(z.jobs.jobs_by_id), [jobid])
+            self.assertEqual(z.jobs.jobs_by_id[jobid].priority, 150)
+        changed = list(args)
+        changed[-2] = 'genuine-workflow-retry-token'
+        self.assertNotEqual(z.jobs.submit_job(*changed), jobid)
+        self.assertEqual(z.jobs.jobid_counter, before_counter + 1)
+
+    def test_pending_submission_replay_after_handover_is_not_duplicated(self):
+        self.assert_submission_token_survives_handover(terminal=False)
+
+    def test_completed_submission_replay_after_handover_is_not_restarted(self):
+        self.assert_submission_token_survives_handover(terminal=True)
 
     def test_snapshot_requeues_assigned_and_preserves_running_lease(self):
         z = self.zslurm
@@ -148,6 +195,376 @@ class HandoverSnapshotTests(unittest.TestCase):
             z.engines.engine_by_clusterid["12345"].instance, "source"
         )
         self.assertEqual(z.status.handover_expected_cluster_ids, {"12345"})
+        evidence = z.status.handover_import_job_evidence
+        self.assertEqual(evidence['handover_id'], 'handover-1')
+        self.assertEqual(evidence['source_instance'], 'source')
+        self.assertEqual(evidence['source_uuid'], 'source-uuid')
+        self.assertEqual(evidence['target_instance'], 'target')
+        self.assertEqual(evidence['jobs'], [
+            {'jobid':'1','name':'job-1','state':'RUNNING'},
+            {'jobid':'2','name':'job-2','state':'PENDING'},
+        ])
+        # Later queue mutations must not change this transaction's membership.
+        z.jobs.jobs_by_id['1'].state = 'COMPLETED'
+        self.assertEqual(evidence['jobs'][0]['state'], 'RUNNING')
+        self.assertNotIn('env', evidence['jobs'][0])
+
+    def test_import_rebuilds_job_objects_and_held_reservations(self):
+        z = self.zslurm
+        running = self.add_job('1', 'RUNNING', 0)
+        assigned = self.add_job('2', 'ASSIGNED', 0)
+        engine = z.Engine('node1', 30, 220708, 'compute', cluster_id='12345')
+        engine.jobs = {running, assigned, '<stale job object>'}
+        engine.res_cpu_reserved = 46
+        engine.res_mem_reserved_mb = 136000
+        engine.res_ssd_reserved_gb = 99
+        running.ssd_alloc_gb = 3.5
+        z.engines.engine_by_id['node1'] = engine
+        z.engines.engine_by_clusterid['12345'] = engine
+        with mock.patch.object(z, '_manager_descriptor', return_value={}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot('ledger-transfer', {})
+        self.assertEqual(snapshot['engines'][0]['jobs'], ['1'])
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z._apply_handover_snapshot(snapshot)
+        imported = z.engines.engine_by_clusterid['12345']
+        live = z.jobs.jobs_by_id['1']
+        self.assertEqual(imported.jobs, {live})
+        self.assertEqual(imported.res_cpu_reserved, 1.25)
+        self.assertEqual(imported.res_mem_reserved_mb, 2500)
+        self.assertEqual(imported.res_ssd_reserved_gb, 3.5)
+        self.assertEqual(z.jobs.jobs_by_id['2'].state, 'PENDING')
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', '12345', 10, 0), 'node1')
+        z.jobs.job_done('1', z.RC_SUCCESS)
+        self.assertFalse(imported.jobs)
+        self.assertEqual(imported.res_cpu_reserved, 0)
+        self.assertEqual(imported.res_mem_reserved_mb, 0)
+        self.assertEqual(imported.res_ssd_reserved_gb, 0)
+
+    def imported_callback_placeholder(self, state='RUNNING'):
+        z = self.zslurm
+        job = self.add_job('early-callback', state, 0)
+        job.ssd_alloc_gb = 3.5 if state == 'RUNNING' else 0
+        engine = z.Engine('node1', 30, 220708, 'compute', cluster_id='12345')
+        z.engines.engine_by_id['node1'] = engine
+        z.engines.engine_by_clusterid['12345'] = engine
+        with mock.patch.object(z, '_manager_descriptor', return_value={}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot('early-callback-transfer', {})
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z._apply_handover_snapshot(snapshot)
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        self.assertFalse(z.engines.engine_by_id)  # Not schedulable before chief registration.
+        return z.engines.engine_by_clusterid['12345'], z.jobs.jobs_by_id[job.jobid]
+
+    def test_completion_before_chief_registration_releases_imported_lease(self):
+        z = self.zslurm
+        engine, job = self.imported_callback_placeholder()
+        z.jobs.job_done(job.jobid, z.RC_SUCCESS)
+        self.assertFalse(engine.jobs)
+        self.assertEqual(engine.res_cpu_reserved, 0)
+        self.assertEqual(engine.res_mem_reserved_mb, 0)
+        self.assertEqual(engine.res_ssd_reserved_gb, 0)
+        self.assertFalse(z.engines.engine_by_id)
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', '12345', 10, 0), 'node1')
+        self.assertEqual(z.engines.list_nodes()[0][14], 0)
+        self.assertEqual(z.engines.list_nodes()[0][7], 0)
+
+    def test_start_callback_before_chief_registration_reserves_imported_lease(self):
+        z = self.zslurm
+        engine, job = self.imported_callback_placeholder('PENDING')
+        z.jobs.job_start('node1', job.jobid)
+        self.assertEqual(engine.jobs, {job})
+        self.assertEqual(engine.res_cpu_reserved, job.held_ncpu)
+        self.assertEqual(engine.res_mem_reserved_mb, job.held_mem)
+        self.assertFalse(z.engines.engine_by_id)
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', '12345', 10, 0), 'node1')
+        self.assertEqual(z.engines.list_nodes()[0][14], job.held_ncpu)
+        z.jobs.job_done(job.jobid, z.RC_SUCCESS)
+        self.assertFalse(engine.jobs)
+        self.assertEqual(engine.res_cpu_reserved, 0)
+
+    def test_placeholder_callbacks_require_exact_handover_engine_scope(self):
+        z = self.zslurm
+        engine, _ = self.imported_callback_placeholder()
+        self.assertIs(z.engines.job_lease_engine('node1'), engine)
+        self.assertIsNone(z.engines.job_lease_engine('unrelated'))
+        z.status.handover_mode = 'ACTIVE'
+        self.assertIsNone(z.engines.job_lease_engine('node1'))
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        z.status.handover_expected_cluster_ids = set()
+        self.assertIsNone(z.engines.job_lease_engine('node1'))
+        z.status.handover_expected_cluster_ids = {'12345', '54321'}
+        z.engines.engine_by_clusterid['54321'] = z.Engine('node1', 30, 220708, 'compute', cluster_id='54321')
+        self.assertIsNone(z.engines.job_lease_engine('node1'))
+
+    def imported_orphan_array(self):
+        z = self.zslurm
+        job = self.add_job('orphan-lease', 'RUNNING', 20)
+        z.jobs.active_inuse = 20
+        z.jobs.running_jobs = {'compute': 1}
+        engine = z.Engine('node1', 30, 220708, 'compute', cluster_id='123_4')
+        engine.jobs = {job}
+        engine.res_cpu_reserved = job.held_ncpu
+        engine.res_mem_reserved_mb = job.held_mem
+        z.engines.engine_by_clusterid['123_4'] = engine
+        z.engines.last_observed_cids = set()
+        engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        z.status.handover_saved_autogrow = False
+        z.status.handover_saved_autoconsolidate = False
+        z.status.handover_expected_cluster_ids = {'123_4'}
+        return engine, job
+
+    def test_terminal_imported_orphan_requeues_same_jobs_and_finishes_migration(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (b'123|123_4|CANCELLED\n', b'')
+        with mock.patch.object(z, 'Popen', return_value=process):
+            self.assertTrue(z.engines.reconcile_imported_orphan_engine(engine, True))
+        self.assertIs(z.jobs.jobs_by_id[job.jobid], job)
+        self.assertEqual(job.state, 'REQUEUED')
+        self.assertIsNone(job.node_id)
+        self.assertNotIn('123_4', z.engines.engine_by_clusterid)
+        self.assertEqual(engine.res_cpu_reserved, 0)
+        self.assertEqual(engine.res_mem_reserved_mb, 0)
+        self.assertEqual(z.status.handover_terminal_cluster_ids, {'123_4'})
+        self.assertEqual(z.status.handover_mode, 'TARGET_ACTIVE')
+        self.assertEqual(z.get_status_json()['handover']['terminal_chiefs'], 1)
+        # A delayed registration RPC cannot resurrect the fenced chief.
+        self.assertEqual(z.register('node1', 30, 220708, 'compute',
+                                    '123_4', 0, 0), 'DENIED')
+        self.assertFalse(z.engines.engine_by_id)
+        self.assertEqual(z.status.handover_registered_cluster_ids, set())
+        self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+
+    def test_legacy_snapshot_tracks_six_unregistered_orphan_leases_until_terminal(self):
+        z = self.zslurm
+        orphan_cid = '41497549_1'
+        orphan = z.Engine('node-orphan', 30, 220708, 'compute', cluster_id=orphan_cid)
+        z.engines.engine_by_clusterid[orphan_cid] = orphan
+        orphan_jobs = []
+        for number in range(6):
+            job = self.add_job(str(number + 1), 'RUNNING', 20)
+            job.node_id = orphan.engine_id
+            orphan_jobs.append(job)
+        orphan.jobs = set(orphan_jobs)
+        live = self.add_job('7', 'RUNNING', 20)
+        live.node_id = 'node-live'
+        registered = z.Engine('node-live', 30, 220708, 'compute', cluster_id='41500000')
+        registered.jobs = {live}
+        z.engines.engine_by_id[registered.engine_id] = registered
+        z.engines.engine_by_clusterid[registered.cluster_id] = registered
+        pending = self.add_job('8', 'PENDING', 0)
+        z.jobs.active_inuse = 140
+        z.jobs.running_jobs = {'compute': 7}
+
+        with mock.patch.object(z, '_manager_descriptor', return_value={
+                'instance': 'source', 'manager_uuid': 'source-uuid'}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot(
+                'legacy-orphan-transfer', {'manager_uuid': 'target-uuid'})
+        self.assertEqual(snapshot['registered_cluster_ids'], ['41500000'])
+        # The XML-RPC round trip must not rely on source-side object identity.
+        snapshot = xmlrpc.client.loads(
+            xmlrpc.client.dumps((snapshot,), allow_none=True))[0][0]
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z.status.instance_name = 'target'
+        z.status.manager_uuid = 'target-uuid'
+        z._apply_handover_snapshot(snapshot)
+        self.assertEqual(z.status.handover_expected_cluster_ids,
+                         {'41500000', orphan_cid})
+        self.assertEqual(
+            {job.jobid for job in z.engines.engine_by_clusterid[orphan_cid].jobs},
+            {job.jobid for job in orphan_jobs})
+        z.status.handover_mode = 'TARGET_IMPORTED'
+        activated = z.activate_received_handover(
+            z.status.handover_secret, 'legacy-orphan-transfer')
+        self.assertEqual(activated['remaining_chiefs'], 2)
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+
+        self.assertEqual(z.register('node-live', 30, 220708, 'compute',
+                                    '41500000', 0, 0), 'node-live')
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+        imported_orphan = z.engines.engine_by_clusterid[orphan_cid]
+        imported_orphan.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+        z.engines.last_observed_cids = set()
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed', return_value=False):
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(
+                imported_orphan, True))
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+        self.assertTrue(all(z.jobs.jobs_by_id[job.jobid].state == 'RUNNING'
+                            for job in orphan_jobs))
+
+        imported_orphan.last_orphan_terminal_check = None
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (
+            b'41497549|41497549_1|CANCELLED\n', b'')
+        with mock.patch.object(z, 'Popen', return_value=process):
+            self.assertTrue(z.engines.reconcile_imported_orphan_engine(
+                imported_orphan, True))
+        for job in orphan_jobs:
+            imported = z.jobs.jobs_by_id[job.jobid]
+            self.assertEqual(imported.state, 'REQUEUED')
+            self.assertIsNone(imported.node_id)
+        self.assertEqual(z.jobs.jobs_by_id[live.jobid].state, 'RUNNING')
+        self.assertEqual(z.jobs.jobs_by_id[live.jobid].node_id, 'node-live')
+        self.assertEqual(z.jobs.jobs_by_id[pending.jobid].state, 'PENDING')
+        self.assertEqual(z.status.handover_terminal_cluster_ids, {orphan_cid})
+        self.assertEqual(z.status.handover_mode, 'TARGET_ACTIVE')
+        self.assertEqual(z.register('node-orphan', 30, 220708, 'compute',
+                                    orphan_cid, 0, 0), 'DENIED')
+
+    def test_import_adds_only_valid_unregistered_pilots_with_running_leases(self):
+        z = self.zslurm
+        registered = z.Engine('snellius-chief', 30, 220708, 'compute',
+                              cluster_id='registered-site-id')
+        z.engines.engine_by_id[registered.engine_id] = registered
+        z.engines.engine_by_clusterid[registered.cluster_id] = registered
+        invalid_cid = z.Engine('invalid-cid-chief', 30, 220708, 'compute',
+                               cluster_id='not-a-slurm-id')
+        z.engines.engine_by_clusterid[invalid_cid.cluster_id] = invalid_cid
+        running = self.add_job('invalid', 'RUNNING', 0)
+        running.node_id = invalid_cid.engine_id
+        stale = z.Engine('no-lease-chief', 30, 220708, 'compute',
+                         cluster_id='123_1')
+        z.engines.engine_by_clusterid[stale.cluster_id] = stale
+        z.engines.engine_by_clusterid['123_2'] = z.Engine(
+            '?', 30, 220708, 'compute', cluster_id='123_2')
+        with mock.patch.object(z, '_manager_descriptor', return_value={}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot('filtered-orphans', {})
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z._apply_handover_snapshot(snapshot)
+        self.assertEqual(z.status.handover_expected_cluster_ids,
+                         {'registered-site-id'})
+
+    def test_imported_orphan_requires_fresh_absence_and_no_live_chief(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed', return_value=True) as terminal:
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, False))
+            engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE - 1
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            engine.missing_hits = z.SQUEUE_MISSING_TOLERANCE
+            z.engines.last_observed_cids = {'123_4'}
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            z.engines.last_observed_cids = set()
+            z.engines.engine_by_id['node1'] = engine
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            z.engines.engine_by_id.clear()
+            z.status.handover_expected_cluster_ids = set()
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            z.status.handover_expected_cluster_ids = {'123_4'}
+            z.engines.engine_by_clusterid['123_5'] = z.Engine(
+                'node1', 30, 220708, 'compute', cluster_id='123_5')
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            terminal.assert_not_called()
+        self.assertEqual(job.state, 'RUNNING')
+        self.assertIs(z.engines.engine_by_clusterid['123_4'], engine)
+
+    def test_imported_orphan_rejects_sibling_base_and_ambiguous_sacct_rows(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        for output in (
+                b'123|123_5|COMPLETED\n',
+                b'123|123|COMPLETED\n',
+                b'123|123_4|RUNNING\n',
+                b'123|123_4|CANCELLED\n123|123_4|COMPLETED\n',
+                b'123|123_4|CANCELLED\nmalformed\n'):
+            engine.last_orphan_terminal_check = None
+            process = mock.Mock(returncode=0)
+            process.communicate.return_value = (output, b'')
+            with self.subTest(output=output), mock.patch.object(z, 'Popen', return_value=process):
+                self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+                self.assertEqual(job.state, 'RUNNING')
+                self.assertIs(z.engines.engine_by_clusterid['123_4'], engine)
+        self.assertEqual(z.status.handover_mode, 'TARGET_MIGRATING')
+
+    def test_imported_orphan_throttles_repeated_accounting_queries(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed', return_value=False) as terminal:
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+            terminal.assert_called_once_with('123_4')
+        self.assertEqual(job.state, 'RUNNING')
+
+    def test_imported_orphan_rechecks_chief_registration_after_sacct(self):
+        z = self.zslurm
+        engine, job = self.imported_orphan_array()
+
+        def chief_registered_during_query(_cid):
+            self.assertEqual(z.engines.register('node1', 30, 220708, 'compute',
+                                                '123_4', 0, 0), 'node1')
+            return True
+
+        with mock.patch.object(z.engines, '_slurm_terminal_confirmed',
+                               side_effect=chief_registered_during_query):
+            self.assertFalse(z.engines.reconcile_imported_orphan_engine(engine, True))
+        self.assertEqual(job.state, 'RUNNING')
+        self.assertIs(z.engines.engine_by_id['node1'], engine)
+        self.assertEqual(z.status.handover_terminal_cluster_ids, set())
+
+    def test_legacy_engine_object_strings_are_not_live_imported_jobs(self):
+        z = self.zslurm
+        running = self.add_job('1', 'RUNNING', 0)
+        engine = z.Engine('node1', 30, 220708, 'compute', cluster_id='12345')
+        z.engines.engine_by_id['node1'] = engine
+        z.engines.engine_by_clusterid['12345'] = engine
+        with mock.patch.object(z, '_manager_descriptor', return_value={}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot('legacy-transfer', {})
+        snapshot['engines'][0]['jobs'] = ['<zslurm.Job object at 0x123>', 'missing']
+        snapshot['engines'][0]['res_cpu_reserved'] = 46
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z._apply_handover_snapshot(snapshot)
+        engine = z.engines.engine_by_clusterid['12345']
+        self.assertEqual(engine.jobs, {z.jobs.jobs_by_id[running.jobid]})
+        self.assertEqual(engine.res_cpu_reserved, 1.25)
+
+    def test_imported_same_host_pilots_keep_ids_in_reverse_registration_order(self):
+        z = self.zslurm
+        first = self.add_job('1', 'RUNNING', 0)
+        second = self.add_job('2', 'RUNNING', 0)
+        first.node_id = 'node1'
+        second.node_id = 'node1-2'
+        for eid, cid, job in [('node1', 'a', first), ('node1-2', 'b', second)]:
+            engine = z.Engine(eid, 30, 220708, 'compute', cluster_id=cid)
+            engine.jobs = {job}
+            z.engines.engine_by_id[eid] = engine
+            z.engines.engine_by_clusterid[cid] = engine
+        with mock.patch.object(z, '_manager_descriptor', return_value={}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=[]):
+            snapshot = z._build_handover_snapshot('same-host-transfer', {})
+        z.jobs = z.JobManager()
+        z.engines = z.EngineManager()
+        z._apply_handover_snapshot(snapshot)
+        z.status.handover_mode = 'TARGET_MIGRATING'
+        # Even a newly allocated pilot arriving first must not take either name.
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', 'new', 0, 0), 'node1-3')
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', 'b', 0, 0), 'node1-2')
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', 'a', 0, 0), 'node1')
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', 'b', 0, 0), 'node1-2')
+        z.jobs.job_done('2', z.RC_SUCCESS)
+        self.assertEqual(z.engines.engine_by_id['node1-2'].res_cpu_reserved, 0)
+        self.assertEqual(z.engines.engine_by_id['node1'].res_cpu_reserved, 1.25)
+        self.assertEqual(z.jobs.jobs_by_id['1'].node_id, 'node1')
+
+    def test_queued_slurm_placeholder_gets_a_real_engine_id(self):
+        z = self.zslurm
+        placeholder = z.Engine(cluster_id='12345', partition='compute')
+        z.engines.engine_by_clusterid['12345'] = placeholder
+        self.assertEqual(z.engines.register('node1', 30, 220708, 'compute', '12345', 0, 0), 'node1')
+        self.assertIs(z.engines.engine_by_id['node1'], placeholder)
+        self.assertNotIn('?', z.engines.engine_by_id)
 
     def test_committed_source_poll_only_retries_migration(self):
         z = self.zslurm
@@ -235,6 +652,46 @@ class HandoverSnapshotTests(unittest.TestCase):
             z.engines.engine_by_id[engine_id].instance, "old-instance"
         )
 
+    def test_abort_clears_import_membership(self):
+        z = self.zslurm
+        z.status.handover_mode = 'TARGET_IMPORTED'
+        z.status.handover_import_job_evidence = {'handover_id':'previous'}
+        result = z.abort_received_handover(z.status.handover_secret, 'previous')
+        self.assertTrue(result['ok'])
+        self.assertIsNone(z.status.handover_import_job_evidence)
+
+    def test_target_never_attaches_cached_membership_of_another_transaction(self):
+        z = self.zslurm
+        z.status.instance_name = 'target'
+        z.status.handover_import_job_evidence = {'handover_id':'previous'}
+        proxy = mock.Mock()
+        proxy.handover_to.return_value = dict(ok=True, handover_id='current')
+        with mock.patch.object(z.zslurm_shared, 'get_instance_config',
+                               return_value={'handover_secret':'test-secret'}), \
+                mock.patch.object(z.zslurm_shared, 'get_job_url', return_value='http://test'), \
+                mock.patch.object(z.zslurm_shared, 'TimeoutServerProxy', return_value=proxy), \
+                mock.patch.object(z, '_manager_descriptor', return_value={}):
+            result = z.initiate_handover('source')
+        self.assertNotIn('source_job_evidence', result)
+
+    def test_large_queue_atomic_membership_retains_every_id(self):
+        z = self.zslurm
+        for i in range(10000):
+            self.add_job(str(i), ['RUNNING','ASSIGNED','PENDING','REQUEUED'][i % 4], 0)
+        with mock.patch.object(z, '_manager_descriptor', return_value={
+                'instance':'source', 'manager_uuid':'source-uuid'}), \
+                mock.patch.object(z, '_instance_names_owned_by', return_value=['source']):
+            snapshot = z._build_handover_snapshot('large-transfer', {'manager_uuid':'target-uuid'})
+        z.status.instance_name = 'target'
+        z.status.manager_uuid = 'target-uuid'
+        z._apply_handover_snapshot(snapshot)
+        evidence = z.status.handover_import_job_evidence
+        self.assertEqual(len(evidence['jobs']), 10000)
+        self.assertEqual({r['jobid'] for r in evidence['jobs']}, {str(i) for i in range(10000)})
+        self.assertEqual(evidence['source_uuid'], 'source-uuid')
+        self.assertEqual(evidence['target_uuid'], 'target-uuid')
+        self.assertEqual(evidence['jobs'][1]['state'], 'PENDING')
+
 
 class HeadlessHandoverIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -248,7 +705,7 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
         # Never let an integration test discover or mutate real Slurm jobs.
         fake_bin = self.workdir / "fake-bin"
         fake_bin.mkdir()
-        for command in ("squeue", "scancel", "scontrol", "sbatch"):
+        for command in ("squeue", "scancel", "scontrol", "sbatch", "sacct"):
             script = fake_bin / command
             script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             script.chmod(0o755)
@@ -342,6 +799,148 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
         self.processes.append(process)
         return process
 
+    def test_same_host_running_jobs_survive_rpc_handover_and_completion(self):
+        self.exercise_same_host_running_job_transfer()
+
+    def test_gpu_assignments_survive_real_rpc_handover_without_duplicate_grants(self):
+        config_dir = self.workdir / '.zslurm'
+        config_dir.mkdir()
+        (config_dir / 'config.yaml').write_text(yaml.safe_dump({
+            'cluster_site':'generic', 'gpu_partition':'gpu_fake',
+            'node_profiles':{'gpu_fake':{'cores':4,'mem_gb':8,'gpus':2}},
+            'autogrow_enable':False,
+        }))
+        sinfo = self.workdir / 'fake-bin' / 'sinfo'
+        sinfo.write_text("#!/bin/sh\nprintf '%s\\n' 'normal*|(null)' 'gpu_fake|gpu:a100:2'\n")
+        sinfo.chmod(0o755)
+        source_name = self.instance_prefix + '_source'
+        self.start_manager(source_name)
+        config = self.wait_for_instances(1)[source_name]
+        source = xmlrpc.client.ServerProxy(self.url(config), allow_none=True)
+        worker = xmlrpc.client.ServerProxy(self.url(config, worker=True), allow_none=True)
+        fake_squeue = self.workdir / 'fake-bin' / 'squeue'
+        fake_squeue.write_text('#!/bin/sh\ncase "$*" in *' + source_name
+            + "*) printf '%s\\n' '1001|1001|N/A|" + source_name
+            + "|1-00:00:00|R|gpu-node|gpu_fake|0:00|N/A|4|None';; esac\n")
+        engine_id = worker.register_gpu_versioned('gpu-node',4,8000,'gpu','1001',
+            0,0,source_name,source.health()['version'],['GPU-A','GPU-B'])
+        deadline = time.time() + 20
+        while source.queue_stats()['engines']['running_gpu'] != 1:
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.1)
+        args = ('gpu-call','true',str(self.workdir),{},1,1000,3600,0,None,
+                0,0,0,0,0,0,'gpu',0,None,'','no',0,'gpu-owner','request-token',100,1)
+        running = source.submit_job(*args)
+        grants = worker.request_jobs(engine_id,4,8000,'gpu')
+        self.assertEqual(grants[0][4]['ZSLURM_GPU_DEVICES'], 'GPU-A')
+        self.assertTrue(worker.can_run_assigned_job(engine_id,running,['GPU-A']))
+        waiting_args = list(args)
+        waiting_args[-3] = 'waiting-token'
+        waiting = source.submit_job(*waiting_args)
+        self.assertEqual(worker.request_jobs(engine_id,3,7000,'gpu')[0][0], waiting)
+        target_name = self.instance_prefix + '_target'
+        self.start_manager(target_name)
+        target_config = self.wait_for_instances(2)[target_name]
+        target = xmlrpc.client.ServerProxy(self.url(target_config),allow_none=True)
+        target_worker = xmlrpc.client.ServerProxy(self.url(target_config,worker=True),allow_none=True)
+        self.assertTrue(target.handover_from('test-control-token',source_name)['ok'])
+        self.assertEqual(target.submit_job(*args), running)
+        self.assertEqual(target_worker.register_gpu_versioned('gpu-node',4,8000,
+            'gpu','1001',0,0,source_name,target.health()['version'],['GPU-A','GPU-B']), engine_id)
+        row = target.list_nodes(True)[0]
+        self.assertEqual(row[25:], [2,1,['GPU-A','GPU-B']])
+        grants = target_worker.request_jobs(engine_id,3,7000,'gpu')
+        self.assertEqual(grants[0][0],waiting)
+        self.assertEqual(grants[0][4]['ZSLURM_GPU_DEVICES'],'GPU-B')
+        self.assertTrue(target_worker.can_run_assigned_job(engine_id,waiting,['GPU-B']))
+        # Cached source endpoint forwards completion to the imported owner.
+        worker.job_finished(engine_id,running,0,{})
+        target_worker.job_finished(engine_id,waiting,0,{})
+        self.assertEqual(target.list_nodes(True)[0][26],0)
+
+    def test_idle_retirement_control_is_registered_and_retained_over_rpc_handover(self):
+        source_name = self.instance_prefix + '_source'
+        target_name = self.instance_prefix + '_target'
+        self.start_manager(source_name)
+        source_config = self.wait_for_instances(1)[source_name]
+        source = xmlrpc.client.ServerProxy(self.url(source_config), allow_none=True)
+        source_uuid = source.health()['manager_uuid']
+        self.assertTrue(source.health()['conditional_autoconsolidate'])
+        self.assertFalse(source.set_autoconsolidate(None, True, False, source_uuid)['ok'])
+        self.assertTrue(source.set_autoconsolidate('test-control-token', True, False, source_uuid)['ok'])
+        self.assertTrue(source.get_status_json()['scheduler']['autoconsolidate_enable'])
+        self.start_manager(target_name)
+        target_config = self.wait_for_instances(2)[target_name]
+        target = xmlrpc.client.ServerProxy(self.url(target_config), allow_none=True)
+        self.assertTrue(target.handover_from('test-control-token', source_name)['ok'])
+        self.assertTrue(target.get_status_json()['scheduler']['autoconsolidate_enable'])
+        self.assertFalse(source.set_autoconsolidate('test-control-token', False, True, source_uuid)['ok'])
+        self.assertTrue(target.get_status_json()['scheduler']['autoconsolidate_enable'])
+
+    def test_forwarded_completion_before_target_chief_registration_releases_lease(self):
+        self.exercise_same_host_running_job_transfer(complete_before_registration=True)
+
+    def exercise_same_host_running_job_transfer(self, complete_before_registration=False):
+        self.start_manager(self.instance_prefix + '_source')
+        source_name, source_config = next(iter(self.wait_for_instances(1).items()))
+        source = xmlrpc.client.ServerProxy(self.url(source_config), allow_none=True)
+        worker = xmlrpc.client.ServerProxy(self.url(source_config, worker=True), allow_none=True)
+        # Advertise only these fake allocations, never real Slurm jobs.
+        allocation_ids = ('1001', '1002')
+        fake_rows = [f'{cid}|{cid}|N/A|{source_name}|1-00:00:00|R|same-node|compute|0:00|N/A|4|None'
+                     for cid in allocation_ids]
+        (self.workdir/'fake-bin'/'squeue').write_text(
+            '#!/bin/sh\ncase "$*" in *' + source_name + "*) printf '%s\\n' "
+            + ' '.join(repr(row) for row in fake_rows) + ';; esac\n', encoding='utf-8')
+        engine_ids = [worker.register('same-node', 4, 8000, 'compute', cid, 0, 0, source_name)
+                      for cid in allocation_ids]
+        deadline = time.time() + 20
+        while source.queue_stats()['engines']['running_total'] != 2:
+            self.assertLess(time.time(), deadline, 'fake Slurm allocations were not observed')
+            time.sleep(0.1)
+        job_ids = [source.submit_job('running-' + cid, 'true', str(self.workdir), {},
+                                    2, 1000, 3600, 0, None, 0, 0, 0, 0, 0, 0,
+                                    'compute', 0, None, '', 'no', 0)
+                   for cid in ('a', 'b')]
+        assigned = []
+        for engine_id in engine_ids:
+            granted = worker.request_jobs(engine_id, 2, 8000, 'compute')
+            self.assertEqual(len(granted), 1)
+            job_id = granted[0][0]
+            self.assertTrue(worker.can_run_assigned_job(engine_id, job_id))
+            assigned.append(job_id)
+        self.assertEqual(set(assigned), set(job_ids))
+        self.assertTrue(worker.resize_running_job(engine_ids[0], assigned[0], 0.5, 500)['ok'])
+        self.start_manager(self.instance_prefix + '_target')
+        configs = self.wait_for_instances(2)
+        target_name = next(name for name in configs if name != source_name)
+        target = xmlrpc.client.ServerProxy(self.url(configs[target_name]), allow_none=True)
+        target_worker = xmlrpc.client.ServerProxy(self.url(configs[target_name], worker=True), allow_none=True)
+        result = target.handover_from('test-control-token', source_name)
+        self.assertTrue(result['ok'], result)
+        if complete_before_registration:
+            # Cached chiefs can forward a completion through the old job server
+            # before either chief registers at the newly activated target.
+            worker.job_finished(engine_ids[0], assigned[0], 0, {})
+        for i in (1, 0):
+            self.assertEqual(target_worker.register('same-node', 4, 8000, 'compute',
+                                                    allocation_ids[i], 0, 0, source_name), engine_ids[i])
+        rows = {row[1]: row for row in target.list_nodes()}
+        self.assertEqual(rows[engine_ids[0]][7], 0 if complete_before_registration else 1)
+        self.assertEqual(rows[engine_ids[0]][14:16], [0, 0] if complete_before_registration else [0.5, 500])
+        self.assertEqual(rows[engine_ids[1]][14:16], [2, 1000])
+        if not complete_before_registration:
+            target_worker.job_finished(engine_ids[0], assigned[0], 0, {})
+        rows = {row[1]: row for row in target.list_nodes()}
+        self.assertEqual(rows[engine_ids[0]][7], 0)
+        self.assertEqual(rows[engine_ids[0]][14:16], [0, 0])
+        self.assertEqual(rows[engine_ids[1]][7], 1)
+        self.assertEqual(rows[engine_ids[1]][14:16], [2, 1000])
+        target_worker.job_finished(engine_ids[1], assigned[1], 0, {})
+        self.assertFalse(target.list_jobs())
+        self.assertTrue(all(row[7] == 0 and row[14] == 0 and row[15] == 0
+                            for row in target.list_nodes()))
+
     def test_new_manager_explicitly_takes_over_old_instance(self):
         self.start_manager(self.instance_prefix + "_source")
         first = self.wait_for_instances(1)
@@ -380,6 +979,13 @@ class HeadlessHandoverIntegrationTests(unittest.TestCase):
         self.assertEqual(result["source_instance"], source_name)
         self.assertEqual(result["target_instance"], target_name)
         self.assertEqual(result["chiefs"], 1)
+        evidence = result['source_job_evidence']
+        self.assertEqual(evidence['handover_id'], result['handover_id'])
+        self.assertEqual(evidence['source_uuid'], source_config['manager_uuid'])
+        self.assertEqual(evidence['target_uuid'], target_config['manager_uuid'])
+        self.assertEqual(evidence['jobs'], [
+            {'jobid': jobid, 'name':'handover-job', 'state':'PENDING'},
+        ])
         self.assertEqual(target.list_jobs()[0][0], jobid)
         self.assertEqual(target.health()["handover_mode"], "TARGET_MIGRATING")
 

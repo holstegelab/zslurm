@@ -137,10 +137,24 @@ partition (exact string), `reqtime ≤ engine.timeleft`, `ncpu ≤ cores`, `mem 
 SSD fits, **and each storage budget fits**. There is **no host affinity / data locality** —
 matching is partition + capacity + budget only.
 
-If a job fits the engine's *static* totals but not its *current* free space, it is
-**ASSIGNED** (reserved) rather than started; the engine holds it and calls
-`can_run_assigned_job()` once space frees (`zslurm:1216-1271`). An idle engine can even
-**steal** an ASSIGNED job from another via `DEASSIGN` (`zslurm:1155-1194`).
+**Current free capacity gate, 2 October 2026.** A new grant must fit both the
+engine's static totals and the currently advertised free CPU and memory.
+The manager checks this before admitting a candidate, during memory packing
+and immediately before each grant, including after earlier grants reduce
+the remaining capacity. Priority is preserved among fitting jobs. Nonfitting
+jobs stay PENDING, allowing a different pilot to claim them and allowing
+smaller fitting jobs beyond the candidate window to fill the residual slot.
+Previously a 30-core pilot could preclaim four eight-core jobs: the fourth
+was stranded ASSIGNED behind long-running work with only six cores free.
+This was reproduced and is covered by the capacity regression tests.
+
+ASSIGNED now describes an outstanding delivery/start acknowledgement, not
+intentional overscheduling. Changing free memory, temporary start failures
+or a lost RPC reply can still delay acknowledgement. Existing assigned grants
+can be recovered or moved to a fitting pilot via `DEASSIGN`; recovery retains
+their storage/transfer reservations rather than reserving those twice.
+The change is independent of Spider/Snellius node profiles, Slurm submission
+arguments, scientific job commands and the dynamic-lease protocol.
 
 ---
 

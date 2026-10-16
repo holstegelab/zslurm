@@ -122,7 +122,7 @@ def test_chief_keeps_assignment_until_ack_and_heartbeats_all_owned_grants():
     block = source[start:end]
 
     keep = block.index("status.assigned_jobs[jobid] = job")
-    acknowledge = block.index("permission = s.can_run_assigned_job")
+    acknowledge = block.index("permission = acknowledge_job_grant")
     release = block.index("status.assigned_jobs.pop(jobid, None)")
     assert keep < acknowledge < release
     assert "set(status.return_codes)" in source

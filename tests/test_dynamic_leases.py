@@ -880,6 +880,20 @@ class SchedulerPriorityTests(unittest.TestCase):
     def test_default_priority_is_100(self):
         job = self.add_job("1", "default")
         self.assertEqual(job.priority, 100)
+
+    def test_slurm_startup_waits_for_observed_walltime(self):
+        self.engine.cluster_id = '123'
+        job = self.add_job('long', 'two-day-task')
+        job.reqtime = 48 * 3600
+        # The default five-day placeholder is not evidence of allocated time.
+        self.assertEqual(self.dispatch_one(), [])
+        self.assertEqual(job.state, 'PENDING')
+        self.engine.slurm_state = 'R'
+        self.engine.timeleft = 30 * 3600
+        self.assertEqual(self.dispatch_one(), [])
+        short = self.add_job('short', 'one-hour-task')
+        assigned = self.dispatch_one()
+        self.assertEqual([row[0] for row in assigned], [short.jobid])
         self.assertEqual(self.zslurm.DEFAULT_JOB_PRIORITY, 100)
 
     def test_higher_pipeline_priority_precedes_earlier_job(self):

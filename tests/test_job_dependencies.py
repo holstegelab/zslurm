@@ -5,6 +5,7 @@ import pathlib
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 ZSLURM_PATH = pathlib.Path(__file__).resolve().parents[1] / "zslurm"
@@ -83,6 +84,73 @@ class JobDependencyTests(unittest.TestCase):
 
     def dependency_state(self, job):
         return self.jobs.dependency_status(job)["state"]
+
+    def test_conditional_cancel_preserves_jobs_that_started_since_observation(self):
+        for state in ('ASSIGNED', 'RUNNING'):
+            with self.subTest(state=state):
+                job = self.submit(requeue=3)
+                job.state = state
+                with mock.patch.object(self.zslurm.engines, 'send_command') as send:
+                    result = self.jobs.cancel_job(job.jobid, False, 'PENDING')
+                self.assertEqual(result, dict(cancelled=False, jobid=job.jobid, state=state))
+                self.assertIs(self.jobs.jobs_by_id[job.jobid], job)
+                self.assertEqual(job.requeue, 3)
+                send.assert_not_called()
+
+    def test_conditional_cancel_is_terminal_and_missing_job_is_noop(self):
+        job = self.submit(requeue=3)
+        result = self.jobs.cancel_job(job.jobid, False, 'PENDING')
+        self.assertEqual(result, dict(cancelled=True, jobid=job.jobid, state='CANCELLED'))
+        self.assertNotIn(job.jobid, self.jobs.jobs_by_id)
+        self.assertEqual(self.jobs.cancel_job(job.jobid, False, 'PENDING'),
+                         dict(cancelled=False, jobid=job.jobid, state=None))
+
+    def test_conditional_cancel_rejects_other_states_or_requeue(self):
+        job = self.submit()
+        for requeue, state in ((False, 'RUNNING'), (False, 'ASSIGNED'),
+                               (True, 'PENDING'), (True, 'REQUEUED')):
+            with self.assertRaises(ValueError):
+                self.jobs.cancel_job(job.jobid, requeue, state)
+        self.assertIn(job.jobid, self.jobs.jobs_by_id)
+
+    def test_requeued_compare_and_cancel_is_terminal_without_signalling_workers(self):
+        parent = self.submit(requeue=3)
+        child = self.submit('child', 'afterok:'+parent.jobid)
+        self.jobs.job_done(parent.jobid, 1)
+        self.assertEqual(parent.state, 'REQUEUED')
+        with mock.patch.object(self.zslurm.engines, 'send_command') as send:
+            reply = self.jobs.cancel_job(parent.jobid, False, 'REQUEUED')
+        self.assertEqual(reply, dict(cancelled=True, jobid=parent.jobid, state='CANCELLED'))
+        self.assertNotIn(parent.jobid, self.jobs.jobs_by_id)
+        self.assertEqual(self.jobs.get_job_states([parent.jobid])['states'][parent.jobid], 'CANCELLED')
+        self.assertEqual(self.dependency_state(child), 'never_satisfied')
+        send.assert_not_called()
+        self.assertEqual(self.jobs.cancel_job(parent.jobid, False, 'REQUEUED'),
+                         dict(cancelled=False, jobid=parent.jobid, state=None))
+
+    def test_requeued_guard_does_not_cancel_after_dispatch_or_another_state_change(self):
+        for state in ('PENDING', 'ASSIGNED', 'RUNNING'):
+            with self.subTest(state=state):
+                job = self.submit(requeue=3)
+                job.state = state
+                with mock.patch.object(self.zslurm.engines, 'send_command') as send:
+                    reply = self.jobs.cancel_job(job.jobid, False, 'REQUEUED')
+                self.assertEqual(reply, dict(cancelled=False, jobid=job.jobid, state=state))
+                self.assertIs(self.jobs.jobs_by_id[job.jobid], job)
+                self.assertEqual(job.requeue, 3)
+                send.assert_not_called()
+
+    def test_pending_guard_still_requires_exact_pending_state(self):
+        job = self.submit(requeue=3)
+        self.jobs.job_done(job.jobid, 1)
+        self.assertEqual(self.jobs.cancel_job(job.jobid, False, 'PENDING'),
+                         dict(cancelled=False, jobid=job.jobid, state='REQUEUED'))
+        self.assertIn(job.jobid, self.jobs.jobs_by_id)
+
+    def test_health_advertises_exact_safe_conditional_cancel_states(self):
+        health = self.zslurm.health()
+        self.assertTrue(health['conditional_pending_cancel'])
+        self.assertEqual(health['conditional_cancel_states'], ['PENDING', 'REQUEUED'])
 
     def test_parser_supports_and_or_delay_and_bare_afterany(self):
         parse = self.zslurm.parse_job_dependency

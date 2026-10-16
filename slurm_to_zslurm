@@ -12,12 +12,25 @@ if [[ -n "${ZSLURM_ENGINE_ENV_BIN:-}" ]]; then
     export PATH="${ZSLURM_ENGINE_ENV_BIN}:${PATH}"
 fi
 
+run_chief() {
+    local chief=$1
+    shift
+    if [[ -n "${ZSLURM_ENGINE_PYTHON:-}" ]]; then
+        if [[ ! -x "${ZSLURM_ENGINE_PYTHON}" ]]; then
+            echo "slurm_to_zslurm: ZSLURM_ENGINE_PYTHON is not executable" >&2
+            exit 127
+        fi
+        exec "${ZSLURM_ENGINE_PYTHON}" "${chief}" "$@"
+    fi
+    exec "${chief}" "$@"
+}
+
 if [[ -n "${ZSLURM_CHIEF_PATH:-}" ]]; then
-    exec "${ZSLURM_CHIEF_PATH}" "$@"
+    run_chief "${ZSLURM_CHIEF_PATH}" "$@"
 elif [[ -x "${launcher_dir}/zslurm_chief" ]]; then
-    exec "${launcher_dir}/zslurm_chief" "$@"
+    run_chief "${launcher_dir}/zslurm_chief" "$@"
 elif command -v zslurm_chief >/dev/null 2>&1; then
-    exec zslurm_chief "$@"
+    run_chief "$(command -v zslurm_chief)" "$@"
 fi
 
 echo "slurm_to_zslurm: zslurm_chief is not installed next to the launcher or on PATH" >&2

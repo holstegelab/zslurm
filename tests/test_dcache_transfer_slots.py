@@ -86,19 +86,18 @@ class DcacheTransferSlotTests(unittest.TestCase):
         self.assertEqual(self.jobs.dcache_upload_inuse, 4)
         self.assertEqual(transfer_jobs[4].state, "PENDING")
 
-        # Simulate loss of the first request_jobs response. The four grants
-        # already hold all transfer slots but must still be returned for the
-        # acknowledgement retry rather than being double-counted.
+        # The four ASSIGNED grants already hold all slots. Retrying after a
+        # lost request_jobs reply must return them without double-counting.
         retried = self.jobs.request_jobs("test-node", 32, 128000, "compute")
         self.assertEqual(
             {row[0] for row in retried},
             {job.jobid for job in transfer_jobs[:4]},
         )
-
         for job in transfer_jobs[:4]:
             self.assertTrue(self.jobs.can_run_assigned_job(
                 "test-node", job.jobid
             ))
+
         self.jobs.job_done(transfer_jobs[0].jobid, self.zslurm.RC_SUCCESS)
         assigned = self.jobs.request_jobs("test-node", 28, 127600, "compute")
 
@@ -125,7 +124,9 @@ class DcacheTransferSlotTests(unittest.TestCase):
 
     def test_assigned_job_releases_slot_when_engine_disappears(self):
         transfer = self.add_job("transfer", 1)
-        assigned = self.jobs.request_jobs("test-node", 0, 0, "compute")
+        # The test is about releasing an existing grant, not overassigning a
+        # task when the pilot has no free CPU or memory.
+        assigned = self.jobs.request_jobs("test-node", 1, 100, "compute")
 
         self.assertEqual(len(assigned), 1)
         self.assertEqual(transfer.state, "ASSIGNED")

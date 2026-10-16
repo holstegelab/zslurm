@@ -25,11 +25,12 @@ python -m pip install .
 ```
 
 Install the manager and worker entry points into the same environment. The
-Slurm engine launcher resolves `zslurm_chief` next to itself, so the same
-installation works on Snellius and Spider without a hardcoded conda path. For
-a relocated environment whose `bin` directory is not inherited by `sbatch`,
-export `ZSLURM_ENGINE_ENV_BIN=/path/to/environment/bin` before starting the
-manager.
+manager resolves the pilot launcher, `zslurm_chief`, and its Python interpreter
+before calling `sbatch`, then exports their exact paths to the pilot. This is
+portable across Snellius and Spider even though Slurm copies the launcher to a
+spool directory. `ZSLURM_ENGINE_LAUNCHER`, `ZSLURM_CHIEF_PATH`,
+`ZSLURM_ENGINE_PYTHON`, and `ZSLURM_ENGINE_ENV_BIN` remain explicit overrides
+for relocated or deliberately split installations.
 
 Check the installed manager and pilot binaries before starting an instance:
 
@@ -43,25 +44,32 @@ version in `zsnodes --json`. At registration it warns in `cluster.log` and
 the UI if a chief reports a different version or no version at all. A new
 chief also warns when connected to an older manager without versioned
 registration. These warnings do not stop pilots; replace old pilots during a
-planned drain. Bump `VERSION` in `zslurm_version.py` when deploying changed
-manager or chief code.
+planned drain. Bump both `VERSION` in `zslurm_version.py` and the package
+version in `setup.py` when deploying changed manager or chief code; a test
+requires them to match.
 
-Site templates are available under `config/sites/`:
+On Spider, preview and add missing site settings without overwriting existing
+values or comments:
 
 ```bash
-mkdir -p ~/.zslurm
-cp config/sites/spider.yaml ~/.zslurm/config.yaml    # on Spider
-# or: cp config/sites/snellius.yaml ~/.zslurm/config.yaml
+zslurm --update-config spider --dry-run
+zslurm --update-config spider
 ```
 
-Review autogrow and storage limits before starting the manager. The Spider
-template enables autogrow with a cap of 15 partial 30-core compute pilots.
+The command uses `~/.zslurm/config.yaml`, or the legacy `~/.zslurm` YAML file
+when present. It makes a timestamped backup before changing an existing file,
+keeps existing values even when they differ from the template, and reports
+those key names without printing their values. Review conflicts manually;
+rerunning the command will not override them. It does not restart or reconfigure
+a running manager. The Spider template enables autogrow with a cap of 15
+partial 30-core compute pilots on the next manager start, so review those
+settings first.
 
-ZSlurm also supports the original Spider layout where `~/.zslurm` itself is
-a YAML configuration file. In that case the legacy file remains the active
-configuration and per-instance/runtime state is written to `~/.zslurm.d/`.
-Merge the relevant values from `config/sites/spider.yaml` into the existing
-file; do not replace it with a directory.
+Site templates remain available under `config/sites/` for manual review. For
+Snellius, copy or merge `config/sites/snellius.yaml` into
+`~/.zslurm/config.yaml` as appropriate. In the original Spider layout where
+`~/.zslurm` itself is a YAML file, it remains the active configuration and
+per-instance/runtime state is written to `~/.zslurm.d/`.
 
 The environment file includes the base runtime dependencies for ZSlurm,
 including `pyyaml` and `tabulate`, plus `setuptools` as an explicit build
@@ -103,6 +111,90 @@ zslurm
 
 4. Inspect jobs with `zsqueue` and nodes with `zsnodes`.
 
+## GPU jobs (0.3.0)
+
+One maintained manager can own `compute`, `archive` and `gpu` workers. The
+GPU implementation was ported from the CCS/DeepConsensus checkout, retaining
+main's dependencies, retry-safe grants, leases, portable pilot launchers and
+explicit handover. It does **not** merge two existing populated managers or
+automatically replace their running binaries.
+
+```bash
+zsbatch --instance MY_MANAGER -p gpu --gpus 1 -c 4 --mem 131072 \
+  -t 04:00:00 -- ./deepconsensus.sh
+```
+
+GPU jobs default to one device; CPU/archive jobs default to zero. Positive
+`--gpus` requires `-p gpu`. A GPU job is placed only when its devices, CPU,
+memory, scratch requirements, dependencies and estimated runtime all fit on
+one GPU worker. Two GPUs on different workers cannot satisfy a two-GPU job.
+CPU demand never requests a GPU worker. CPU and GPU worker caps are separate.
+
+Physical routes and allocation shapes remain site configuration. Spider's
+default GPU route is `gpu_a100_22c`; Snellius's is `gpu_a100` (override it, for
+example with `gpu_h100`, together with that partition's profile). Absent routes
+are disabled when `sinfo` discovery succeeds. No GPU allocation shape is
+guessed: configure `cores`, `mem_gb`, `gpus`, and optionally `gpu_type` before
+starting workers. This is the allocation used by the existing Spider CCS run:
+
+```yaml
+gpu_partition: gpu_a100_22c
+autogrow_max_gpu_nodes: 5
+consolidation_min_gpu_engines: 0
+node_profiles:
+  # Merge with existing CPU profiles; do not remove them.
+  gpu_a100_22c:
+    cores: 44
+    mem_gb: 320
+    gpus: 2
+    gpu_type: a100
+```
+
+`mem_gb` follows existing node-profile units (GiB; converted to Slurm MB).
+GPU workers use the configured CPU/RAM request and `--gres=gpu:a100:2`, not
+the CPU pool's partial/exclusive shape. Review core-to-memory requirements at
+the site. Optional `has_ssd`/`ssd_gb` describe GPU-worker scratch. The shipped
+site templates set `autogrow_max_gpu_nodes: 0`: GPU growth is opt-in, demand
+backed, counts already queued/held allocations, has its own cooldown, and
+never grows from dependency/storage/transfer-blocked or unserviceable jobs.
+Short remaining pilot leases do not hide long-job demand. Backfill shortening
+must retain enough time for the requests being placed.
+
+Manual `d` accepts the logical `gpu` route or a configured physical partition.
+`o gpu +1` drains one GPU worker; `o gpu -1` restores one. Automatic GPU
+consolidation preserves every busy worker (including unacknowledged grants),
+retires only unused idle capacity, and cancels surplus queued tasks with a
+PENDING-only Slurm filter. It never cancels a whole array or releases an
+administrative hold. New demand restores automatic drains, not manual drains.
+
+Devices are reserved at grant time, retained while a start is deferred, and
+released after completion/failure or a rejected start. Lost replies replay
+the same device assignment; retrying GPU submissions is idempotent. Start
+acknowledgements must match the exact grant's device IDs, so a stale
+pre-handover grant cannot start on a subsequently reassigned device. CPU/RAM
+lease resizing does not release devices. Explicit handover preserves running
+GPU assignments and requeues unstarted grants, and rejects CPU-only targets.
+The separate legacy CCS checkpoint/restart mechanism is not transplanted.
+
+The chief sets worker-local `CUDA_VISIBLE_DEVICES`, NVIDIA visibility and
+Apptainer/Singularity overrides; CPU children see no GPUs. This is cooperative
+visibility, **not** a separate per-job device cgroup/security boundary.
+`zsqueue --json`, `zsnodes --json`, detailed job RPCs, queue statistics and
+the manager UI expose device counts/assignments. Legacy 14/15-field job and
+25-field node RPC rows remain unchanged unless GPU fields are requested.
+
+Install the same 0.3.0 release for manager, chiefs and GPU clients before
+rollout. New GPU clients/chiefs refuse old managers. Old CPU client/registration
+arguments remain valid; the positional GPU protocol of the old CCS fork is
+explicitly rejected (its GPU-count argument occupied main's idempotency-token
+position). Do not deploy by overwriting a checkout that live processes import.
+Qualify the release separately, then plan a staged rollout; mock scheduling
+tests do not establish CUDA/container/hardware correctness.
+
+The source GPU helper used for the port had SHA256
+`468dbb3d3197778254322b77675e0c41c267e8788d557672df914c8b8a4f1d9d`;
+it came from the uncommitted CCS checkout inspected on 13 October 2026.
+
 ## Interactive manager controls
 
 Inside the `zslurm` curses UI:
@@ -130,6 +222,44 @@ Inside the `zslurm` curses UI:
 - **`q`**: Stop the manager
 
 When starting Slurm engines, entering `staging` maps to archive-oriented engines used for transfer/archive work.
+
+Workflow coordinators that legitimately wait on queued child jobs can explicitly
+submit `ZSLURM_JOB_MONITOR_ROLE=controller` in their job environment. Updated
+chiefs retain resource accounting and cancellation but do not terminate these
+jobs solely for low CPU/I/O activity. Ordinary jobs keep the configured stuck
+detection. The launch option is removed from the child environment so it cannot
+silently exempt the coordinator's subsequently submitted scientific jobs.
+`compute` explicitly selects normal detection; other values are rejected before
+launch. This is site-independent (Spider and Snellius). Already running or old
+chiefs are not modified by a software update; rolling deployment is required.
+From release 0.2.4, an updated manager places explicitly tagged controllers only
+on chiefs reporting 0.2.4 or later. Older/unversioned chiefs keep processing
+ordinary work; they are not stopped. Existing running tasks are unaffected.
+This prevents a recovered controller from silently receiving the old heuristic
+during a mixed-version rollout. Ensure an updated pilot is available; the tag
+does not itself replace already queued legacy pilot allocations.
+
+From release 0.2.5, an operator can also explicitly register an application-owned
+controller namespace with the authenticated manager RPC
+`register_controller_owner_prefix(token, "my-controller:")`. This is a literal
+prefix of the job's **owner**, not its name, cwd, command, or inherited environment.
+Registration is additive and idempotent; it tags matching queued and future jobs
+with the same controller launch option and survives manager handover. Ordinary
+scientific jobs must use a different owner namespace. The default registry is
+empty on every site, including Spider and Snellius. Explicit conflicting roles
+and untagged in-flight grants cause registration to fail before any change.
+Running jobs are reported but left untouched; this cannot retroactively protect
+a running controller on an old chief. Tagged jobs still require a chief >=0.2.4,
+normal resources, satisfied dependencies, and sufficient allocation time.
+
+The manager RPC `cancel_job(jobid, False, expected_state)` supports exact
+compare-and-cancel for `PENDING` and `REQUEUED`. The state check and cancellation
+share the dispatch lock: a job that became assigned or running is left alone,
+without signalling a worker. A successful cancellation is terminal, including
+when retries remain. Clients must check `health()['conditional_cancel_states']`
+before using `REQUEUED`; older managers advertise only the legacy
+`conditional_pending_cancel` capability. Never fall back to unconditional
+cancellation after a rejected comparison. This behavior is site-independent.
 
 On Snellius, starting Slurm engines also offers an SSD scratch-node reservation prompt. For regular partitions, the UI asks for:
 
@@ -269,17 +399,18 @@ Phasing out means:
 
 #### Backfilling a phasing-out engine
 
-A phased-out engine holds its node until its **last** job ends. When that job still
-has hours to run, the rest of the node would otherwise sit idle for those hours, so
-the engine may still accept work that is certain to finish first -- it then stops at
-about the moment it would have stopped anyway.
+A phased-out engine holds its node until its **last** job ends. For consolidation
+or manual draining, backfill must fit inside the estimated remaining work, so it
+does not deliberately delay releasing surplus capacity. For **end-of-life**
+draining, the constraint is instead the remaining Slurm lease: the early default
+12-hour drain marker does not blacklist a four-hour job on a busy pilot with ten
+hours left. This can extend its useful life, but never its allocation.
 
 This is deliberately conservative and falls back to refusing everything, exactly as
 before, unless all of these hold:
 
 - `phaseout_backfill_enable` is on
-- the engine is **not** draining because its node walltime is nearly up -- that one is
-  already racing a hard kill
+- the engine is not stopping
 - the engine still has running work, since letting an empty one die is the point
 - at least `phaseout_backfill_min_window_sec` (default 1 h) remains after subtracting
   `phaseout_backfill_margin_sec` (default 30 min)
@@ -287,6 +418,9 @@ before, unless all of these hold:
 The window is also capped by the node's own remaining walltime minus the same margin,
 and every job still has to satisfy `job_walltime_buffer_sec` on top, so a backfilled
 job needs roughly 45 minutes of slack before it is allowed to start.
+These are scheduling estimates, not guarantees that a job cannot overrun. Empty
+pilots still stop, and the minimum queue age, actual free cores/memory, dependency
+and controller-version checks remain in force on both Spider and Snellius.
 
 #### Fitting jobs to remaining walltime
 
@@ -306,6 +440,21 @@ Autoconsolidation also includes safeguards such as:
 
 If there are still eligible queued jobs, consolidation may be skipped so that useful capacity is not removed too aggressively.
 
+Headless managers expose the same toggle through an identity- and state-checked
+control RPC (requires version 0.2.8 or newer). Inspect `zscontrol status` and
+manager health first, then explicitly supply the observed UUID and old setting:
+
+```bash
+zscontrol --instance MY_PRIMARY consolidate on --expect off --manager-uuid OBSERVED_UUID
+```
+
+This changes only the existing demand-aware consolidation policy; it does not
+cancel a job, change its runtime, or resize an allocation. Running jobs drain
+normally before an excess engine stops. Forwarders, in-progress handovers,
+stale identities and changed old settings are rejected; inspect a lost response
+before retrying. The setting is retained through subsequent manager handovers.
+The control and retirement policy are shared by Spider and Snellius.
+
 ### Autogrow (`g`)
 
 Autogrow does the opposite of consolidation: it starts new Slurm-backed engines when the current eligible queue suggests that more capacity is really needed.
@@ -322,13 +471,18 @@ The autogrow controller:
 - caps every new engine at the next applicable Slurm `MAINT` reservation and
   gives the job a matching Slurm deadline
 
-This means autogrow is not triggered by every pending job. It is triggered when there is meaningful unmet demand after considering:
+This means autogrow is not triggered by every pending job. It is triggered by positive unmet CPU or memory demand, even below one node, after considering:
 
 - work already fitting on current engines
 - work that will fit on already queued engines
 - global archive/active/dcache constraints
 
 So if jobs are pending only because a global storage quota is full, autogrow will not solve that problem by launching more nodes.
+
+A small eligible backlog can unlock a large downstream DAG and must not wait
+for a full node's worth of jobs to accumulate behind long-running work. Already
+queued capacity still suppresses duplicate growth. Consolidation, cooldowns and
+the node cap remain separate controls; enabling growth does not disable them.
 
 #### Maintenance windows
 
@@ -342,20 +496,35 @@ users, and `sbatch --test-only` is not a usable substitute, because it reports t
 for, and an inference built on it concludes "no maintenance" precisely when a
 window is imminent.
 
-Instead every allocation is submitted with both a maximum and a minimum walltime:
+With the Snellius maintenance policy, pilot allocations are submitted with both
+a maximum and a minimum walltime:
 
 ```text
 sbatch -t 5-00:00:00 --time-min 12:00:00 ...
 ```
 
-Slurm then starts the job in the first slot that fits and truncates `TimeLimit`
-to exactly the time available before the next reservation, so allocations are
-self-sizing and the boundary is simply `StartTime + TimeLimit` of the resulting
-job. Below `maintenance_time_min_sec` (default **12 hours**) the job stays queued
+Slurm may shorten `TimeLimit` to let the allocation backfill; this does not
+guarantee an immediate start or bypass priority. The resulting boundary is
+`StartTime + TimeLimit`. Below `maintenance_time_min_sec` (default **12 hours**)
+the job stays queued
 instead: a shorter engine spends more on startup and drain than it gives back,
 and the capacity comes back by itself once the window has passed. Autogrow
-workers, manually requested engines and the coordinator's manager node all go
-through the same path.
+workers and manually requested engines use this policy; separately submitted
+manager allocations have their own walltime settings.
+
+Spider instead enables a workload-aware floor for **compute autogrow only**.
+It uses the larger of the configured useful minimum (12 hours), the longest
+runnable request plus headroom, and the end-of-life drain horizon plus headroom.
+Headroom defaults to one hour and is never less than the job placement margin.
+With the default 12-hour drain horizon, six-hour work therefore permits a
+13-hour allocation; 48-hour work requires at least 49 hours. Dependencies that
+are not ready and jobs exceeding the maximum pilot runtime do not raise this
+floor. When the floor reaches the requested maximum, `--time-min` is omitted
+and the full duration is required. The maximum, core/memory request, scientific
+job runtimes and existing demand/cap/idle guards are unchanged. Actual job
+placement still checks remaining time, including after the queue changes.
+Manual/staging Spider pilots and Snellius defaults are unchanged; the new
+policy is separately configurable on either site.
 
 There is also separate staging/archive-oriented autogrow behavior for `staging` engines when archive jobs are waiting.
 
@@ -410,6 +579,9 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - Slurm partition name used for archive/staging-oriented engines
 - **`enable_ssd_prompt`**
   - whether the interactive UI asks about SSD-capable nodes
+- **`enable_feature_prompt`**
+  - whether the manual-engine dialog asks for an arbitrary Slurm feature;
+    Spider disables this because its normal nodes expose local scratch
 - **`ssd_feature_name`**
   - Slurm feature/constraint string used for SSD-capable nodes
 - **`autogrow_prefer_partitions`**
@@ -420,9 +592,32 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - default CPU count for manually started pilots; `0` requests an exclusive
     node
 - **`autogrow_engine_cores`**
-  - CPU count for automatically started pilots; `0` requests an exclusive node
+  - CPU count for automatically started pilots, or their upper bound when
+    `autogrow_dynamic_engine_cores` is enabled; `0` requests an exclusive node
+- **`autogrow_dynamic_engine_cores`** / **`autogrow_engine_min_cores`**
+  - size partial pilots between the configured minimum and
+    `autogrow_engine_cores` from runnable CPU and memory demand
+- **`autogrow_require_idle_nodes`**
+  - require a wholly idle Slurm node before submitting an autogrow pilot;
+    Spider disables this for partial pilots so Slurm can place them on mixed
+    nodes or queue them until capacity becomes available
+- **`autogrow_engine_memory_mb_per_core`**
+  - hard Slurm memory grant per requested pilot core; required for memory-aware
+    dynamic sizing
+- **`autogrow_engine_memory_headroom_fraction`**,
+  **`autogrow_engine_memory_cap_fraction`** and
+  **`autogrow_engine_memory_static_reserve_mb`**
+  - mirror the chief's advertised-memory envelope while sizing and accounting
+    for queued partial pilots
 - **`autogrow_enable`** / **`autogrow_max_compute_nodes`**
   - whether automatic allocation is initially enabled and its hard fleet cap
+- **`autogrow_require_idle_nodes`**
+  - optional, defaults to `false`: let Slurm queue demand-backed pilots even
+    when no completely idle nodes are reported; idle capacity still influences
+    partition preference. Queued pilots count against residual demand and the
+    fleet cap. Set `true` only for a site policy requiring immediately idle nodes.
+    A plain-only site such as Spider is not subject to the scratch-preference
+    fraction cap when no scratch partition is configured.
 - **`autogrow_fallback_partition`**
   - partition to fall back to if no preferred autogrow partition scores better
 - **`autogrow_fat_partitions`**
@@ -442,11 +637,36 @@ The manager now reads the following cluster-policy keys from `~/.zslurm/config.y
   - that floor: the shortest allocation still worth having. Below it the job stays
     queued until the window has passed, instead of starting and dying immediately
     (default `43200`, i.e. 12 hours)
+- **`autogrow_time_min_enable`**
+  - workload-aware `--time-min` for compute autogrow, overriding the legacy
+    maintenance floor only on that path (default true on Spider, false elsewhere)
+- **`autogrow_time_min_sec`**
+  - minimum useful allocation before workload/drain constraints (default `43200`)
+- **`autogrow_time_min_headroom_sec`**
+  - startup/placement headroom, at least the job walltime buffer (default `3600`,
+    minimum `60`); add this to the longest runnable job and the drain horizon
 - **`job_walltime_buffer_sec`**
   - slack a job's `reqtime` must leave inside an engine's remaining walltime before
     it may start there (default `900`)
+- **`capacity_wait_min_age_sec`**, **`capacity_wait_max_sec`**, **`capacity_wait_cooldown_sec`**
+  - defaults `600`, `1800`, `300` seconds. If an older higher-priority job fits
+    a pilot's total resources but not its current free CPU/memory, one busy
+    pilot per logical partition can temporarily accumulate its required slot
+    instead of continually refilling each small hole with lower-priority work.
+    Surplus can still backfill; equal/higher-priority work is not blocked.
+  - The job remains PENDING, available to other pilots and autogrowth. No
+    grant, storage, SSD or transfer reservation is made until it actually fits.
+    Dependencies, time remaining, SSD and transfer/storage gates still apply.
+    The wait expires within `capacity_wait_max_sec` (or remaining usable pilot
+    time), followed by a cooldown; set the maximum to `0` to disable it.
+  - This bounds deliberate idle capacity, not waiting time or runtime. It is
+    not a fair-share guarantee for equal-priority jobs. Running dynamic leases
+    retain their existing rights; the soft hint is recomputed after handover.
+    The policy uses the actual pilot shape, including fractional CPU requests,
+    with no Spider/Snellius hostname or node-size assumptions.
 - **`phaseout_backfill_enable`**
-  - let a phasing-out engine still accept work that finishes before its last job does
+  - let a busy phasing-out engine accept work fitting its drain estimate, or its
+    remaining lease for end-of-life draining
 - **`phaseout_backfill_margin_sec`**
   - safety margin subtracted from both the drain estimate and the node walltime when
     sizing that backfill window (default `1800`)
@@ -520,26 +740,38 @@ staging_autogrow_burst_nodes: 4
 
 ### Spider example
 
-Spider grants schedulable memory through allocated cores
-(`DefMemPerCPU=8000`). The supplied `config/sites/spider.yaml` therefore uses
-30-core/240-GB partial pilots. This is deliberately an allocation profile, not
-the physical 960-GB or 1440-GB node size:
+Spider grants memory through allocated cores (`DefMemPerCPU=8000`). The
+supplied `config/sites/spider.yaml` therefore treats 30 cores/240 GB as a
+partial-pilot upper bound. Autogrow sizes a smaller request when the runnable
+demand fits one such pilot; for example, a 1-core/8-GB logical task needs a
+2-core pilot because the chief retains its configured memory headroom. Larger
+backlogs still use the 30-core ceiling. This is an allocation profile, not the
+physical 960-GB or 1440-GB node size:
 
 ```yaml
 cluster_site: spider
 default_partition: normal
-ssd_feature_name: ssd
-ssd_scratch_root: "$TMPDIR"
-ssd_capacity_gb: 2200
+staging_partition: __disabled__
+staging_autogrow_enable: false
+enable_feature_prompt: false
 enable_ssd_prompt: true
+ssd_feature_name: ssd
+scratch_use_tmpdir: true
+scratch_capacity_gb_per_core: 73
+gpfs_io_enable: false
 default_engine_cores: 30
 autogrow_engine_cores: 30
+autogrow_dynamic_engine_cores: true
+autogrow_require_idle_nodes: false
+autogrow_engine_min_cores: 2
+autogrow_engine_memory_mb_per_core: 8000
+autogrow_engine_memory_headroom_fraction: 0.08
+autogrow_engine_memory_cap_fraction: 0.99
+autogrow_engine_memory_static_reserve_mb: 100
 node_profiles:
   normal:
     cores: 30
     mem_gb: 240
-autogrow_prefer_partitions:
-  - [normal, true]
 autogrow_enable: true
 autogrow_max_compute_nodes: 15
 maintenance_window_enable: false
@@ -548,12 +780,29 @@ maintenance_window_enable: false
 The chief derives its final schedulable memory from the Slurm environment and
 cgroup, so a site or partition with a different memory-per-core grant is never
 allowed to advertise the physical node's complete RAM accidentally.
-Spider's chief likewise validates the allocation-local `$TMPDIR`, advertises
-at most 2200 GiB per 30-core pilot, and gives each child job a private directory
-below it. This stays just below Spider's documented 80-decimal-GB-per-core
-scratch entitlement. Compute autogrow considers both
-IDLE nodes and 30-core slots remaining on MIXED nodes, and submits pilots with
-`--constraint=ssd`.
+
+Spider binds node-local XFS to `TMPDIR=/tmp` inside each Slurm allocation.
+`scratch_use_tmpdir` is deliberately site-specific: without it, a chief never
+mistakes ordinary system `/tmp` for schedulable SSD. The chief creates a private
+mode-0700 `.zslurm/jobs/job-<zslurm-id>-<suffix>` directory for every child
+attempt, exports it
+as `ZSLURM_SCRATCH_DIR`, points the standard temp variables there, and removes
+only that directory when the child ends. A per-core capacity cap prevents
+multiple partial pilots on one node from each advertising the complete 12-TiB
+device. The supplied 73-GiB/core cap stays below Spider's documented
+80-decimal-GB/core entitlement; a 30-core pilot advertises at most 2190 GiB.
+The actual filesystem free space remains an additional hard bound.
+
+Manual pilot creation asks whether SSD scratch should be reserved. Enter or
+`yes` supplies `--constraint=ssd`; `no` omits it. Spider currently exposes the
+`ssd` feature on all normal nodes, so this is explicit without narrowing the
+current normal-node pool. Compute autogrow starts enabled and is capped at 15
+running-plus-queued pilots (at most 450 requested cores at the 30-core ceiling).
+
+Spider has no physical `staging` partition and its project filesystem is
+CephFS. The supplied site file therefore disables staging autogrow and GPFS
+RDMA telemetry. Archive-class input jobs require a separately implemented and
+tested Spider backend; dCache and S3 jobs continue to use compute pilots.
 
 ## Storage quotas as a global resource monitor
 
@@ -786,7 +1035,9 @@ set each tool's thread arguments consistently with the lease it acquires.
 
 The chief injects `ZSLURM_LEASE_SOCKET`, `ZSLURM_LEASE_TOKEN`,
 `ZSLURM_JOB_ID`, `ZSLURM_LEASE_MAX_CORES`, and
-`ZSLURM_LEASE_MAX_MEM_MB` into every child. The socket is node-local and mode
+`ZSLURM_LEASE_MAX_MEM_MB` into every child. On a scratch-capable pilot it also
+injects `ZSLURM_SCRATCH_ROOT` and the private `ZSLURM_SCRATCH_DIR`, and rewrites
+`TMPDIR`, `TMP`, `TEMP`, and `TEMPDIR` to the latter. The socket is node-local and mode
 `0600`; every request additionally requires the job-specific capability token.
 Jobs should use `zslurm_lease` rather than speaking the JSON protocol directly.
 
@@ -826,6 +1077,16 @@ budgets, leases, dependencies, scheduler settings, and Slurm-engine records. The
 old instance name is atomically changed into an alias for the new endpoint, and
 running chiefs reconnect without stopping their child processes.
 
+The manager bounds new grants by the smaller of the chief's reported free
+resources and the engine's actual remaining CPU/memory reservations. Running
+jobs count their current mutable leases, not immutable maxima; unacknowledged
+`ASSIGNED` grants already count at their initial shape. A lost grant reply
+replays the same engine's existing grants before assigning new work, without
+claiming their resources twice. Start acknowledgements and lease growth check
+the same holdings. This protects Spider and Snellius pilots when an older
+chief has stale free counters. A pre-existing overbooked pilot keeps its live
+children, but receives no additional work until its holdings fit again.
+
 The target must not contain jobs or engines, and a source with a local/unmanaged
 engine is rejected. Both managers must run a version that supports explicit
 handover. The equivalent gated control command is:
@@ -838,6 +1099,21 @@ After a successful handover, queued chiefs resolve the alias when they start;
 already-running chiefs receive a migration command and also follow the alias if
 the old manager exits before that command arrives.
 
+Do not retire the source forwarding process merely because all chiefs migrated.
+Older Snakemake ZSlurm executors cache their job-RPC URL and can keep polling the
+old endpoint even when discovery points elsewhere. Keep the source until those
+controllers exit or verify that their executor supports endpoint rediscovery on
+status failure (plugin commit `1f3ffe1` or later). Updating an installed package
+does not update objects already loaded by a running controller.
+
+If the source was already stopped, `zslurm_legacy_proxy.py` can restore only its
+legacy job-RPC endpoint, forwarding to the explicitly identified target manager.
+It requires the preserved source startup banner log, target instance name, and
+expected target manager UUID. It creates no queue or Slurm allocations and
+refuses nonlocal source addresses, direct forwarding loops and mismatched target
+identity. Keep its log private and retain the helper until legacy clients are
+gone. This is a compatibility bridge, not automatic recovery of a lost queue.
+
 ## Output files
 
 ZSlurm writes several useful files in the working directory of the manager or commands:
@@ -847,6 +1123,11 @@ ZSlurm writes several useful files in the working directory of the manager or co
 - **`lease_phases-YYYY-MM-DD_HH-MM.tsv`**: one row per lease interval/phase
 - **`cluster.log`**: manager log output
 - **`node_usage-YYYY-MM-DD_HH-MM.tsv`**: periodic node usage snapshots when node reports are enabled
+
+Unless a chief is started with `--keep`, successful child logs are removed after
+their resource report is recorded. Logs from every nonzero child exit are
+retained regardless of their text, so exceptions and tool failures remain
+available for diagnosis.
 
 ### `report-*.tsv`
 
@@ -1112,10 +1393,12 @@ Useful options:
 
 This makes `zsnodes` the best tool for checking whether engines are full, idle, unmanaged, stopping, or carrying SSD-constrained work.
 
-The curses status row uses `CPU/GPFS (%)`: the first value is host CPU busy;
-the second is the mean GPFS fabric utilization across reporting compute
-engines. GPFS traffic is measured from the byte counters on the RDMA port that
-Spectrum Scale is configured to use. `GPFS%` is
+When GPFS telemetry is enabled, the curses status row uses `CPU/GPFS (%)`: the
+first value is host CPU busy; the second is the mean GPFS fabric utilization
+across reporting compute engines. When it is disabled (as on Spider), the row
+is labeled `Host CPU (%)` and omits the inapplicable GPFS value. GPFS traffic is
+measured from the byte counters on the RDMA port that Spectrum Scale is
+configured to use. `GPFS%` is
 `max(receive_rate, transmit_rate) / link_rate`, because the fabric is full
 duplex. It is throughput utilization, not Linux IO-wait time. The old
 `sys_iowait_pct` metric remains available through `zsnodes` and node reports.
@@ -1284,6 +1567,18 @@ the interface design and phasing.
   `--no-autoconsolidate`, `--enable-control`, `--control-token TOKEN`, and
   `--instance-name NAME`. It prints a one-line JSON banner with the instance endpoint,
   then runs until SIGTERM.
+  On shutdown, failed Slurm cancellation requests are logged with their allocation
+  IDs and cause a nonzero manager exit. A failed request does not unregister the
+  engine in the cancellation operation. Even successful `scancel` requests are
+  reported as requests, not confirmed termination; inspect Slurm before assuming
+  allocations have ended. Logs must be retained for recovery after manager loss.
+  Silent chiefs are fenced against new assignments. Their jobs remain owned
+  until repeated fresh queue observations show absence and `sacct` confirms a
+  terminal state for the exact allocation. Missing or failed observations are
+  not termination evidence. This avoids requeueing onto a second worker while
+  the original may still be writing outputs; accounting delays can therefore
+  delay recovery. The controller no longer blocks for 60 seconds per chief
+  waiting for its own cached queue snapshot to change.
 - **`zsstatus`**: one JSON snapshot an agent polls — health, the three storage budgets,
   scheduler mode, queue, an engine summary, and derived **alarms** (`budget_stall`,
   `no_engines`, `oversized_pending`, `near_oom`).
