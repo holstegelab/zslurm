@@ -5,4 +5,4 @@ changed manager or chief code. A chief reports this value at registration
 so mixed installations are visible.
 """
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
