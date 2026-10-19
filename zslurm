@@ -256,6 +256,166 @@ def _consolidation_job_resources(job):
     return max(0.0, float(cpu)), max(0.0, float(mem_mb))
 
 
+def _consolidation_job_fits_engine(job, engine, walltime_buffer, now):
+    """Could this existing pilot accept the job after its occupants finish?
+
+    Unlike independent partition-wide CPU/RAM maxima, all placement properties
+    belong to the SAME pilot. Ordinary consolidation drains may be unphased by
+    this plan; end-of-life drains cannot, so only their bounded backfill window
+    counts. Free CPU/RAM is accounted for separately when choosing what to keep.
+    """
+    if (job.partition != engine.partition
+            or getattr(engine, 'stopping', False)):
+        return False
+    if (engine.cluster_id not in (None, False, '')
+            and (not engine.managed or engine.slurm_state != 'R')):
+        return False
+    if (isinstance(getattr(job, 'env', None), dict)
+            and job.env.get(MONITOR_ROLE_ENV) == 'controller'
+            and not controller_monitor_supported(engine.chief_version)):
+        return False
+    try:
+        timeleft = int(engine.timeleft)
+        if getattr(engine, 'end_of_life_drain', False):
+            timeleft = min(timeleft, int(phaseout_backfill_window(engine, now)))
+            if (now - float(getattr(job, 'submit_ts', now)) < float(
+                    status.config.get('phaseout_backfill_min_job_age_sec',
+                        getattr(status, 'phaseout_backfill_min_job_age_sec', 180.0)))):
+                return False
+        duration = float(job.reqtime) + walltime_buffer
+        cpu, mem = float(job.ncpu), float(job.mem)
+        if (not all(math.isfinite(v) for v in (duration, cpu, mem))
+                or duration > timeleft or cpu > float(engine.cores)
+                or mem > float(engine.totmem)
+                or getattr(job, 'ngpus', 0) > len(engine.gpu_devices)):
+            return False
+        ssd_use = str(getattr(job, 'ssd_use', 'no') or 'no')
+        has_ssd = bool(getattr(engine, 'has_ssd', False))
+        if ssd_use == 'required' and not has_ssd:
+            return False
+        if ssd_use in ('required', 'possible') and has_ssd:
+            need = max(0.0, float(getattr(job, 'ssd_gb', 0.0) or 0.0))
+            free = max(0.0, float(engine.ssd_total_gb)
+                       - float(engine.res_ssd_reserved_gb))
+            if need > free:
+                return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
+def _consolidation_pending_jobs(part_engines, now, pending_min_age_sec):
+    """Snapshot runnable demand and its actual existing-pilot placement set.
+
+    An unplaceable job remains queued for autogrow; it must not retain expired
+    pilots or consume this snapshot's transfer slots ahead of fitting backfill.
+    The caller holds jobs.lock so grants and storage/transfer reservations cannot
+    change halfway through the snapshot.
+    """
+    pending = []
+    if not part_engines:
+        return pending
+    part = part_engines[0].partition
+    walltime_buffer = float(status.config.get('job_walltime_buffer_sec',
+        getattr(status, 'job_walltime_buffer_sec', 900.0)))
+    download_available = max(0.0, jobs.dcache_download_total - jobs.dcache_download_inuse)
+    upload_available = max(0.0, jobs.dcache_upload_total - jobs.dcache_upload_inuse)
+    s3_download_available = max(0.0, jobs.s3_download_total - jobs.s3_download_inuse)
+    for job in list(jobs.jobs_by_id.values()):
+        if (job.partition != part or job.state not in queue_states
+                or not jobs._dependency_allows_run_locked(job)
+                or (part != 'archive' and hasattr(job, 'submit_ts')
+                    and now - float(job.submit_ts) < pending_min_age_sec)
+                or not all(jobs._resource_fits_locked(
+                    getattr(jobs, name + '_total'), getattr(jobs, name + '_inuse'),
+                    getattr(job, name + '_start_use_add'))
+                    for name in ('active', 'dcache', 'archive'))
+                or not jobs._dcache_transfer_fits_locked(job, download_available,
+                    upload_available, s3_download_available)):
+            continue
+        jobs._apply_owner_controller_role_locked(job)
+        fits = frozenset(engine.engine_id for engine in part_engines
+            if _consolidation_job_fits_engine(job, engine, walltime_buffer, now))
+        if not fits:
+            continue
+        pending.append((job, fits))
+        download_need, upload_need = jobs._dcache_slot_needs(job)
+        download_available -= download_need
+        upload_available -= upload_need
+        s3_download_available -= jobs._s3_download_slot_need(job)
+    return pending
+
+
+def _consolidation_keep_engines(engines_sorted, pending, held_jobs,
+                                safety_fraction, min_engines):
+    """Retain aggregate headroom only on pilots that can supply that demand.
+
+    This preserves the existing CPU/RAM safety-fraction approximation (it is not
+    a second job scheduler). Buckets have identical placement sets: a short
+    pilot can cover short demand, never the 48-hour demand of another pilot.
+    Busy engines and unacknowledged grants are pinned conservatively; canonical
+    holdings and chief reservation telemetry are maxed, not double-counted.
+    """
+    buckets = {}
+    for job, fits in pending:
+        demand = buckets.setdefault(fits, [0.0, 0.0])
+        cpu, mem = _consolidation_job_resources(job)
+        demand[0] += cpu
+        demand[1] += mem
+    for demand in buckets.values():
+        demand[0] *= safety_fraction
+        demand[1] *= safety_fraction
+    # Credit scarce placements first, before flexible requests use their slots.
+    demand_order = sorted(buckets, key=lambda fits: (len(fits), sorted(fits)))
+    holdings = defaultdict(lambda: [0.0, 0.0])
+    for job in held_jobs:
+        cpu, mem = _consolidation_job_resources(job)
+        holdings[job.node_id][0] += cpu
+        holdings[job.node_id][1] += mem
+    keep_ids = set()
+    reserved = {}
+    for engine in engines_sorted:
+        canonical = holdings.get(engine.engine_id, (0.0, 0.0))
+        cpu = max(canonical[0], float(getattr(engine, 'res_cpu_reserved', 0.0)))
+        mem = max(canonical[1], float(getattr(engine, 'res_mem_reserved_mb', 0.0)))
+        reserved[engine.engine_id] = (cpu, mem)
+        if (engine.engine_id in holdings or engine.jobs or cpu > 0.0 or mem > 0.0
+                or getattr(engine, 'res_ssd_reserved_gb', 0.0) > 0.0
+                or getattr(engine, 'gpu_allocations', None)):
+            keep_ids.add(engine.engine_id)
+    needed_cpu = int(math.ceil(sum(d[0] for d in buckets.values())
+                               + sum(r[0] for r in reserved.values()) * safety_fraction))
+    needed_mem = int(math.ceil(sum(d[1] for d in buckets.values())
+                               + sum(r[1] for r in reserved.values()) * safety_fraction))
+    # Their allocations cannot be released yet, so use pinned pilots' fitting
+    # free headroom before retaining additional idle engines in keep-score order.
+    supply_order = sorted(engines_sorted, key=lambda engine: engine.engine_id not in keep_ids)
+    for engine in supply_order:
+        held_cpu, held_mem = reserved[engine.engine_id]
+        free_cpu = max(0.0, float(engine.cores) - held_cpu * safety_fraction)
+        free_mem = max(0.0, float(engine.totmem) - held_mem * safety_fraction)
+        used = False
+        for fits in demand_order:
+            if engine.engine_id not in fits:
+                continue
+            demand = buckets[fits]
+            credit_cpu = min(free_cpu, demand[0])
+            credit_mem = min(free_mem, demand[1])
+            if credit_cpu > 0.0 or credit_mem > 0.0:
+                used = True
+            free_cpu -= credit_cpu
+            free_mem -= credit_mem
+            demand[0] -= credit_cpu
+            demand[1] -= credit_mem
+        if used:
+            keep_ids.add(engine.engine_id)
+    for engine in engines_sorted:
+        if len(keep_ids) >= min_engines:
+            break
+        keep_ids.add(engine.engine_id)
+    return [engine for engine in engines_sorted if engine.engine_id in keep_ids], needed_cpu, needed_mem
+
+
 
 # return codes
 RC_CANCELLED = -255
@@ -8352,56 +8512,12 @@ def thread_check_commands():
                     if not part_engines:
                         continue
 
-                    # Determine max capacity of any engine in this partition
-                    try:
-                        cap_cpu_max = max(int(getattr(e, 'cores', 0)) for e in part_engines)
-                        cap_mem_mb_max = max(float(getattr(e, 'totmem', 0.0)) for e in part_engines)
-                    except Exception:
-                        cap_cpu_max = 0
-                        cap_mem_mb_max = 0.0
-
-                    pending_eligible = []
-                    download_available = max(
-                        0.0,
-                        jobs.dcache_download_total - jobs.dcache_download_inuse,
-                    )
-                    upload_available = max(
-                        0.0,
-                        jobs.dcache_upload_total - jobs.dcache_upload_inuse,
-                    )
-                    s3_download_available = max(
-                        0.0,
-                        jobs.s3_download_total - jobs.s3_download_inuse,
-                    )
-                    for j in list(jobs.jobs_by_id.values()):
-                        if (
-                            j.partition == part
-                            and j.state in queue_states
-                            and jobs.dependency_status(j)["state"] == DEPENDENCY_SATISFIED
-                            and float(j.ncpu) <= float(cap_cpu_max)
-                            and float(j.mem) <= float(cap_mem_mb_max)
-                            and (
-                                part == 'archive'
-                                or not hasattr(j, 'submit_ts')
-                                or (now - float(getattr(j, 'submit_ts', now)) >= pending_min_age_sec)
-                            )
-                            and ((jobs.active_total >= (jobs.active_inuse + j.active_start_use_add)) or j.active_start_use_add == 0)
-                            and ((jobs.dcache_total >= (jobs.dcache_inuse + j.dcache_start_use_add)) or j.dcache_start_use_add == 0)
-                            and ((jobs.archive_total >= (jobs.archive_inuse + j.archive_start_use_add)) or j.archive_start_use_add == 0)
-                            and jobs._dcache_transfer_fits_locked(
-                                j, download_available, upload_available,
-                                s3_download_available
-                            )
-                            and (
-                                str(getattr(j, 'ssd_use', 'no') or 'no') != 'required'
-                                or jobs._any_ssd_engine_available(getattr(j, 'ssd_gb', 0.0))
-                            )
-                        ):
-                            pending_eligible.append(j)
-                            download_need, upload_need = jobs._dcache_slot_needs(j)
-                            download_available -= download_need
-                            upload_available -= upload_need
-                            s3_download_available -= jobs._s3_download_slot_need(j)
+                    with jobs.lock:
+                        pending_eligible = _consolidation_pending_jobs(
+                            part_engines, now, pending_min_age_sec)
+                        held_jobs = [j for j in jobs.jobs_by_id.values()
+                            if j.partition == part
+                            and j.state in ('RUNNING', 'ASSIGNED')]
                       
                     if pending_eligible and part == 'archive':
                         # archive/staging stays FIFO and is grown on demand, not
@@ -8420,29 +8536,6 @@ def thread_check_commands():
                             except Exception:
                                 pass
                         continue
-
-                    running_jobs = [
-                        j for j in list(jobs.jobs_by_id.values())
-                        if j.partition == part and j.state == "RUNNING"
-                    ]
-
-                    # Size the engines to KEEP for RUNNING work PLUS the eligible pending
-                    # backlog that could start right now. Sizing to running-only phased
-                    # out perfectly usable engines while jobs waited -- the exact
-                    # "phasing out while there is runnable work" bug that had to be undone
-                    # by hand. Budget-blocked / oversized / too-young pending jobs are
-                    # already excluded from pending_eligible above, so genuinely idle
-                    # excess (no runnable queue) still consolidates as before.
-                    demand_jobs = running_jobs + pending_eligible
-                    demand_resources = [
-                        _consolidation_job_resources(j) for j in demand_jobs
-                    ]
-                    total_req_cpu = sum(cpu for cpu, _mem in demand_resources)
-                    total_req_mem_mb = sum(
-                        mem_mb for _cpu, mem_mb in demand_resources
-                    )
-                    needed_cpu = max(0, int(math.ceil(total_req_cpu * safety_fraction)))
-                    needed_mem_mb = max(0, int(math.ceil(total_req_mem_mb * safety_fraction)))
 
                     drain_horizon = max(1.0, float(status.config.get(
                         "consolidation_drain_horizon_sec",
@@ -8471,20 +8564,9 @@ def thread_check_commands():
 
                     engines_sorted = sorted(part_engines, key=keep_score, reverse=True)
 
-                    keep = []
-                    acc_cpu = 0
-                    acc_mem_mb = 0
-                    for e in engines_sorted:
-                        if acc_cpu >= needed_cpu and acc_mem_mb >= needed_mem_mb:
-                            break
-                        keep.append(e)
-                        acc_cpu += int(e.cores)
-                        acc_mem_mb += int(e.totmem)
-
-                    if len(keep) < min_engines and part_engines:
-                        need_more = min_engines - len(keep)
-                        for e in engines_sorted[len(keep):len(keep)+need_more]:
-                            keep.append(e)
+                    keep, needed_cpu, needed_mem_mb = _consolidation_keep_engines(
+                        engines_sorted, pending_eligible, held_jobs,
+                        safety_fraction, min_engines)
 
                     keep_ids = set(e.engine_id for e in keep)
                     if dbg_consolidation:
