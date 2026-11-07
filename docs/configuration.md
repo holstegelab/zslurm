@@ -22,7 +22,7 @@ Explicit configuration overrides those defaults. See the
 | SSD feature | `scratch-node` | `ssd` | `scratch-node` |
 | Pilot CPU shape | Exclusive node | Partial, up to 30 cores for autogrow | Exclusive node |
 | Compute autogrow | Enabled, cap 40 | Enabled, cap 15 | Disabled |
-| Prefer idle nodes for autogrow (else queue one pilot) | Yes | No | Yes |
+| Require idle nodes for autogrow | No (queues on `genoa,rome`) | No | Yes |
 | GPU autogrow | Enabled, cap 1 | Enabled, cap 2 | Disabled |
 The Snellius node profiles are `genoa` (192 cores, 336 GiB), `rome` (128 cores,
 224 GiB), `fat_genoa` (192 cores, 1440 GiB) and `fat_rome` (128 cores, 960 GiB).
@@ -67,13 +67,10 @@ The manager reads the following cluster-policy keys from `~/.zslurm/config.yaml`
   - size partial pilots between the configured minimum and
     `autogrow_engine_cores` from runnable CPU and memory demand
 - **`autogrow_require_idle_nodes`**
-  - prefer a wholly idle Slurm node for autogrow pilots. When none is idle,
-    autogrow still queues **one** pilot and waits for Slurm to start it, and
-    requests no more while that pilot (or a held one) is pending, so a busy
-    cluster never collects several whole-node requests. Spider disables this
-    for partial pilots, which Slurm places on mixed nodes or queues without
-    that one-at-a-time limit. Snellius and generic defaults enable it. Queued
-    pilots count against residual demand and the fleet cap in either mode.
+  - require a wholly idle Slurm node before submitting an autogrow pilot.
+    Snellius and Spider disable it: demand-backed pilots are queued and Slurm
+    starts them when capacity frees. Generic clusters keep it. Queued pilots
+    count against residual demand and the fleet cap in either mode.
 - **`autogrow_engine_memory_mb_per_core`**
   - hard Slurm memory grant per requested pilot core; required for memory-aware
     dynamic sizing
@@ -88,6 +85,39 @@ The manager reads the following cluster-policy keys from `~/.zslurm/config.yaml`
   - partition to fall back to if no preferred autogrow partition scores better
 - **`autogrow_fat_partitions`**
   - partitions treated as large/fat nodes during autogrow heuristics
+
+#### Thin and fat growth (Snellius)
+
+Thin pilots go to the first preferred thin partition (`genoa`, higher IPC)
+when it has an idle node. Otherwise they are submitted to all preferred thin
+partitions at once (`-p genoa,rome`), so Slurm starts them wherever a node
+frees first. Such a pilot is counted at the smaller node (rome: 128 cores,
+224 GiB). Snellius accepts several partitions only for `--exclusive` jobs, so
+partial-core pilots (`autogrow_engine_cores > 0`) keep one partition.
+
+Fat nodes are used in two cases:
+
+- **Memory pressure:** the backlog left after running *and queued* capacity
+  needs more GiB per core than thin nodes offer. Ordinary growth may then pick
+  fat, with no fat-specific cap (only `autogrow_max_compute_nodes`).
+- **Availability, without memory pressure:** a pending thin pilot is expected
+  to start at least `autogrow_fat_min_earlier_sec` (default 21600, 6 h) later
+  than a fat node is available, no thin node is idle, and fewer than
+  `autogrow_max_fat_nodes` (default 10) fat pilots run or wait. A fat node
+  must be idle now. Each fat pilot then *replaces* one late thin autogrow
+  pilot: that one is cancelled with `scancel --state=PENDING`, so a pilot that
+  started in the meantime is kept. Manually requested pilots are never
+  cancelled.
+
+"Expected to start" is Slurm's backfill estimate (`squeue` StartTime) for the
+pending pilot. `--test-only` is not used (see
+[maintenance windows](scheduling.md#maintenance-windows)). When Slurm still
+has no estimate after `autogrow_start_estimate_grace_sec` (default 300, about
+ten backfill passes), the start is treated as beyond the backfill window
+(`bf_window`, 5 days on Snellius). Backfill tests at most `bf_max_job_user`
+(20) jobs per user, so with many pending jobs of your own, a near pilot may
+also report no estimate. The autogrow line in the UI shows when the soonest
+queued pilot is expected to start.
 - **`archive_job_partitions`**
   - job partitions that should count toward staging/archive autogrow pressure
 - **`staging_autogrow_base_nodes`**

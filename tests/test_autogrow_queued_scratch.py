@@ -105,34 +105,10 @@ class QueuedScratchCapacityTests(unittest.TestCase):
         with mock.patch.object(z.zslurm_shared, 'slurm_partition_state_counts_by_scratch', return_value={}):
             plan = z.compute_autogrow_plan([], 'compute')
             self.assertEqual(plan['best_nodes'], 1)
-            # Whole-node site with no idle node: claim one pilot and wait.
             z.status.config['autogrow_require_idle_nodes'] = True
-            plan = z.compute_autogrow_plan([], 'compute')
-            self.assertEqual(plan['plan_nodes'], 1)
-            self.assertIn('queueing one pilot', plan['plan_reason'])
-            # ...but do not stack a second request while that one is pending.
-            z.engines.cluster_queued_by_partition = {'genoa': 1}
-            z.engines.queued_engines_detail = [('pending', 'genoa', 60.0, True)]
-            self.jobs.jobs_by_id.clear()
-            for i in range(3):
-                self.add_ssd_job()
             plan = z.compute_autogrow_plan([], 'compute')
             self.assertEqual(plan['plan_nodes'], 0)
-            self.assertIn('waiting for the queued pilot', plan['plan_reason'])
-
-    def test_busy_whole_node_site_queues_at_most_one_large_pilot(self):
-        z = self.zslurm
-        for i in range(30):
-            job = z.Job('wide', 'w%d' % i, 'true', '/tmp', {}, 192, 300 * 1024, 3600,
-                        0, None, 0, 0, 0, 0, 0, 0, 'compute', 0, None, '')
-            self.jobs.jobs_by_id[job.jobid] = job
-        with mock.patch.object(z.zslurm_shared, 'slurm_partition_state_counts_by_scratch', return_value={}):
-            z.status.config['autogrow_require_idle_nodes'] = False
-            self.assertGreater(z.compute_autogrow_plan([], 'compute')['best_nodes'], 1)
-            z.status.config['autogrow_require_idle_nodes'] = True
-            plan = z.compute_autogrow_plan([], 'compute')
-        self.assertGreater(plan['raw_best_nodes'], 1)
-        self.assertEqual(plan['best_nodes'], 1)
+            self.assertIn('no idle nodes', plan['plan_reason'])
 
     def test_subnode_backlog_grows_once_and_not_when_already_covered(self):
         z = self.zslurm

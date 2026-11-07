@@ -75,7 +75,8 @@ class ClusterSiteTests(unittest.TestCase):
         self.assertEqual(defaults["default_engine_cores"], 0)
         self.assertEqual(defaults["autogrow_engine_cores"], 0)
         self.assertFalse(defaults["autogrow_dynamic_engine_cores"])
-        self.assertTrue(defaults["autogrow_require_idle_nodes"])
+        # Pilots queue as "genoa,rome" instead of waiting for an idle node.
+        self.assertFalse(defaults["autogrow_require_idle_nodes"])
         self.assertTrue(defaults["autogrow_enable"])
         self.assertTrue(defaults["maintenance_window_enable"])
         self.assertFalse(defaults["autogrow_time_min_enable"])

@@ -881,6 +881,9 @@ def _cluster_defaults(config=None):
             "node_profiles": copy.deepcopy(DEFAULT_NODE_PROFILES),
             "autogrow_fallback_partition": "genoa",
             "autogrow_fat_partitions": ["fat_genoa", "fat_rome"],
+            # Queue demand-backed pilots even while no node is idle; they go
+            # to "genoa,rome" so Slurm starts them wherever a node frees first.
+            "autogrow_require_idle_nodes": False,
             "maintenance_window_enable": True,
             "autogrow_enable": True,
             "autogrow_max_compute_nodes": 40,
@@ -5250,6 +5253,9 @@ class Engine(object):
         self.backfill_announced = False   # phase-out backfill logged once per engine
 
         self.has_ssd = False
+        # True only for pilots this manager submitted through autogrow; the fat
+        # availability swap never cancels a manually requested pilot.
+        self.autogrow = False
         self.ssd_total_gb = 0.0
         self.ssd_used_gb = 0.0        
         self.res_ssd_reserved_gb = 0.0
@@ -5286,6 +5292,7 @@ class EngineManager(object):
         # not hold, release, or cancel queued engine allocations.
         self.queued_engines_detail = []   # [(cid, partition, age_sec, is_scratch)] -- excludes held
         self.queued_engine_capacity_by_cid = {}  # cid -> (cores, expected schedulable MB)
+        self.queued_start_estimate_by_cid = {}  # cid -> Slurm backfill start (epoch) or None
         self.held_engine_cids = set()     # cids successfully held by this manager
         self.actual_held_engine_cids = set()  # all cids Slurm currently reports held
         self.held_engines_detail = []     # manager-held [(cid, partition, age_sec, is_scratch)]
@@ -5499,7 +5506,7 @@ class EngineManager(object):
                 instance_names.add(str(known_instance))
         output_format = (
             "jobid:|,arrayjobid:|,arraytaskid:|,name:|,timeleft:|,statecompact:|,"
-            "nodelist:|,partition:|,pendingtime:|,feature:|,numcpus:|,reason"
+            "nodelist:|,partition:|,pendingtime:|,feature:|,numcpus:|,reason:|,starttime"
         )
         selectors = [["--name", ",".join(sorted(instance_names))]]
         known_slurm_ids = sorted({
@@ -5577,6 +5584,7 @@ class EngineManager(object):
         held_by = defaultdict(int)
         queued_engines_detail = []  # (cid, partition, age_sec, is_scratch) for non-R, non-staging, non-held engine allocations
         queued_capacity_by_cid = {}
+        queued_start_by_cid = {}
         held_detail = []            # same tuple for allocations this manager actually holds
         external_held_detail = []   # actual Slurm holds not owned by this manager
         actual_held_cids = set()
@@ -5585,7 +5593,12 @@ class EngineManager(object):
 
 
         try:
-            for slurm_job_id, jid_raw, atask, cname, ctime, cstate, cnode, cpartition, cpending, cfeatures, cnumcpus, creason in output:
+            for row in output:
+                # StartTime (13th) is Slurm's backfill estimate for pending
+                # jobs; rows from older formats or test doubles may lack it.
+                (slurm_job_id, jid_raw, atask, cname, ctime, cstate, cnode,
+                 cpartition, cpending, cfeatures, cnumcpus, creason) = row[:12]
+                cstart = row[12] if len(row) > 12 else ""
                 task = (atask or "").strip()
                 if task and task != "N/A":
                     cid = f"{jid_raw}_{task}"
@@ -5716,6 +5729,7 @@ class EngineManager(object):
                         queued_engines_detail.append(
                             (cid, cpartition, float(age_sec), _is_scratch)
                         )
+                        queued_start_by_cid[cid] = zslurm_shared.parse_slurm_start_time(cstart)
                         queued_capacity_by_cid[cid] = (
                             float(engine.cores), float(engine.totmem)
                         )
@@ -5789,6 +5803,7 @@ class EngineManager(object):
             self.cluster_held_by_partition = dict(held_by)
             self.queued_engines_detail = list(queued_engines_detail)
             self.queued_engine_capacity_by_cid = dict(queued_capacity_by_cid)
+            self.queued_start_estimate_by_cid = dict(queued_start_by_cid)
             self.held_engines_detail = list(held_detail)
             self.external_held_engines_detail = list(external_held_detail)
             self.actual_held_engine_cids = set(actual_held_cids)
@@ -5802,6 +5817,7 @@ class EngineManager(object):
             self.cluster_held_by_partition = {}
             self.queued_engines_detail = []
             self.queued_engine_capacity_by_cid = {}
+            self.queued_start_estimate_by_cid = {}
             self.held_engines_detail = []
             self.external_held_engines_detail = []
             self.actual_held_engine_cids = set()
@@ -5837,6 +5853,30 @@ class EngineManager(object):
         if target == 'gpu':
             return manager_partition == 'gpu' or _worker_kind(slurm_partition) == 'gpu'
         return False
+
+    def cancel_pending_compute_engine(self, cid):
+        """Cancel only a still-PENDING, idle autogrow compute pilot.
+
+        Used when the fat availability swap replaces it. --state=PENDING
+        makes a pilot that started in the meantime survive; it is then only
+        marked draining, like a cancelled pending GPU pilot.
+        """
+        with self.lock:
+            engine = self.engine_by_clusterid.get(str(cid))
+            if (engine is None or engine.partition != 'compute' or not engine.managed
+                    or not getattr(engine, 'autogrow', False)
+                    or engine.slurm_state not in ('PD', 'PENDING') or engine.jobs
+                    or engine.stopping or str(cid) in self.actual_held_engine_cids):
+                return False
+            target = str(engine.slurm_job_id or engine.cluster_id)
+            process = Popen(['scancel', '--state=PENDING', target],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process.communicate()
+            if process.returncode not in (None, 0):
+                return False
+            engine.status = PHASING_OUT
+            engine.phaseout_reason = 'consolidation'
+            return True
 
     def cancel_pending_gpu_engine(self, cid):
         """Cancel only a still-PENDING, idle managed GPU pilot, never its array."""
@@ -7745,9 +7785,24 @@ def _partial_engine_schedulable_memory_mb(cores):
     )
 
 
+def compute_partition_profile(partition):
+    """Profile of a Slurm partition; for a 'genoa,rome' request, the smaller
+    member's cores and memory, so a pilot Slurm may start on either partition
+    is never credited with more than it can deliver."""
+    name = str(partition or '')
+    if ',' not in name:
+        return status.node_profiles.get(name) or {}
+    members = [status.node_profiles.get(part.strip()) or {}
+               for part in name.split(',') if part.strip()]
+    if not members or not all(members):
+        return {}
+    return {'cores': min(float(m.get('cores', 0) or 0) for m in members),
+            'mem_gb': min(float(m.get('mem_gb', 0) or 0) for m in members)}
+
+
 def _autogrow_engine_capacity(partition, requested_cores):
     """Return the capacity a queued engine is expected to advertise."""
-    prof = status.node_profiles.get(str(partition)) or {}
+    prof = compute_partition_profile(partition)
     if _worker_kind(str(partition)) == 'gpu':
         memory = float(prof.get('mem_gb', 0)) * 1024
         return float(prof.get('cores', 0)), zslurm_gpu.worker_memory_mb(memory, memory, status.config)
@@ -7772,7 +7827,7 @@ def _autogrow_requested_engine_cores(
     if configured <= 0 or not bool(
             getattr(status, 'autogrow_dynamic_engine_cores', False)):
         return configured
-    profile = status.node_profiles.get(str(best_part)) or {}
+    profile = compute_partition_profile(best_part)
     profile_cores = max(0, int(float(profile.get('cores', 0.0) or 0.0)))
     maximum = min(configured, profile_cores) if profile_cores > 0 else configured
     minimum = min(
@@ -7974,10 +8029,10 @@ def compute_autogrow_plan(all_engines, partition):
             cid, part_name, _age, _scratch = detail
         except (TypeError, ValueError):
             continue
-        if part_name not in unique_part:
+        if not set(str(part_name).split(',')) <= set(unique_part):
             continue
         queued_detail_counts[part_name] += 1
-        prof = status.node_profiles.get(part_name) or {}
+        prof = compute_partition_profile(part_name)
         capacity = queued_capacity.get(str(cid))
         try:
             queued_cores = float(capacity[0])
@@ -8071,7 +8126,7 @@ def compute_autogrow_plan(all_engines, partition):
             continue
         if not is_scratch:
             continue
-        prof = status.node_profiles.get(str(queued_part)) or {}
+        prof = compute_partition_profile(queued_part)
         capacity = queued_capacity.get(str(_cid))
         try:
             queued_cpu = max(0.0, float(capacity[0]))
@@ -8139,6 +8194,7 @@ def compute_autogrow_plan(all_engines, partition):
             'required_mpc': required_mpc,
             'raw_best_nodes': 0.0,
             'fat_cap_applied': False,
+            'need_fat': need_fat,
             'runtime_residual': runtime_residual,
             'unserviceable_runtime_n': len(unserviceable),
         }
@@ -8171,6 +8227,11 @@ def compute_autogrow_plan(all_engines, partition):
             continue
         prof = status.node_profiles.get(part) or {}
         if not prof:
+            continue
+        # Fat nodes serve memory pressure here. Without it, fat is only used
+        # by the availability swap (plan_fat_availability_swap), never by
+        # ordinary growth.
+        if str(part) in fat_partitions and not need_fat:
             continue
 
         # Real idle-node availability for this (partition, scratch) class, straight
@@ -8252,6 +8313,22 @@ def compute_autogrow_plan(all_engines, partition):
         best_use_scratch = need_ssd
         best_idle = 0
 
+    # Thin growth: the first preferred thin partition (genoa: higher IPC) when
+    # it has an idle node; otherwise every preferred thin partition, so Slurm
+    # starts the pilot wherever a node frees first ("genoa,rome"). Snellius
+    # accepts several partitions only for --exclusive jobs, so partial-core
+    # pilots keep a single partition.
+    exclusive_pilots = int(getattr(status, 'autogrow_engine_cores', 0) or 0) <= 0
+    thin_order = []
+    for part, scratch in status.autogrow_prefer_partitions:
+        if (bool(scratch) == bool(best_use_scratch) and _worker_kind(part) == 'compute'
+                and str(part) not in fat_partitions and status.node_profiles.get(part)
+                and part not in thin_order):
+            thin_order.append(part)
+    if (exclusive_pilots and best_part in thin_order and len(thin_order) > 1
+            and not (best_part == thin_order[0] and best_idle > 0)):
+        best_part = ",".join(thin_order)
+
     # SSD-preference moderation: plain (non-scratch) growth is a last resort. Even
     # when no scratch is idle, cap plain engines at autogrow_max_nonssd_fraction of
     # the fleet, so a transient scratch shortage cannot drift us onto a mostly-plain
@@ -8278,28 +8355,16 @@ def compute_autogrow_plan(all_engines, partition):
                 'required_mpc': required_mpc,
                 'raw_best_nodes': 0.0,
                 'fat_cap_applied': False,
+            'need_fat': need_fat,
                 'runtime_residual': runtime_residual,
                 'unserviceable_runtime_n': len(unserviceable),
                 'plan_reason': 'ssd-preferred: non-SSD engine cap reached, waiting for scratch capacity',
             }
 
-    # Whole-node sites (Snellius) prefer a currently idle node. Without one,
-    # still claim a single pilot and let Slurm start it when a node frees up,
-    # but never stack several whole-node requests in a busy queue: wait for
-    # the pending one first. Spider pilots are partial allocations that
-    # backfill on MIXED nodes, so Slurm decides there without this limit.
-    queue_one_pilot = False
+    # Some sites only schedule whole-node pilots and should wait for a currently
+    # idle node.  Spider pilots are partial allocations, however: they can
+    # backfill on MIXED nodes and Slurm (not zslurm) should decide when they run.
     if best_idle <= 0 and bool(
-            status.config.get(
-                'autogrow_require_idle_nodes',
-                getattr(status, 'autogrow_require_idle_nodes', True),
-            )):
-        waiting_pilots = int(getattr(engines, 'cluster_held_engines', 0) or 0) + sum(
-            int(n or 0) for part_name, n in
-            (getattr(engines, 'cluster_queued_by_partition', {}) or {}).items()
-            if _worker_kind(part_name) == 'compute')
-        queue_one_pilot = waiting_pilots == 0
-    if best_idle <= 0 and not queue_one_pilot and bool(
             status.config.get(
                 'autogrow_require_idle_nodes',
                 getattr(status, 'autogrow_require_idle_nodes', True),
@@ -8317,12 +8382,13 @@ def compute_autogrow_plan(all_engines, partition):
             'required_mpc': required_mpc,
             'raw_best_nodes': 0.0,
             'fat_cap_applied': False,
+            'need_fat': need_fat,
             'runtime_residual': runtime_residual,
             'unserviceable_runtime_n': len(unserviceable),
-            'plan_reason': 'no idle nodes; waiting for the queued pilot to start',
+            'plan_reason': 'no idle nodes in any preferred partition',
         }
 
-    prof = status.node_profiles.get(best_part) or {}
+    prof = compute_partition_profile(best_part)
     # When growing scratch, size for the larger of the general residual and the
     # SSD-only residual, so stuck ssd_use=required work actually pulls in scratch
     # nodes even while plain free cores cover the general backlog.
@@ -8347,8 +8413,6 @@ def compute_autogrow_plan(all_engines, partition):
     if str(best_part) in getattr(status, 'autogrow_fat_partitions', []) and best_nodes > 1:
         best_nodes = 1
         fat_cap_applied = True
-    if queue_one_pilot:
-        best_nodes = min(best_nodes, 1)
 
     requested_engine_cores = _autogrow_requested_engine_cores(
         eligible, best_part, size_cpu, size_mem_mb, raw_best_nodes
@@ -8361,6 +8425,7 @@ def compute_autogrow_plan(all_engines, partition):
         'plan_part': best_part,
         'plan_use_scratch': best_use_scratch,
         'plan_need_ssd': need_ssd,
+        'need_fat': need_fat,
         'plan_nodes': best_nodes,
         'best_part': best_part,
         'best_nodes': best_nodes,
@@ -8379,13 +8444,117 @@ def compute_autogrow_plan(all_engines, partition):
         'runtime_residual': runtime_residual,
         'unserviceable_runtime_n': len(unserviceable),
         'plan_reason': (
-            ('no idle nodes; queueing one pilot in Slurm' if queue_one_pilot
-             else 'submitted to Slurm queue despite zero fully idle nodes')
+            'submitted to Slurm queue despite zero fully idle nodes'
             if best_idle <= 0 else None
         ),
     }
     
     return plan
+
+def queued_pilot_wait_seconds(cid, age_sec, now=None):
+    """Seconds until Slurm expects a pending pilot to start.
+
+    Slurm's backfill estimate when it has one. math.inf when it still has
+    none after autogrow_start_estimate_grace_sec (several backfill passes):
+    the start then lies beyond the backfill window (5 days on Snellius), or
+    backfill skipped it. None while that is still unknown.
+    """
+    now = time.time() if now is None else now
+    estimate = (getattr(engines, 'queued_start_estimate_by_cid', {}) or {}).get(str(cid))
+    if estimate is not None:
+        return max(0.0, float(estimate) - now)
+    grace = float(status.config.get('autogrow_start_estimate_grace_sec', 300))
+    return math.inf if float(age_sec or 0.0) >= grace else None
+
+
+def _fat_partition_names():
+    fat = set(str(p) for p in (getattr(status, 'autogrow_fat_partitions', []) or []))
+    ordered = []
+    for part, _scratch in status.autogrow_prefer_partitions:
+        if str(part) in fat and status.node_profiles.get(part) and part not in ordered:
+            ordered.append(part)
+    return ordered
+
+
+def count_fat_compute_engines():
+    """Running plus pending compute pilots on fat partitions."""
+    fat = set(str(p) for p in (getattr(status, 'autogrow_fat_partitions', []) or []))
+    return sum(
+        1 for engine in list(engines.engine_by_clusterid.values())
+        if engine is not None and engine.partition == 'compute'
+        and not getattr(engine, 'stopping', False)
+        and set(str(getattr(engine, 'slurm_partition', '') or '').split(',')) & fat)
+
+
+def plan_fat_availability_swap(plan, now=None, partition_states=None):
+    """Without memory pressure, move late thin pilots onto idle fat nodes.
+
+    Fat is used only when it gives a node at least autogrow_fat_min_earlier_sec
+    (default 6 h) sooner than the pending thin pilots Slurm is holding, while no
+    thin node is idle and fewer than autogrow_max_fat_nodes (default 10) fat
+    pilots exist. Each fat pilot replaces one late thin pilot, so demand is not
+    counted twice. Returns None or dict(fat_part, nodes, cancel_cids,
+    use_scratch, thin_wait_s, reason).
+    """
+    if (plan or {}).get('need_fat'):
+        return None  # memory pressure: ordinary growth already chooses fat
+    fat_parts = _fat_partition_names()
+    if not fat_parts:
+        return None
+    now = time.time() if now is None else now
+    min_earlier = float(status.config.get('autogrow_fat_min_earlier_sec', 6 * 3600))
+    room = int(status.config.get('autogrow_max_fat_nodes', 10)) - count_fat_compute_engines()
+    if room <= 0:
+        return None
+    fat_set = set(fat_parts) | set(str(p) for p in (getattr(status, 'autogrow_fat_partitions', []) or []))
+    late = []
+    for detail in list(getattr(engines, 'queued_engines_detail', []) or []):
+        try:
+            cid, part, age, scratch = detail
+        except (TypeError, ValueError):
+            continue
+        engine = (getattr(engines, 'engine_by_clusterid', {}) or {}).get(str(cid))
+        if (set(str(part).split(',')) & fat_set or engine is None
+                or not getattr(engine, 'autogrow', False)):
+            continue
+        wait = queued_pilot_wait_seconds(cid, age, now)
+        # An idle fat node is available now, so it is >= min_earlier sooner.
+        if wait is not None and wait >= min_earlier:
+            late.append((wait, str(cid), bool(scratch)))
+    if not late:
+        return None
+    if partition_states is None:
+        try:
+            partition_states = zslurm_shared.slurm_partition_state_counts_by_scratch(
+                60, feature_name=getattr(status, 'ssd_feature_name', 'scratch-node'))
+        except Exception:
+            return None
+    use_scratch = any(scratch for _wait, _cid, scratch in late)
+
+    def idle(part):
+        groups = (partition_states or {}).get(part, {}) or {}
+        classes = ('scratch',) if use_scratch else ('scratch', 'no_scratch')
+        return sum(int(((groups.get(c, {}) or {}).get('states', {}) or {}).get('IDLE', 0) or 0)
+                   for c in classes)
+
+    thin_parts = {part for part, _scratch in status.autogrow_prefer_partitions
+                  if _worker_kind(part) == 'compute' and str(part) not in fat_set}
+    if any(idle(part) > 0 for part in thin_parts):
+        return None  # a thin node is available now; growth gets it there
+    fat_part = next((part for part in fat_parts if idle(part) > 0), None)
+    if fat_part is None:
+        return None
+    late.sort(reverse=True)  # replace the latest thin pilots first
+    nodes = min(len(late), room, idle(fat_part))
+    thin_wait = late[nodes - 1][0]
+    return dict(
+        fat_part=fat_part, nodes=nodes,
+        cancel_cids=[cid for _wait, cid, _scratch in late[:nodes]],
+        use_scratch=use_scratch, thin_wait_s=thin_wait,
+        reason='thin pilots expected in %s, fat %s idle now' % (
+            'more than 5 days' if math.isinf(thin_wait) else zslurm_shared.format_time(thin_wait),
+            fat_part))
+
 
 def gpu_worker_profile(partition=None):
     part = partition or status.gpu_partition
@@ -8873,8 +9042,18 @@ def thread_check_commands():
                     )
                 else:
                     plan_compute = str(plan.get('plan_reason') or "no nodes needed")
+                    waits = [queued_pilot_wait_seconds(d[0], d[2], now)
+                             for d in list(getattr(engines, 'queued_engines_detail', []) or [])
+                             if len(d) == 4]
+                    waits = [w for w in waits if w is not None]
+                    if waits:
+                        soonest = min(waits)
+                        plan_compute += "; queued pilot starts " + (
+                            "in >5 days or unknown" if math.isinf(soonest)
+                            else "in " + zslurm_shared.format_time(soonest))
 
                 if cooldown_remaining_compute <= 0: # Autogrow cooldown expired, lets see if we need to start some engines
+                    grew_compute = False
                     if plan.get('best_part',None) is not None:
                         to_start = int(plan.get('best_nodes', 0) or 0)
                         if to_start > 0:
@@ -8920,9 +9099,34 @@ def thread_check_commands():
                                 )
                                 status.autogrow_last_action_compute_ts = now
                                 if started:
+                                    grew_compute = True
+                                    for engine in started:
+                                        engine.autogrow = True
                                     plan_compute = f"grew: {len(started)} @ {plan.get('best_part', 'compute')}"
                                 else:
                                     plan_compute = "growth deferred (maintenance window or submission failure)"
+                    if not grew_compute:
+                        swap = plan_fat_availability_swap(plan, now)
+                        status.autogrow_plan_detail['fat_swap'] = swap
+                        if swap:
+                            add_log_line(gb, "Autogrow: %d fat node(s) on %s replace late thin "
+                                         "pilot(s) %s (%s)" % (swap['nodes'], swap['fat_part'],
+                                         ",".join(swap['cancel_cids']), swap['reason']), CYAN)
+                            ssd_feature_name = getattr(status, 'ssd_feature_name', '')
+                            started = engines.start_slurm(
+                                gb, swap['nodes'], status.autogrow_runtime_default,
+                                swap['fat_part'],
+                                ssd_feature_name if (ssd_feature_name and swap['use_scratch']) else None,
+                                0, minimum_runtime_seconds=plan.get('minimum_runtime_seconds'))
+                            status.autogrow_last_action_compute_ts = now
+                            for engine in started or []:
+                                engine.autogrow = True
+                            # Cancel a thin pilot only for each fat pilot that
+                            # was really submitted.
+                            cancelled = [cid for cid in swap['cancel_cids'][:len(started or [])]
+                                         if engines.cancel_pending_compute_engine(cid)]
+                            plan_compute = "swapped %d late thin pilot(s) to %s" % (
+                                len(cancelled), swap['fat_part'])
 
                 staging_pending = 0
                 try:

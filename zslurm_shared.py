@@ -221,6 +221,22 @@ def job_activity_row(job):
     return [activity[field] for field in JOB_ACTIVITY_FIELDS]
 
 
+def parse_slurm_start_time(value):
+    """Epoch seconds of a squeue StartTime, or None for N/A/Unknown/blank.
+
+    For a pending job this is Slurm's backfill estimate. It is reported in the
+    cluster's local time without a zone, like every squeue timestamp.
+    """
+    text = str(value or "").strip()
+    if not text or text.upper() in ("N/A", "NONE", "UNKNOWN"):
+        return None
+    try:
+        import datetime
+        return time.mktime(datetime.datetime.fromisoformat(text).timetuple())
+    except (ValueError, OverflowError):
+        return None
+
+
 def parse_cgroup_memory_stat(lines):
     """Parse cgroup ``memory.stat`` content into non-negative byte counts."""
     values = {}
