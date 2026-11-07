@@ -132,7 +132,7 @@ partition)` (`zslurm:854`). Inside, the scheduler runs a **two-phase selection**
 
 1. **Candidate window (ordering).** Walk `jobs_by_id.values()` collecting `eligible()`
    PENDING/REQUEUED jobs until the window reaches `prio_fillmem_context + current_cpu`
-   (default `prio_fillmem_context = 500`, `zslurm:101,954-965`).
+   (default `prio_fillmem_context = 1500`, `zslurm:101,954-965`).
 2. **Greedy memory-fit (packing).** From the first `prio_fillmem_context` candidates, pop
    the job with the **lowest fit score** (`zslurm:966-1043`), reserve its budgets/cores/mem,
    decrement `current_cpu/current_mem`, and keep packing until the node is full — so one

@@ -503,7 +503,7 @@ class Status(object):
         self.port = 0
         self.instance_name = None
         self.lastin_first = True
-        self.prio_fillmem_context = 500
+        self.prio_fillmem_context = 1500
         self.used_load = numpy.array([], dtype=float)
         self.used_cpus = numpy.array([], dtype=float)
         self.used_mem = numpy.array([], dtype=float)
@@ -9172,9 +9172,21 @@ def thread_display_status(gb, status):
                     if room > 0 and row < maxrow:
                         gb.wcom_status.addstr(row, col, str(text)[:room], curses.color_pair(color))
 
-                def put_field(row, label, text, color=GREEN, right=False):
-                    put(row, 30 if right else 1, label)
-                    put(row, 48 if right else 18, text, color)
+                left_end = {}
+
+                def put_field(row, label, text, color=GREEN, right=False, group=()):
+                    """Left field at 1/18; a right field starts after the
+                    longest left value of its row group (at least column 30),
+                    so wide values such as 37687 / 100000 never collide."""
+                    text = str(text)
+                    if not right:
+                        put(row, 1, label)
+                        put(row, 18, text, color)
+                        left_end[row] = 18 + len(text)
+                        return
+                    col = max([30] + [left_end.get(r, 0) + 3 for r in (group or (row,))])
+                    put(row, col, label)
+                    put(row, col + 18, text, color)
 
                 type_labels = {"compute": "Compute", "archive": "Archive", "gpu": "GPU"}
                 engine_list = list(engines.engine_by_id.values())
@@ -9366,13 +9378,7 @@ def thread_display_status(gb, status):
                     bool(getattr(status, "gpfs_io_enable", True)),
                 )
 
-                gb.wcom_status.addstr(11, 1, cpu_io_label)
-                gb.wcom_status.addstr(
-                    11,
-                    18,
-                    cpu_io_text,
-                    curses.color_pair(GREEN),
-                )
+                put_field(11, cpu_io_label, cpu_io_text)
 
                 # Mem reserved (GB) – place inside CPU/Load/Mem block (just after Mem usage)
                 try:
@@ -9382,13 +9388,7 @@ def thread_display_status(gb, status):
                         if e.partition != "archive":
                             rem_gb += float(getattr(e, 'res_mem_reserved_mb', 0.0)) / 1024.0
                             tot_gb += float(e.totmem) / 1024.0
-                    gb.wcom_status.addstr(11, 30, "Mem resv (GB): ")
-                    gb.wcom_status.addstr(
-                        11,
-                        48,
-                        "%d/%d" % (int(rem_gb), int(tot_gb)),
-                        curses.color_pair(GREEN),
-                    )
+                    put_field(11, "Mem resv (GB): ", "%d/%d" % (int(rem_gb), int(tot_gb)), right=True)
                 except Exception:
                     pass
 
@@ -9407,11 +9407,11 @@ def thread_display_status(gb, status):
                 put_field(14, "Active (GB): ", "%d / %d" % (jobs.active_inuse, jobs.active_total))
                 put_field(15, "dCache (GB): ", "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total))
                 put_field(13, "dCache down: ", format_slot_usage(
-                    jobs.dcache_download_inuse, jobs.dcache_download_total), right=True)
+                    jobs.dcache_download_inuse, jobs.dcache_download_total), right=True, group=(13, 14, 15))
                 put_field(14, "dCache up: ", format_slot_usage(
-                    jobs.dcache_upload_inuse, jobs.dcache_upload_total), right=True)
+                    jobs.dcache_upload_inuse, jobs.dcache_upload_total), right=True, group=(13, 14, 15))
                 put_field(15, "S3 down: ", format_slot_usage(
-                    jobs.s3_download_inuse, jobs.s3_download_total), right=True)
+                    jobs.s3_download_inuse, jobs.s3_download_total), right=True, group=(13, 14, 15))
 
                 if not status.autoconsolidate_enable:
                     put_field(16, "Consolidation: ", "disabled", YELLOW)
@@ -9448,14 +9448,15 @@ def thread_display_status(gb, status):
                 put_field(5, "Compute R/Q/H/-: ", *engine_counts(erunning, equeue, eheld, ephasing))
                 if "archive" in shown:
                     put_field(5, "Archive R/Q/H/-: ", *engine_counts(
-                        erunning_archive, equeue_archive, eheld_archive, ephasing_archive), right=True)
+                        erunning_archive, equeue_archive, eheld_archive, ephasing_archive),
+                        right=True, group=(5, 6))
                 if "gpu" in shown:
                     gpu_engines = [e for e in engine_list if e.partition == "gpu"]
                     put_field(6, "GPU R/Q/H/-: ", *engine_counts(
                         erunning_gpu, equeue_gpu, eheld_gpu, ephasing_gpu))
                     put_field(6, "GPU devices: ", "%d / %d" % (
                         sum(len(d) for e in gpu_engines for d in e.gpu_allocations.values()),
-                        sum(len(e.gpu_devices) for e in gpu_engines)), right=True)
+                        sum(len(e.gpu_devices) for e in gpu_engines)), right=True, group=(5, 6))
 
                 gb.wcom_status.refresh()
         except Exception as e:
@@ -10427,7 +10428,7 @@ def main(scr, *args, **kwds):
                 except Exception:
                     pass
             elif c == ord("m"):  # set context size to search for good fitting jobs
-                cmd = get_number(gb, "Search context size for jobs [n=500]: ", 500)
+                cmd = get_number(gb, "Search context size for jobs [n=1500]: ", 1500)
                 if not cmd is None:
                     status.prio_fillmem_context = max(int(cmd), 1)
                 add_log_line(gb, "Fill memory context size set to " + str(cmd), GREEN)
