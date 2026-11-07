@@ -8283,10 +8283,23 @@ def compute_autogrow_plan(all_engines, partition):
                 'plan_reason': 'ssd-preferred: non-SSD engine cap reached, waiting for scratch capacity',
             }
 
-    # Some sites only schedule whole-node pilots and should wait for a currently
-    # idle node.  Spider pilots are partial allocations, however: they can
-    # backfill on MIXED nodes and Slurm (not zslurm) should decide when they run.
+    # Whole-node sites (Snellius) prefer a currently idle node. Without one,
+    # still claim a single pilot and let Slurm start it when a node frees up,
+    # but never stack several whole-node requests in a busy queue: wait for
+    # the pending one first. Spider pilots are partial allocations that
+    # backfill on MIXED nodes, so Slurm decides there without this limit.
+    queue_one_pilot = False
     if best_idle <= 0 and bool(
+            status.config.get(
+                'autogrow_require_idle_nodes',
+                getattr(status, 'autogrow_require_idle_nodes', True),
+            )):
+        waiting_pilots = int(getattr(engines, 'cluster_held_engines', 0) or 0) + sum(
+            int(n or 0) for part_name, n in
+            (getattr(engines, 'cluster_queued_by_partition', {}) or {}).items()
+            if _worker_kind(part_name) == 'compute')
+        queue_one_pilot = waiting_pilots == 0
+    if best_idle <= 0 and not queue_one_pilot and bool(
             status.config.get(
                 'autogrow_require_idle_nodes',
                 getattr(status, 'autogrow_require_idle_nodes', True),
@@ -8306,7 +8319,7 @@ def compute_autogrow_plan(all_engines, partition):
             'fat_cap_applied': False,
             'runtime_residual': runtime_residual,
             'unserviceable_runtime_n': len(unserviceable),
-            'plan_reason': 'no idle nodes in any preferred partition',
+            'plan_reason': 'no idle nodes; waiting for the queued pilot to start',
         }
 
     prof = status.node_profiles.get(best_part) or {}
@@ -8334,6 +8347,8 @@ def compute_autogrow_plan(all_engines, partition):
     if str(best_part) in getattr(status, 'autogrow_fat_partitions', []) and best_nodes > 1:
         best_nodes = 1
         fat_cap_applied = True
+    if queue_one_pilot:
+        best_nodes = min(best_nodes, 1)
 
     requested_engine_cores = _autogrow_requested_engine_cores(
         eligible, best_part, size_cpu, size_mem_mb, raw_best_nodes
@@ -8364,7 +8379,8 @@ def compute_autogrow_plan(all_engines, partition):
         'runtime_residual': runtime_residual,
         'unserviceable_runtime_n': len(unserviceable),
         'plan_reason': (
-            'submitted to Slurm queue despite zero fully idle nodes'
+            ('no idle nodes; queueing one pilot in Slurm' if queue_one_pilot
+             else 'submitted to Slurm queue despite zero fully idle nodes')
             if best_idle <= 0 else None
         ),
     }

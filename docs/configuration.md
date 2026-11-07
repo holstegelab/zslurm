@@ -22,9 +22,8 @@ Explicit configuration overrides those defaults. See the
 | SSD feature | `scratch-node` | `ssd` | `scratch-node` |
 | Pilot CPU shape | Exclusive node | Partial, up to 30 cores for autogrow | Exclusive node |
 | Compute autogrow | Enabled, cap 40 | Enabled, cap 15 | Disabled |
-| Require idle nodes for autogrow | Yes | No | Yes |
-
-GPU growth stays disabled until configured with an allocation profile and cap.
+| Prefer idle nodes for autogrow (else queue one pilot) | Yes | No | Yes |
+| GPU autogrow | Enabled, cap 1 | Enabled, cap 2 | Disabled |
 The Snellius node profiles are `genoa` (192 cores, 336 GiB), `rome` (128 cores,
 224 GiB), `fat_genoa` (192 cores, 1440 GiB) and `fat_rome` (128 cores, 960 GiB).
 These are scheduling profiles; chiefs derive actual usable resources from their
@@ -68,11 +67,13 @@ The manager reads the following cluster-policy keys from `~/.zslurm/config.yaml`
   - size partial pilots between the configured minimum and
     `autogrow_engine_cores` from runnable CPU and memory demand
 - **`autogrow_require_idle_nodes`**
-  - require a wholly idle Slurm node before submitting an autogrow pilot;
-    Spider disables this for partial pilots so Slurm can place them on mixed
-    nodes or queue them until capacity becomes available. Snellius and generic
-    defaults require idle capacity. Queued pilots count against residual demand
-    and the fleet cap in either mode.
+  - prefer a wholly idle Slurm node for autogrow pilots. When none is idle,
+    autogrow still queues **one** pilot and waits for Slurm to start it, and
+    requests no more while that pilot (or a held one) is pending, so a busy
+    cluster never collects several whole-node requests. Spider disables this
+    for partial pilots, which Slurm places on mixed nodes or queues without
+    that one-at-a-time limit. Snellius and generic defaults enable it. Queued
+    pilots count against residual demand and the fleet cap in either mode.
 - **`autogrow_engine_memory_mb_per_core`**
   - hard Slurm memory grant per requested pilot core; required for memory-aware
     dynamic sizing
