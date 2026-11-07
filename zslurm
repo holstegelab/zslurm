@@ -8164,15 +8164,18 @@ def compute_autogrow_plan(all_engines, partition):
     ssd_required_cpu = max(ssd_required_cpu, runtime_residual['ssd_cpu'])
     ssd_required_mem_mb = max(ssd_required_mem_mb, runtime_residual['ssd_mem_mb'])
 
-    # Memory-per-core pressure for info only
+    # Average GiB/core the fleet offers (running plus queued pilots) and the
+    # average all compute demand needs (held by running jobs plus the backlog).
     avail_mpc = ((tot_mem_cap_mb + queue_mem_cap_mb) / 1024.0) / max(1.0, (tot_cpu_cap + queue_cpu_cap))
     required_mpc = ((res_mem_mb + pend_mem_mb) / 1024.0) / max(1.0, (res_cpu + pend_cpu))
 
-    # mem/core of the UNMET (residual) backlog. When memory is the binding
-    # constraint the cluster runs out of RAM headroom while cores remain free, so
-    # required_cpu -> 0 while required_mem stays high -> req_mpc spikes -> fat wins.
+    # mem/core of the UNMET (residual) backlog; scores how well a profile covers it.
     req_mpc = (required_mem_mb / 1024.0) / max(1.0, required_cpu)
-    need_fat = req_mpc > (thin_mpc * 1.05)
+    # Memory pressure is about averages, judged against the whole fleet: fat
+    # nodes already running or queued raise the fleet's GiB/core, so the same
+    # backlog stops counting as pressure once enough fat capacity exists. A
+    # thin node's GiB/core is the floor (an empty fleet adds thin nodes).
+    need_fat = required_mpc > max(thin_mpc, avail_mpc) * 1.05
 
     # A sub-node backlog can unlock the entire downstream DAG. Do not make it
     # wait behind long running jobs until a whole node of demand accumulates.

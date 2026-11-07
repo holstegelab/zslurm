@@ -203,3 +203,23 @@ def test_start_time_parsing(module):
     assert module.zslurm_shared.parse_slurm_start_time('') is None
     epoch = module.zslurm_shared.parse_slurm_start_time('2026-11-08T10:30:00')
     assert time.localtime(epoch)[:5] == (2026, 11, 8, 10, 30)
+
+
+def fat_engine(cores=192, mem_gb=1440, used_fraction=1.0):
+    return SimpleNamespace(partition='compute', cores=cores, totmem=mem_gb * 1024,
+                           res_cpu_reserved=cores * used_fraction,
+                           res_mem_reserved_mb=mem_gb * 1024 * used_fraction * 0.5,
+                           has_ssd=True, timeleft=4 * 24 * HOUR, status='',
+                           cluster_id=None, managed=True)
+
+
+def test_existing_fat_fleet_absorbs_memory_pressure(z):
+    add_jobs(z, 400, cpu=1, mem_mb=3 * 1024)   # backlog averages 3 GiB/core
+    assert plan(z)['need_fat']                  # thin-only fleet: pressure
+    fleet = [fat_engine() for _ in range(10)]   # busy fat nodes: ~3.75 GiB/core held
+    with mock.patch.object(z.zslurm_shared, 'slurm_partition_state_counts_by_scratch',
+                           return_value=states()):
+        result = z.compute_autogrow_plan(fleet, 'compute')
+    # Running jobs hold 3.75 GiB/core on a 7.5 GiB/core fleet: no pressure.
+    assert not result['need_fat']
+    assert 'fat' not in str(result['best_part'])

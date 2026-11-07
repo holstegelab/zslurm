@@ -97,9 +97,13 @@ partial-core pilots (`autogrow_engine_cores > 0`) keep one partition.
 
 Fat nodes are used in two cases:
 
-- **Memory pressure:** the backlog left after running *and queued* capacity
-  needs more GiB per core than thin nodes offer. Ordinary growth may then pick
-  fat, with no fat-specific cap (only `autogrow_max_compute_nodes`).
+- **Memory pressure:** the average GiB per core of all compute demand (held
+  by running jobs plus the pending backlog) exceeds the average GiB per core
+  of the actual plus queued fleet, and at least a thin node's (1.75; 5%
+  margin). It is about averages, not single jobs, and fat nodes already
+  running or queued raise the fleet average, so pressure falls as fat
+  capacity is added. Ordinary growth may then pick fat, with no fat-specific
+  cap (only `autogrow_max_compute_nodes`).
 - **Availability, without memory pressure:** a pending thin pilot is expected
   to start at least `autogrow_fat_min_earlier_sec` (default 21600, 6 h) later
   than a fat node is available, no thin node is idle, and fewer than
