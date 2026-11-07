@@ -57,6 +57,16 @@ Preserve unrelated or uncommitted changes in these repositories.
    command -v zsbatch zsqueue zsnodes zsstatus zscontrol zslurm_lease
    ```
 
+   Verify the selected executable matches the current source. On 2026-10-28,
+   the installed `.../miniconda3/bin/zsbatch` still submitted walltime in minutes
+   to a manager expecting seconds (`06:00:00` became 360 seconds). The source
+   `~/projects/cluster_manager/zsbatch` contains the seconds fix. Until the
+   installed copy is refreshed, invoke that source with
+   `/home/hulsmanm/all_data/research/conda/marc/miniconda3/envs/clustersnake/bin/python`.
+   After submission, verify `reqtime_s` in `zscontrol jobs` (six hours = 21600),
+   alongside priority and resource requests. Do not silently patch or restart a
+   shared manager to address a client-path mismatch.
+
 2. Discover instances. If a client reports ambiguity, select one explicitly
    with `--instance NAME` or set `ZSLURM_INSTANCE`.
 3. Run:
