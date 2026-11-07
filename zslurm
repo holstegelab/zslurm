@@ -9680,7 +9680,8 @@ def init_commands(gb):
                 max_rows, _ = gb.wcom.getmaxyx()
             except Exception:
                 max_rows = 20
-            inst_row = max(1, min(max_rows - 2, 18))
+            # Bottom row is the input prompt; instance and version sit above it.
+            inst_row = max(1, min(max_rows - 3, 17))
             gb.wcom.addstr(1, 1, "Start/stop local engine: s/x")
             gb.wcom.addstr(2, 1, "Start/stop SLURM engines: d/c")
             gb.wcom.addstr(3, 1, "Toggle auto consolidate: a")
@@ -9696,6 +9697,7 @@ def init_commands(gb):
             gb.wcom.addstr(13, 1, "Shutdown: q")
             gb.wcom.addstr(14, 1, "Take over old instance: Shift-H")
             gb.wcom.addstr(inst_row, 1, "Instance:")
+            gb.wcom.addstr(inst_row + 1, 1, "Version: " + VERSION)
             gb.wcom.refresh()
     except Exception as e:
         pass
@@ -9743,7 +9745,7 @@ def render_control_status(gb, status):
                 GREEN if handover_mode in ('ACTIVE', 'TARGET_ACTIVE') else YELLOW,
             )
             try:
-                inst_row = max(1, min(rows - 2, 18))
+                inst_row = max(1, min(rows - 3, 17))
                 inst_name = str(getattr(status, 'instance_name', '') or '-')
                 gb.wcom.move(inst_row, 1)
                 gb.wcom.clrtoeol()
