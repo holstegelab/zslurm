@@ -26,6 +26,8 @@ import uuid
 
 
 PROTOCOL_VERSION = 1
+WAIT_PROTOCOL_VERSION = 2
+WAIT_REASONS = ("quota", "lease")
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_PHASE_NAME_BYTES = 128
 PHASE_PERCENTILES = (0, 5, 25, 50, 75, 95, 100)
@@ -82,6 +84,17 @@ def _phase_name(value, *, required=False):
     if any(ord(char) < 32 or ord(char) == 127 for char in result):
         raise ValueError("phase name must not contain control characters")
     return result
+
+
+def _wait_reason(value):
+    """None preserves the annotation; 'none' explicitly clears it."""
+    if value is None:
+        return None
+    if value == "none" or value == "":
+        return ""
+    if value not in WAIT_REASONS:
+        raise ValueError("wait_reason must be quota, lease, or none")
+    return value
 
 
 def _percentiles(values):
@@ -199,6 +212,8 @@ class ChiefLeaseController:
             "rss_samples_seen": 0,
         }
         record["phases"].append(phase)
+        if name != record.get("phase_name") or "phase_since" not in record:
+            record["phase_since"] = float(now)
         record["phase_name"] = name
         # A sample from the previous phase must not be extrapolated across a
         # semantic or resource boundary. The first fresh sample backfills only
@@ -448,6 +463,8 @@ class ChiefLeaseController:
                 "completed_releases": {},
                 "phases": [],
                 "phase_name": "initial",
+                "wait_reason": "",
+                "wait_since": None,
                 "last_usage_sample": None,
             }
             self.leases[key] = record
@@ -602,6 +619,43 @@ class ChiefLeaseController:
         with self.condition:
             return bool(self.waiters)
 
+    def _activity_locked(self, record):
+        reason = record.get("wait_reason", "")
+        since = record.get("wait_since")
+        pending = [waiter["created_at"] for waiter in self.waiters
+                   if waiter["job_id"] == record["job_id"] and not waiter.get("granted", False)]
+        if pending:
+            # A blocked resource acquisition is an intentional wait even for
+            # older callers that do not send an explicit wait annotation.
+            since = min(pending + ([since] if reason == "lease" and since is not None else []))
+            reason = "lease"
+        return {
+            "phase_name": record.get("phase_name", ""),
+            "phase_since": record.get("phase_since"),
+            "wait_reason": reason,
+            "wait_since": since,
+        }
+
+    def activity_snapshot(self):
+        """Small token-free per-job metadata for the existing chief heartbeat."""
+        with self.condition:
+            return {key: self._activity_locked(record)
+                    for key, record in self.leases.items()}
+
+    def is_intentionally_waiting(self, job_id):
+        with self.condition:
+            record = self.leases.get(self._key(job_id))
+            return bool(record and self._activity_locked(record)["wait_reason"])
+
+    def _set_wait_locked(self, record, reason):
+        if reason is None or reason == record.get("wait_reason", ""):
+            return False
+        record["wait_reason"] = reason
+        record["wait_since"] = time.time() if reason else None
+        self.condition.notify_all()
+        self._wake()
+        return True
+
     def pending_summary(self):
         with self.condition:
             if not self.waiters:
@@ -711,6 +765,7 @@ class ChiefLeaseController:
         timeout_s=3600.0,
         request_id=None,
         phase=None,
+        wait_reason=None,
     ):
         """Set an absolute lease target, waiting for growth when necessary."""
 
@@ -719,6 +774,7 @@ class ChiefLeaseController:
         try:
             timeout_s = max(0.0, _finite_float(timeout_s, "timeout_s"))
             phase = _phase_name(phase)
+            wait_reason = _wait_reason(wait_reason)
         except ValueError as exc:
             return {
                 "ok": False,
@@ -750,6 +806,9 @@ class ChiefLeaseController:
                     "message": str(exc),
                 }
 
+            # Metadata is independent of the resource grant: record an
+            # accepted intent immediately, and keep it across grant timeouts.
+            wait_changed = self._set_wait_locked(record, wait_reason)
             needs_growth = (
                 target_cpu > record["held_cpu"] + 1e-9
                 or target_mem_mb > record["held_mem_mb"] + 1e-9
@@ -796,6 +855,8 @@ class ChiefLeaseController:
                         abs(target_cpu - record["held_cpu"]) <= 1e-9
                         and abs(target_mem_mb - record["held_mem_mb"]) <= 1e-9
                     ):
+                        if waiter is not None:
+                            waiter["granted"] = True
                         if phase is not None and phase != record.get("phase_name"):
                             self._transition_phase_locked(
                                 record,
@@ -816,7 +877,7 @@ class ChiefLeaseController:
                             )
                         return self._response_locked(
                             record,
-                            status="unchanged",
+                            status="activity-changed" if wait_changed else "unchanged",
                             safety=safety,
                             request_id=request_id,
                         )
@@ -894,6 +955,8 @@ class ChiefLeaseController:
                         )
                         self.condition.notify_all()
                         self._wake()
+                        if waiter is not None:
+                            waiter["granted"] = True
                         return self._response_locked(
                             record,
                             status="granted",
@@ -1137,7 +1200,9 @@ class ChiefLeaseController:
             "epoch": record["epoch"],
             "phase_index": len(record.get("phases", [])) - 1,
             "phase_name": record.get("phase_name", ""),
+            "wait_reason_supported": True,
         }
+        result.update(self._activity_locked(record))
         if safety is not None:
             result["safety"] = safety
         if request_id is not None:
@@ -1152,7 +1217,7 @@ class ChiefLeaseController:
                 "status": "invalid",
                 "message": "request must be a JSON object",
             }
-        if request.get("version", PROTOCOL_VERSION) != PROTOCOL_VERSION:
+        if request.get("version", PROTOCOL_VERSION) not in (PROTOCOL_VERSION, WAIT_PROTOCOL_VERSION):
             return {
                 "ok": False,
                 "code": 2,
@@ -1173,6 +1238,7 @@ class ChiefLeaseController:
                 timeout_s=request.get("timeout_s", 3600.0),
                 request_id=request.get("request_id"),
                 phase=request.get("phase"),
+                wait_reason=request.get("wait_reason"),
             )
         if action == "phase":
             return self.mark_phase(job_id, token, request.get("phase"))
@@ -1347,7 +1413,9 @@ def request_from_environment(action, socket_timeout_s=30.0, **fields):
             f"expected {ENV_SOCKET}, {ENV_TOKEN}, and {ENV_JOB_ID}"
         )
     request = {
-        "version": PROTOCOL_VERSION,
+        # An old chief must reject, not silently ignore, requested wait
+        # metadata. Ordinary requests retain their version-1 wire format.
+        "version": WAIT_PROTOCOL_VERSION if fields.get("wait_reason") is not None else PROTOCOL_VERSION,
         "request_id": str(uuid.uuid4()),
         "action": action,
         "job_id": job_id,

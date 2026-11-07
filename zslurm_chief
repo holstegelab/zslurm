@@ -1000,6 +1000,24 @@ def manager_supports_method(proxy, method_name):
         return False
 
 
+def poll_manager(proxy, poll_args, gpfs, leases, activity_supported, gpfs_supported):
+    """Piggyback activity on normal polling, with old-manager fallbacks."""
+    extended = poll_args + (gpfs["rx_mib_s"], gpfs["tx_mib_s"],
+                            gpfs["io_pct"], gpfs["available"])
+    if activity_supported:
+        return proxy.poll_with_job_activity(*(extended + (leases.activity_snapshot(),)))
+    if gpfs_supported:
+        return proxy.poll_with_gpfs(*extended)
+    return proxy.poll(*poll_args)
+
+
+def stuck_window_is_idle(cpu_samples, io_deltas, count, cpu_threshold, io_threshold,
+                         history_start=0):
+    return (len(cpu_samples) - history_start > count and len(io_deltas) - history_start > count
+            and all(sample['cpu_perc'] < cpu_threshold for sample in cpu_samples[-count:])
+            and all(delta <= io_threshold for delta in io_deltas[-count:]))
+
+
 _warned_legacy_manager = False
 
 
@@ -1143,6 +1161,7 @@ else:
     print(("[%s] Registered with controller, got id: " % myip) + myid)
 
 manager_supports_gpfs_io = manager_supports_method(s, "poll_with_gpfs")
+manager_supports_job_activity = manager_supports_method(s, "poll_with_job_activity")
 sys.stderr.write(
     "GPFS I/O manager protocol: %s\n"
     % ("enabled" if manager_supports_gpfs_io else "legacy fallback")
@@ -1212,6 +1231,7 @@ def job_monitor(
     spend_time = 0
     last_summary_io_total = None
     iodeltas = []
+    stuck_history_start = 0
     monitor_initial_delay = float(config.get('monitor_initial_delay_sec', 0.0))
     monitor_interval = float(config.get('monitor_interval_sec', 600.0))
     live_monitor_interval = float(config.get('monitor_live_interval_sec', min(5.0, monitor_interval)))
@@ -1331,9 +1351,18 @@ def job_monitor(
                         snapshot['cpu_perc'] = cpu_percentage
                         cpucache.append(snapshot)
 
-                    if stuck_enabled and (summary_report_time - start_time) >= monitor_initial_delay:
-                        if partition == 'compute' and len(cpucache) > stuck_stop_threshold and len(iodeltas) > stuck_stop_threshold:
-                            if all([e['cpu_perc'] < stuck_cpu_thr for e in cpucache[::-1][:stuck_stop_threshold]]) and all([d <= stuck_io_thr for d in iodeltas[::-1][:stuck_stop_threshold]]):
+                    intentionally_waiting = lease_controller.is_intentionally_waiting(jobid)
+                    if intentionally_waiting:
+                        # Preserve profiling samples, but do not count planned
+                        # idle time toward a kill, including just after resume.
+                        stuck_history_start = len(cpucache)
+                    if stuck_enabled and not intentionally_waiting and (summary_report_time - start_time) >= monitor_initial_delay:
+                        if partition == 'compute':
+                            if stuck_window_is_idle(
+                                cpucache, iodeltas,
+                                stuck_stop_threshold, stuck_cpu_thr, stuck_io_thr,
+                                history_start=stuck_history_start,
+                            ):
                                 window_sec = float(stuck_stop_threshold) * float(monitor_interval)
                                 recent_cpu = [e['cpu_perc'] for e in cpucache[::-1][:min(stuck_stop_threshold, 5)]]
                                 recent_io = iodeltas[::-1][:min(stuck_stop_threshold, 5)]
@@ -1618,6 +1647,8 @@ try :
                                 s, myid, uri = reconnected
                                 manager_supports_gpfs_io = manager_supports_method(
                                     s, "poll_with_gpfs")
+                                manager_supports_job_activity = manager_supports_method(
+                                    s, "poll_with_job_activity")
                                 status.assigned_jobs.clear()
                                 last_seen = time.time()
                                 s.job_finished(
@@ -1797,17 +1828,10 @@ try :
                 heartbeat_mem_usage,
                 sys_cpu_busy, sys_iowait, ssd_total_gb, ssd_used_gb,
             )
-            if manager_supports_gpfs_io:
-                commands = s.poll_with_gpfs(
-                    *(poll_args + (
-                        gpfs_io_metrics["rx_mib_s"],
-                        gpfs_io_metrics["tx_mib_s"],
-                        gpfs_io_metrics["io_pct"],
-                        gpfs_io_metrics["available"],
-                    ))
-                )
-            else:
-                commands = s.poll(*poll_args)
+            commands = poll_manager(
+                s, poll_args, gpfs_io_metrics, lease_controller,
+                manager_supports_job_activity, manager_supports_gpfs_io,
+            )
             last_seen = time.time()
         except MANAGER_RPC_ERRORS as serror :
             print('%s - [%s] Caught a socket error for command poll !' % (xtime(), myid))
@@ -1823,6 +1847,8 @@ try :
                     s = new_proxy
                     manager_supports_gpfs_io = manager_supports_method(
                         s, "poll_with_gpfs")
+                    manager_supports_job_activity = manager_supports_method(
+                        s, "poll_with_job_activity")
                     myid = new_id
                     uri = redirected_uri
                     last_seen = time.time()
@@ -1905,6 +1931,8 @@ try :
                     s = new_proxy
                     manager_supports_gpfs_io = manager_supports_method(
                         s, "poll_with_gpfs")
+                    manager_supports_job_activity = manager_supports_method(
+                        s, "poll_with_job_activity")
                     myid = new_id
                     uri = str(target_uri)
                     inst_name = target_instance or inst_name

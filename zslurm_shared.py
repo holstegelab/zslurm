@@ -190,6 +190,37 @@ def format_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{sec:02d}"
 
 
+JOB_ACTIVITY_FIELDS = ("phase_name", "phase_since", "wait_reason", "wait_since", "wait_seconds")
+
+
+def job_activity_snapshot(job, now=None):
+    """Display-only metadata; never replace the scheduler's RUNNING state."""
+    now = time.time() if now is None else now
+    reason = getattr(job, "wait_reason", "") if getattr(job, "state", None) == "RUNNING" else ""
+    since = getattr(job, "wait_since", None) if reason else None
+    return {
+        "phase_name": getattr(job, "phase_name", ""),
+        "phase_since": getattr(job, "phase_since", None),
+        "wait_reason": reason,
+        "wait_since": since,
+        "wait_seconds": max(0.0, now - since) if since is not None else 0.0,
+    }
+
+
+def format_job_activity(activity):
+    reason = activity.get("wait_reason")
+    if not reason:
+        return activity.get("phase_name") or ""
+    seconds = max(0, int(activity.get("wait_seconds") or 0))
+    duration = f"{seconds}s" if seconds < 60 else f"{seconds // 60}m"
+    return f"WAIT_{str(reason).upper()} {duration}"
+
+
+def job_activity_row(job):
+    activity = job_activity_snapshot(job)
+    return [activity[field] for field in JOB_ACTIVITY_FIELDS]
+
+
 def parse_cgroup_memory_stat(lines):
     """Parse cgroup ``memory.stat`` content into non-negative byte counts."""
     values = {}

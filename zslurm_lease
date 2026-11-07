@@ -42,6 +42,10 @@ def _parser():
         "--phase",
         help="name the phase started by this request, even if resources are unchanged",
     )
+    set_parser.add_argument(
+        "--wait-reason", choices=("quota", "lease", "none"),
+        help="annotate an intentional wait; none clears it (requires a new chief)",
+    )
 
     phase_parser = subparsers.add_parser(
         "phase", help="start a named phase without changing held resources"
@@ -79,6 +83,8 @@ def _print_human(response):
             "(epoch {epoch})".format(**response)
         )
         safety = response.get("safety") or {}
+        if response.get("wait_reason"):
+            print(f"waiting for {response['wait_reason']} since {response.get('wait_since')}")
         if safety.get("adjusted"):
             print(
                 "safety floor applied: "
@@ -107,9 +113,9 @@ def main(argv=None):
             mem_mb = args.mem_mb
             if args.mem_gb is not None:
                 mem_mb = args.mem_gb * 1024.0
-            if args.cores is None and mem_mb is None and args.phase is None:
+            if args.cores is None and mem_mb is None and args.phase is None and args.wait_reason is None:
                 parser.error(
-                    "set requires --cores, --mem-mb, --mem-gb, or --phase"
+                    "set requires --cores, --mem-mb, --mem-gb, --phase, or --wait-reason"
                 )
             # The socket must remain open for slightly longer than the requested
             # chief-side wait so the final grant/timeout response can arrive.
@@ -120,6 +126,7 @@ def main(argv=None):
                 mem_mb=mem_mb,
                 timeout_s=args.wait,
                 phase=args.phase,
+                **({"wait_reason": args.wait_reason} if args.wait_reason is not None else {}),
             )
         elif args.command == "phase":
             response = lease.request_from_environment(

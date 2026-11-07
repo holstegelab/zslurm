@@ -1459,6 +1459,10 @@ class Job(object):
         self.endtime = None
         self.current_cpu_usage = 0.0
         self.current_mem_usage = 0.0
+        self.phase_name = ""
+        self.phase_since = None
+        self.wait_reason = ""
+        self.wait_since = None
         # The chief heartbeat is authoritative for ownership after a grant.
         # These fields let the manager distinguish a briefly delayed startup
         # from a grant response that never reached the chief.
@@ -1482,6 +1486,10 @@ class Job(object):
         self.held_ncpu = float(self.ncpu)
         self.held_mem = float(self.mem)
         self.lease_epoch = 0
+        self.phase_name = ""
+        self.phase_since = None
+        self.wait_reason = ""
+        self.wait_since = None
         engines.job_running(nodeid, self)
 
     def assigned(self, nodeid):
@@ -1495,6 +1503,10 @@ class Job(object):
         self.state = state
         self.reason = reason
         self.return_code = return_code
+        self.phase_name = ""
+        self.phase_since = None
+        self.wait_reason = ""
+        self.wait_since = None
         if state in queue_states:
             self.current_cpu_usage = 0.0
             self.current_mem_usage = 0.0
@@ -2556,6 +2568,7 @@ class JobManager(object):
                     'dependency_state': dependency_state,
                     'dependency_reason': dependency_reason,
                     'comment': getattr(job, 'comment', ''),
+                    **zslurm_shared.job_activity_snapshot(job, now),
                 })
             return out
         finally:
@@ -3025,7 +3038,7 @@ class JobManager(object):
             self.lock.release()
 
     def list_done_jobs(self, last_seen_jobid=None, owner=None,
-                           include_priority=False, include_gpus=False):
+                           include_priority=False, include_gpus=False, include_activity=False):
         def serialize(job):
             if not job.starttime is None:
                 runtime = job.endtime - job.starttime
@@ -3052,8 +3065,9 @@ class JobManager(object):
                 job.cwd,
                 job.comment,
             ] + ([int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY))]
-                 if include_priority else []) + ([job.ngpus, list(getattr(job, 'last_gpu_devices', []))]
-                 if include_gpus else [])
+                 if include_priority or include_activity else []) + ([job.ngpus, list(getattr(job, 'last_gpu_devices', []))]
+                 if include_gpus else []) + (
+                     zslurm_shared.job_activity_row(job) if include_activity else [])
 
         jobs = []
         target_jobid = None if last_seen_jobid is None else str(last_seen_jobid)
@@ -3135,6 +3149,8 @@ class JobManager(object):
         }
         by_part = {}
         states = {}
+        waiting = {reason: {'jobs': 0, 'longest_wait_s': 0.0}
+                   for reason in ('quota', 'lease')}
 
 
         for j in list(self.jobs_by_id.values()):
@@ -3158,6 +3174,12 @@ class JobManager(object):
                 }
             is_pending = (st in queue_states) or (st == 'ASSIGNED')
             if st == 'RUNNING':
+                activity = zslurm_shared.job_activity_snapshot(j)
+                reason = activity['wait_reason']
+                if reason in waiting:
+                    waiting[reason]['jobs'] += 1
+                    waiting[reason]['longest_wait_s'] = max(
+                        waiting[reason]['longest_wait_s'], activity['wait_seconds'])
                 cores = float(getattr(j, 'held_ncpu', cores) or 0.0)
                 mem_mb = float(getattr(j, 'held_mem', mem_mb) or 0.0)
                 buckets = (totals['running'], by_part[part]['running'])
@@ -3198,10 +3220,11 @@ class JobManager(object):
             'total': totals,
             'by_partition': by_part,
             'states': states,
+            'waiting': waiting,
             'engines': engines_info,
         }
 
-    def list_jobs(self, owner=None, include_priority=False, include_gpus=False):
+    def list_jobs(self, owner=None, include_priority=False, include_gpus=False, include_activity=False):
         jobs = []
         for job in list(self.jobs_by_id.values()):
             if getattr(job, 'state', None) not in active_job_states:
@@ -3238,8 +3261,9 @@ class JobManager(object):
                     job.cwd,
                     job.comment
                 ] + ([int(getattr(job, 'priority', DEFAULT_JOB_PRIORITY))]
-                     if include_priority else []) + ([job.ngpus, list(job.gpu_devices)]
-                     if include_gpus else [])
+                     if include_priority or include_activity else []) + ([job.ngpus, list(job.gpu_devices)]
+                     if include_gpus else []) + (
+                     zslurm_shared.job_activity_row(job) if include_activity else [])
             )
 
         return jobs
@@ -4051,6 +4075,47 @@ class JobManager(object):
             self.lock.release()
         return recovered
 
+    def update_job_activity(self, nodeid, activity, known_jobids):
+        """Accept a bounded full snapshot only for this chief's RUNNING jobs.
+
+        No scheduler state or reservations are changed. Missing entries in a
+        new-protocol snapshot clear annotations for finished local leases.
+        """
+        if not isinstance(activity, dict):
+            return
+        with self.lock:
+            for key in known_jobids:
+                job = self.jobs_by_id.get(str(key))
+                if job is None or job.state != "RUNNING" or str(job.node_id) != str(nodeid):
+                    continue
+                item = activity.get(str(key), {})
+                if not isinstance(item, dict):
+                    continue
+                phase = item.get('phase_name', '')
+                reason = item.get('wait_reason', '')
+                if not isinstance(phase, str) or len(phase.encode('utf-8')) > 128:
+                    continue
+                if any(ord(char) < 32 or ord(char) == 127 for char in phase):
+                    continue
+                if reason not in ('', 'quota', 'lease'):
+                    continue
+                try:
+                    phase_since = item.get('phase_since')
+                    wait_since = item.get('wait_since') if reason else None
+                    phase_since = None if phase_since is None else float(phase_since)
+                    wait_since = None if wait_since is None else float(wait_since)
+                    if any(value is not None and (not math.isfinite(value) or value < 0)
+                           for value in (phase_since, wait_since)):
+                        continue
+                    if reason and wait_since is None:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                job.phase_name = phase
+                job.phase_since = phase_since
+                job.wait_reason = reason
+                job.wait_since = wait_since
+
     def resize_running_job(self, nodeid, jobid, target_cpu, target_mem_mb):
         """Atomically set a running job's mutable CPU and memory reservation.
 
@@ -4586,6 +4651,8 @@ def ping():
         "gpu_submit_protocol": 1,
         "default_job_priority": DEFAULT_JOB_PRIORITY,
         "list_jobs_priority": True,
+        "list_jobs_activity": True,
+        "job_activity": True,
         "cwd_priority_overrides": True,
         "controller_owner_roles": True,
         "targeted_job_status": True,
@@ -6416,6 +6483,7 @@ class EngineManager(object):
         gpfs_tx_mib_s=None,
         gpfs_io_pct=None,
         gpfs_io_available=False,
+        job_activity=None,
     ):
         try:
             e = self.engine_by_id[myid]
@@ -6614,6 +6682,10 @@ class EngineManager(object):
             finally:
                 jobs.lock.release()
 
+            if job_activity is not None:
+                jobs.update_job_activity(
+                    myid, job_activity, set(current_cpu_usage) | set(current_mem_usage))
+
             # The inverse check matters just as much: request_jobs used to mark
             # jobs RUNNING before its response reached the chief. A timeout then
             # left a permanent ghost. Heartbeats are the worker-side ownership
@@ -6737,6 +6809,11 @@ def poll(*args):
 
 def poll_with_gpfs(*args):
     """Extended chief poll; kept separate for rolling RPC compatibility."""
+    return poll(*args)
+
+
+def poll_with_job_activity(*args):
+    """Existing GPFS heartbeat plus a small per-job activity snapshot."""
     return poll(*args)
 
 
@@ -8777,6 +8854,7 @@ def thread_start_manager_server(port, rpc_path):
     server.register_function(unregister, "unregister")
     server.register_function(poll, "poll")
     server.register_function(poll_with_gpfs, "poll_with_gpfs")
+    server.register_function(poll_with_job_activity, "poll_with_job_activity")
     server.register_function(request_jobs, "request_jobs")
     server.register_function(job_finished, "job_finished")
     server.register_function(can_run_assigned_job, "can_run_assigned_job")
@@ -8893,6 +8971,7 @@ def thread_display_status(gb, status):
         ephasing_archive = engines.count_phasing_out("staging")
 
         njobs, nrunning, neligible, nfailed, ncompleted = jobs.get_job_stats()
+        waiting = jobs.queue_stats()['waiting']
 
         # active_engines = jobs.active_engines()
         # active_engines.discard(mylocal_id)
@@ -8999,6 +9078,18 @@ def thread_display_status(gb, status):
                     gb.wcom_status.addstr(6, 18, '%d/%d/%d devices %d/%d' % (
                         engines.cluster_running_engines_gpu, engines.cluster_queued_engines_gpu,
                         engines.cluster_held_engines_gpu, reserved, total), curses.color_pair(GREEN))
+
+                if gb.wcom_status.getmaxyx()[0] > 19:
+                    gb.wcom_status.addstr(19, 1, "Waiting Q/L: ")
+                    gb.wcom_status.addstr(
+                        19, 18, "%d (%s) / %d (%s)" % (
+                            waiting['quota']['jobs'],
+                            zslurm_shared.format_time(waiting['quota']['longest_wait_s']),
+                            waiting['lease']['jobs'],
+                            zslurm_shared.format_time(waiting['lease']['longest_wait_s']),
+                        ), curses.color_pair(YELLOW if any(
+                            entry['jobs'] for entry in waiting.values()) else GREEN),
+                    )
 
 
                 total_ssd_arr = numpy.asarray(getattr(status, 'total_ssd', []), dtype=float)
@@ -9362,7 +9453,7 @@ def build_windows(gb):
         rows, columns = os.popen("stty size", "r").read().split()
         size = (int(rows), int(columns))
 
-        com_win_rows = max(0, min(20, size[0] - 2))
+        com_win_rows = max(0, min(21, size[0] - 2))
         status_win_rows = max(0, min(2, size[0] - com_win_rows))
         log_win_rows = max(0, size[0] - com_win_rows - status_win_rows)
 
@@ -9829,13 +9920,14 @@ def main(scr, *args, **kwds):
         zslurm_shared.get_config().get('compute_pilot_exclude_nodes'))
     cli_args = kwds.get('cli_args')
     requested_recovery = getattr(cli_args, 'recover_instance', None)
+    requested_instance = getattr(cli_args, 'instance_name', None)
     address = zslurm_shared.get_hostname()
     recovery_config = _prepare_explicit_recovery(
         requested_recovery, address) if requested_recovery else None
     _cleanup_unreachable_instances()
     instance_name = _ensure_unique_instance(
         address,
-        requested_name=requested_recovery,
+        requested_name=requested_recovery or requested_instance,
         recovery_config=recovery_config,
     )
     config = zslurm_shared.get_config(instance=instance_name)
@@ -9972,7 +10064,9 @@ def main(scr, *args, **kwds):
             pass
 
     gb.scr = scr
-    gb.log_file = open("cluster.log", "w")
+    # A live handover target may intentionally use the same operational
+    # directory as its source. Preserve the existing diagnosis history.
+    gb.log_file = open("cluster.log", "a")
 
     build_windows(gb)
     try:
@@ -10551,7 +10645,7 @@ def _cli_main():
     parser.add_argument("--control-token", default=None,
                         help="(headless) require this token for control RPCs (implies --enable-control)")
     parser.add_argument("--instance-name", default=None,
-                        help="(headless) requested logical instance name; a numeric "
+                        help="requested logical instance name; a numeric "
                              "suffix is added if it already exists")
     parser.add_argument(
         "--recover-instance", default=None,
