@@ -347,13 +347,27 @@ CPU demand never requests a GPU worker. CPU and GPU worker caps are separate.
 Physical routes and allocation shapes remain site configuration. Spider's
 default GPU route is `gpu_a100_22c`; Snellius's is `gpu_a100` (override it, for
 example with `gpu_h100`, together with that partition's profile). Absent routes
-are disabled when `sinfo` discovery succeeds. No GPU allocation shape is
-guessed: configure `cores`, `mem_gb`, `gpus`, and optionally `gpu_type` before
-starting workers. This is the allocation used by the existing Spider CCS run:
+are disabled when `sinfo` discovery succeeds. Each site ships a verified
+whole-node profile for its default GPU partition, merged into `node_profiles`
+unless you define that partition yourself:
+
+| Site | Partition | Cores | `mem_gb` | GPUs | Scratch (`ssd_gb`) | Autogrow cap |
+| --- | --- | --- | --- | --- | --- | --- |
+| Spider | `gpu_a100_22c` | 44 | 320 | 2x A100 | 3200 GiB | 2 nodes |
+| Snellius | `gpu_a100` | 72 | 460 | 4x A100 | none promised | 1 node |
+
+Spider grants scratch per requested core, so a 44-core GPU worker advertises
+the chief's 73 GiB/core cap (3212 GiB), not the node's whole 6 TB SSD. The
+profile's `ssd_gb` must not exceed what the chief reports, or autogrow would
+grow for jobs that then never fit. Only some Snellius GPU nodes have scratch,
+so its profile promises none. Snellius bills 128 SBU per GPU-hour (512 SBU per
+node-hour). On another cluster no shape is guessed: configure `cores`,
+`mem_gb`, `gpus`, and optionally `gpu_type`, `has_ssd` and `ssd_gb`, for
+example:
 
 ```yaml
 gpu_partition: gpu_a100_22c
-autogrow_max_gpu_nodes: 5
+autogrow_max_gpu_nodes: 2
 consolidation_min_gpu_engines: 0
 node_profiles:
   # Merge with existing CPU profiles; do not remove them.
@@ -362,13 +376,20 @@ node_profiles:
     mem_gb: 320
     gpus: 2
     gpu_type: a100
+    has_ssd: true
+    ssd_gb: 3200
 ```
+
+The interactive `d` prompt only offers `gpu` when such a profile exists, and
+the manager rejects `-p gpu` (or `-p archive` without a staging partition)
+submissions that no worker could ever run, instead of queueing them.
 
 `mem_gb` follows existing node-profile units (GiB; converted to Slurm MB).
 GPU workers use the configured CPU/RAM request and `--gres=gpu:a100:2`, not
 the CPU pool's partial/exclusive shape. Review core-to-memory requirements at
-the site. Optional `has_ssd`/`ssd_gb` describe GPU-worker scratch. The shipped
-site templates set `autogrow_max_gpu_nodes: 0`: GPU growth is opt-in, demand
+the site. GPU autogrow is on by default on Spider and Snellius with the caps
+above (set `autogrow_max_gpu_nodes: 0` to disable; it follows the global
+autogrow toggle). It is demand
 backed, counts already queued/held allocations, has its own cooldown, and
 never grows from dependency/storage/transfer-blocked or unserviceable jobs.
 Short remaining pilot leases do not hide long-job demand. Backfill shortening

@@ -81,3 +81,70 @@ def test_long_partition_list_falls_back_to_log(module):
 def test_transfer_slots_use_status_pane_style(module):
     assert module.format_slot_usage(0, 2) == '0 / 2'
     assert module.format_slot_usage(0.5, 2.0) == '0.5 / 2'
+
+
+def test_site_gpu_profiles_and_autogrow_cap_default_on(site):
+    z = site('spider')
+    profile = z.status.node_profiles['gpu_a100_22c']
+    assert (profile['cores'], profile['gpus'], profile['has_ssd']) == (44, 2, True)
+    # Matches the chief's 73 GiB/core scratch cap on a 44-core worker.
+    assert profile['ssd_gb'] <= 73 * 44
+    assert z.worker_slurm_partitions('gpu') == ['gpu_a100_22c']
+    z = site('snellius')
+    assert z.status.node_profiles['gpu_a100']['gpus'] == 4
+    assert not z.status.node_profiles['gpu_a100']['has_ssd']
+
+
+def test_autogrow_cap_default_and_explicit_zero(module, monkeypatch):
+    monkeypatch.setattr(module, 'status', module.Status())
+    monkeypatch.setattr(module, '_discover_slurm_partitions', lambda: None)
+    for site_name, cap in (('spider', 2), ('snellius', 1), ('generic', 0)):
+        config = {'cluster_site': site_name}
+        module._apply_cluster_config(config)
+        assert config['autogrow_max_gpu_nodes'] == cap
+    config = {'cluster_site': 'spider', 'autogrow_max_gpu_nodes': 0}
+    module._apply_cluster_config(config)
+    assert config['autogrow_max_gpu_nodes'] == 0
+
+
+def test_own_node_profiles_keep_site_gpu_profile(site):
+    z = site('spider', node_profiles={'normal': {'cores': 20, 'mem_gb': 160}})
+    assert z.status.node_profiles['normal']['cores'] == 20
+    assert 'gpu_a100_22c' in z.status.node_profiles
+    z = site('spider', node_profiles={'gpu_a100_22c': {'cores': 22, 'mem_gb': 160, 'gpus': 1}})
+    assert z.status.node_profiles['gpu_a100_22c']['cores'] == 22
+
+
+def test_generic_gpu_route_without_profile_is_not_offered(site):
+    z = site('generic', gpu_partition='gpu_x')
+    assert z.worker_slurm_partitions('gpu') == []
+    assert 'gpu' not in z.worker_type_prompt()
+
+
+def _submit(z, partition, ngpus=None):
+    return z.jobs.submit_job('job', ['true'], '/', {}, 1, 1024, 60, 0, '', 0, 0, 0, 0, 0, 0,
+                             partition, 0, '', ngpus=ngpus)
+
+
+def test_unroutable_submissions_are_rejected(site, module, monkeypatch):
+    monkeypatch.setattr(module, 'jobs', module.JobManager())
+    monkeypatch.setattr(module, 'engines', module.EngineManager())
+    monkeypatch.setattr(module, 'add_log_line', lambda *args, **kwargs: None)
+    z = site('spider')
+    with pytest.raises(ValueError, match='No archive workers'):
+        _submit(z, 'archive')
+    assert _submit(z, 'gpu') and _submit(z, 'compute')
+    z = site('generic', gpu_partition=None)
+    with pytest.raises(ValueError, match='No GPU workers'):
+        _submit(z, 'gpu')
+    assert _submit(site('snellius'), 'archive')
+
+
+def test_hand_started_worker_keeps_its_route_open(site, module, monkeypatch):
+    monkeypatch.setattr(module, 'jobs', module.JobManager())
+    monkeypatch.setattr(module, 'engines', module.EngineManager())
+    monkeypatch.setattr(module, 'add_log_line', lambda *args, **kwargs: None)
+    z = site('spider')
+    z.engines.engine_by_id['e1'] = type('E', (), {'partition': 'archive'})()
+    assert z.job_route_available('archive')
+    assert _submit(z, 'archive')

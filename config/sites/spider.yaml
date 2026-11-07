@@ -8,10 +8,12 @@ default_partition: normal
 staging_partition: __disabled__
 staging_autogrow_enable: false
 # GPU jobs use the same manager with a separate device-accounted worker class.
-# Growth stays disabled until an operator sets a cap and an explicit allocation
-# profile (cores, mem_gb, gpus, optional gpu_type) in node_profiles below.
+# ZSlurm supplies a whole-node gpu_a100_22c profile (44 cores, 320 GB, 2x A100,
+# 3200 GiB scratch = the 73 GiB/core cap below); define
+# node_profiles.gpu_a100_22c to override it. Autogrow adds at most two of the
+# five shared GPU nodes; set 0 to disable.
 gpu_partition: gpu_a100_22c
-autogrow_max_gpu_nodes: 0
+autogrow_max_gpu_nodes: 2
 consolidation_min_gpu_engines: 0
 enable_ssd_prompt: true
 # All normal nodes expose local XFS through TMPDIR. The dedicated SSD prompt

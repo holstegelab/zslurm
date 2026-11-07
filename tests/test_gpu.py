@@ -504,6 +504,13 @@ def test_gpu_site_defaults_are_portable(z, monkeypatch, site, part):
     monkeypatch.setattr(z, '_discover_slurm_partitions', lambda:None)
     z._apply_cluster_config({'cluster_site':site})
     assert z.status.gpu_partition == part
+    # Each site supplies a verified whole-node profile for its default route.
+    assert z.resolve_worker_partition('gpu') == (part, 'gpu')
+
+
+def test_gpu_partition_without_profile_is_not_guessed(z, monkeypatch):
+    monkeypatch.setattr(z, '_discover_slurm_partitions', lambda:None)
+    z._apply_cluster_config({'cluster_site':'generic', 'gpu_partition':'gpu_x'})
     # A physical GPU name alone is not permission to guess resources.
     with pytest.raises(ValueError, match='Configure cores'):
         z.resolve_worker_partition('gpu')

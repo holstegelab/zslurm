@@ -42,7 +42,8 @@ The manager reads the following cluster-policy keys from `~/.zslurm/config.yaml`
 - **`staging_partition`**
   - Slurm partition name used for archive/staging-oriented engines
 - **`gpu_partition`**, **`autogrow_max_gpu_nodes`**, **`consolidation_min_gpu_engines`**
-  - physical GPU route and separate GPU fleet limits; see [GPU jobs](scheduling.md#gpu-jobs)
+  - physical GPU route and separate GPU fleet limits (GPU autogrow cap defaults
+    to 2 nodes on Spider, 1 on Snellius, 0 elsewhere); see [GPU jobs](scheduling.md#gpu-jobs)
 - **`scratch_use_tmpdir`**, **`scratch_capacity_gb`**, **`scratch_capacity_gb_per_core`**
   - chief settings for accepting allocation-local `TMPDIR` and bounding scratch
     capacity; when both capacity limits are set, the smaller applies

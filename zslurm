@@ -865,6 +865,10 @@ def _cluster_defaults(config=None):
         "autogrow_max_nonssd_fraction": 0.5,
         "autogrow_enable": False,
         "autogrow_max_compute_nodes": 0,
+        # GPU worker shapes are merged into node_profiles unless the operator
+        # defines that partition; an unknown cluster has none, so no GPU route.
+        "gpu_node_profiles": {},
+        "autogrow_max_gpu_nodes": 0,
     }
     if site == "snellius":
         defaults.update({
@@ -880,6 +884,13 @@ def _cluster_defaults(config=None):
             "maintenance_window_enable": True,
             "autogrow_enable": True,
             "autogrow_max_compute_nodes": 40,
+            # Whole gpu_a100 node (72 cores, 480 GB, 4x A100). Only some of
+            # these nodes have scratch-node SSDs, so do not promise one.
+            # Billing is 128 SBU per GPU-hour: grow at most one node.
+            "gpu_node_profiles": {
+                "gpu_a100": {"cores": 72, "mem_gb": 460, "gpus": 4, "gpu_type": "a100"},
+            },
+            "autogrow_max_gpu_nodes": 1,
         })
     elif site == "spider":
         # Spider grants 8 GB per allocated core (DefMemPerCPU=8000). A
@@ -917,6 +928,14 @@ def _cluster_defaults(config=None):
             "autogrow_max_nonssd_fraction": 1.0,
             "autogrow_enable": True,
             "autogrow_max_compute_nodes": 15,
+            # Whole gpu_a100_22c node (44 cores, 344 GB, 2x A100, 6 TB SSD).
+            # Scratch follows the chief's 73 GB/core sizing. The partition
+            # has five shared nodes; grow at most two of them.
+            "gpu_node_profiles": {
+                "gpu_a100_22c": {"cores": 44, "mem_gb": 320, "gpus": 2, "gpu_type": "a100",
+                                 "has_ssd": True, "ssd_gb": 3200},
+            },
+            "autogrow_max_gpu_nodes": 2,
         })
     return defaults
 
@@ -1041,11 +1060,31 @@ def worker_slurm_partitions(kind):
     for name in names:
         name = _optional_partition(name)
         if (name and name not in result and _worker_kind(name) == kind
-                and (known is None or name in known)):
+                and (known is None or name in known)
+                and (kind != 'gpu' or _gpu_profile_usable(name))):
             result.append(name)
     if kind == 'compute' and not result and _optional_partition(status.default_partition):
         result.append(status.default_partition)
     return result
+
+
+def _gpu_profile_usable(partition):
+    profile = status.node_profiles.get(partition, {})
+    try:
+        return min(float(profile.get('cores', 0)), float(profile.get('mem_gb', 0)),
+                   int(profile.get('gpus', 0))) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def job_route_available(kind):
+    """Whether queued jobs of this type can ever get a worker here."""
+    if kind == 'compute' or worker_slurm_partitions(kind):
+        return True
+    # Workers started outside the configured route (e.g. by hand) still count.
+    return any(getattr(e, 'partition', None) == kind
+               for e in list(engines.engine_by_id.values())
+               + list(engines.engine_by_clusterid.values()) if e is not None)
 
 
 def worker_types_shown(present=()):
@@ -1150,6 +1189,11 @@ def _apply_cluster_config(config, *, discover_partitions=False):
     status.node_profiles = _cfg_node_profiles(
         cfg.get("node_profiles"), defaults["node_profiles"]
     )
+    for name, profile in _cfg_node_profiles(defaults["gpu_node_profiles"], {}).items():
+        status.node_profiles.setdefault(name, profile)
+    if isinstance(config, dict):
+        # Read from status.config throughout; an explicit 0 still disables.
+        config.setdefault("autogrow_max_gpu_nodes", defaults["autogrow_max_gpu_nodes"])
     default_archive_jobs = ["archive", "staging"]
     status.archive_job_partitions = _cfg_string_list(cfg.get("archive_job_partitions"), default_archive_jobs)
     default_fallback_partition = status.autogrow_prefer_partitions[0][0] if status.autogrow_prefer_partitions else status.default_partition
@@ -2948,6 +2992,12 @@ class JobManager(object):
         if partition == 'gpu' and isinstance(idempotency_key, (int, float)):
             raise ValueError('Legacy GPU submission protocol: update zsbatch before submitting GPU jobs')
         ngpus = zslurm_gpu.gpu_count(partition, ngpus)
+        if not job_route_available(partition):
+            if partition == 'archive':
+                raise ValueError('No archive workers on this cluster (no staging partition); '
+                                 'submit transfers as compute jobs')
+            raise ValueError('No GPU workers on this cluster: configure gpu_partition and '
+                             'node_profiles[<partition>] with cores, mem_gb and gpus')
 
         def transfer_slots_from_env(name):
             try:

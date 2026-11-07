@@ -3,10 +3,12 @@
 cluster_site: snellius
 default_partition: genoa
 staging_partition: staging
-# Override with gpu_h100 or another site route if required. Configure an exact
-# GPU allocation profile in node_profiles before enabling GPU autogrow.
+# Override with gpu_h100 or another site route if required. ZSlurm supplies a
+# whole-node gpu_a100 profile (72 cores, 460 GB, 4x A100, no SSD promise);
+# define node_profiles.gpu_a100 to override it. Autogrow adds at most one GPU
+# node (128 SBU per GPU-hour); set 0 to disable.
 gpu_partition: gpu_a100
-autogrow_max_gpu_nodes: 0
+autogrow_max_gpu_nodes: 1
 consolidation_min_gpu_engines: 0
 enable_ssd_prompt: true
 ssd_feature_name: scratch-node
