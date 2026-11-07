@@ -110,8 +110,8 @@ automatic growth disabled for this first job:
 zslurm --no-autogrow
 ```
 
-Press `d` to request Slurm engines, choosing a physical partition, count and
-runtime for your site. Pressing `s` instead starts a local engine on the manager's
+Press `d` to request Slurm engines: choose a worker type (normally `compute`),
+then one of your site's Slurm partitions for it, the count and the runtime. Pressing `s` instead starts a local engine on the manager's
 host; use it only on a host where running the workload is appropriate.
 
 In another terminal, activate the same environment. If several instances are

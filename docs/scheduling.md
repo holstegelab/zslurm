@@ -318,7 +318,9 @@ So there are two layers:
 - **ZSlurm job partition**: `compute`, `archive` or `gpu`
 - **Slurm engine partition**: for example `genoa`, `rome`, `fat_genoa`, or `staging`
 
-This is why `staging` appears in the manager UI and cluster configuration, while `compute` and `archive` appear in `zsbatch` and internal scheduling.
+The manager UI asks for the worker type (`compute`, `archive`, `gpu`) first and
+only then for a Slurm partition of that type, so `staging` appears only in
+cluster configuration and as a partition choice for archive workers.
 
 Use `archive` for work requiring that configured backend. dCache and S3
 transfers can run on compute engines; Spider disables staging by default.
@@ -372,7 +374,8 @@ never grows from dependency/storage/transfer-blocked or unserviceable jobs.
 Short remaining pilot leases do not hide long-job demand. Backfill shortening
 must retain enough time for the requests being placed.
 
-Manual `d` accepts the logical `gpu` route or a configured physical partition.
+Manual `d` with worker type `gpu` uses the configured GPU partition and its
+profile's cores/memory; a physical GPU partition name is also accepted.
 `o gpu +1` drains one GPU worker; `o gpu -1` restores one. Automatic GPU
 consolidation preserves every busy worker (including unacknowledged grants),
 retires only unused idle capacity, and cancels surplus queued tasks with a

@@ -77,10 +77,10 @@ Inside the `zslurm` curses UI:
 
 - **`s`**: Start a local engine
 - **`x`**: Stop a local engine
-- **`d`**: Start Slurm engines for a partition
-- **`c`**: Stop Slurm engines
+- **`d`**: Start Slurm engines: choose a worker type, then a Slurm partition of that type
+- **`c`**: Stop Slurm engines of one worker type, or all
 - **`a`**: Toggle automatic consolidation of engines
-- **`o`**: Phase out engines by node name so they stop accepting new jobs
+- **`o`**: Phase out an engine by ID, or `<type> +n`/`-n` (e.g. `gpu +1`), so it stops accepting new jobs
 - **`p`**: One-time prioritize jobs whose name or working-directory component matches a pattern
 - **`n`**: One-time deprioritize jobs whose name or working-directory component matches a pattern
 - **`P`**: Set an active numeric priority override for a working-directory pattern
@@ -92,12 +92,24 @@ Inside the `zslurm` curses UI:
 - **`4`**: Manually set archive currently-used capacity
 - **`5`**: Manually set active currently-used capacity
 - **`6`**: Manually set dcache currently-used capacity
+- **`7`/`8`/`9`**: Set the dCache download, dCache upload and S3 download slot limits
 - **`m`**: Set the scheduling search window used for memory-aware filling
 - **`g`**: Toggle autogrow and set the maximum number of compute nodes it may add
 - **`u`**: Refresh the ncurses screen
 - **`q`**: Stop the manager
 
-When starting Slurm engines, entering `staging` maps to archive-oriented engines used for transfer/archive work.
+Starting engines (`d`) first asks for the **worker type**: `compute`, `archive`
+or `gpu`, matching the `zsbatch -p` job partitions. Only types with a usable
+Slurm route on this cluster are offered (Spider has no `archive` workers). When
+a type has more than one site-local Slurm partition, the next prompt lists
+them, e.g. `Partition genoa/rome/fat_genoa/fat_rome [genoa]:`; a type with one
+partition (`staging`, the GPU partition) skips this question. Typing a Slurm
+partition name at the first prompt still works. The log records the resulting
+request (type, Slurm partition, cores, feature, runtime).
+
+The status panel shows jobs per worker type (`running/eligible/total`), engines
+per type as `R/Q/H/-` (running, queued, held, phasing out), storage
+reservations in GB and transfer slots as `used / total`.
 
 Workflow coordinators that legitimately wait on queued child jobs can explicitly
 submit `ZSLURM_JOB_MONITOR_ROLE=controller` in their job environment. Updated
@@ -137,9 +149,9 @@ before using `REQUEUED`; older managers advertise only the legacy
 `conditional_pending_cancel` capability. Never fall back to unconditional
 cancellation after a rejected comparison. This behavior is site-independent.
 
-On Snellius, starting Slurm engines also offers an SSD scratch-node reservation prompt. For regular partitions, the UI asks for:
+On Snellius, starting Slurm engines also offers an SSD scratch-node reservation prompt. For compute engines, the UI asks for:
 
-- **Partition**
+- **Worker type** and, if there are several, **Slurm partition**
 - **Number of engines**
 - **Optional Slurm feature/constraint**
 - **Cores per engine**

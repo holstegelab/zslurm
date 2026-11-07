@@ -1011,6 +1011,90 @@ def resolve_worker_partition(partition):
     return partition, kind
 
 
+# Worker types are the ZSlurm job partitions (zsbatch -p); the UI asks for one
+# of these first and only then for a site-local Slurm partition of that type.
+WORKER_TYPES = ('compute', 'archive', 'gpu')
+_WORKER_TYPE_ALIASES = {
+    'c': 'compute', 'compute': 'compute',
+    'a': 'archive', 'archive': 'archive', 's': 'archive', 'staging': 'archive',
+    'g': 'gpu', 'gpu': 'gpu',
+}
+
+
+def worker_type_alias(answer):
+    """Return the worker type named by an operator answer, else None."""
+    return _WORKER_TYPE_ALIASES.get(str(answer or '').strip().lower())
+
+
+def worker_slurm_partitions(kind):
+    """Ordered site-local Slurm partitions that start workers of one type."""
+    if kind == 'archive':
+        names = [status.staging_partition]
+    elif kind == 'gpu':
+        names = [status.gpu_partition] + [
+            name for name, profile in status.node_profiles.items() if profile.get('gpus', 0)]
+    else:
+        names = ([status.default_partition] + list(status.node_profiles)
+                 + [name for name, _scratch in status.autogrow_prefer_partitions])
+    known = getattr(status, 'slurm_partitions', None)
+    result = []
+    for name in names:
+        name = _optional_partition(name)
+        if (name and name not in result and _worker_kind(name) == kind
+                and (known is None or name in known)):
+            result.append(name)
+    if kind == 'compute' and not result and _optional_partition(status.default_partition):
+        result.append(status.default_partition)
+    return result
+
+
+def worker_types_shown(present=()):
+    """Worker types with a configured route, plus types that still have work."""
+    present = set(present)
+    return [kind for kind in WORKER_TYPES
+            if kind == 'compute' or kind in present or worker_slurm_partitions(kind)]
+
+
+def worker_type_prompt():
+    kinds = [kind for kind in WORKER_TYPES if worker_slurm_partitions(kind)]
+    return 'Worker type (' + '/'.join(kinds) + ') [compute]: '
+
+
+def slurm_partition_prompt(kind, partitions, width=None):
+    """Prompt for a partition of one type; list the choices when they fit."""
+    default = partitions[0]
+    text = 'Partition %s [%s]: ' % ('/'.join(partitions), default)
+    if width is not None and len(text) > width:
+        text = '%s partition [%s], choices in log: ' % (kind, default)
+    return text
+
+
+def select_worker_route(type_answer, partition_answer=None):
+    """Resolve the two start prompts to (slurm_partition, worker_type).
+
+    ``partition_answer`` is only needed when the type offers several Slurm
+    partitions. A Slurm partition typed at the type prompt is accepted for
+    operators used to the former single prompt.
+    """
+    answer = str(type_answer or '').strip()
+    kind = worker_type_alias(answer or 'compute')
+    if kind is None:
+        return resolve_worker_partition(answer)
+    partitions = worker_slurm_partitions(kind)
+    if not partitions:
+        raise ValueError('No ' + kind + ' worker partition configured on this cluster')
+    chosen = str(partition_answer or '').strip() or partitions[0]
+    partition, resolved = resolve_worker_partition(chosen)
+    if resolved != kind:
+        raise ValueError('%s is a %s partition, not %s' % (partition, resolved, kind))
+    return partition, kind
+
+
+def format_slot_usage(inuse, total):
+    """Transfer slots in the status pane's 'used / total' style."""
+    return '%g / %g' % (float(inuse), float(total))
+
+
 def _cpu_io_display(host_cpu_pct, gpfs_io_pct, gpfs_io_enable=True):
     """Return the site-appropriate TUI label and compact value."""
     host_text = "%.0f" % float(host_cpu_pct)
@@ -5975,7 +6059,7 @@ class EngineManager(object):
                 return
 
             available = self.count_cluster_engines(target)
-            group_label = "staging" if target == "archive" else target
+            group_label = "archive" if target == "staging" else target
             if available == 0 and n != 0:
                 set_status_message(gb, f"No {group_label} SLURM engines found", YELLOW)
             elif n < 0 or n > available:
@@ -8969,6 +9053,10 @@ def thread_display_status(gb, status):
         eheld_archive = engines.cluster_held_engines_archive
         ephasing = engines.count_phasing_out("compute")
         ephasing_archive = engines.count_phasing_out("staging")
+        equeue_gpu = engines.cluster_queued_engines_gpu
+        erunning_gpu = engines.cluster_running_engines_gpu
+        eheld_gpu = engines.cluster_held_engines_gpu
+        ephasing_gpu = engines.count_phasing_out("gpu")
 
         njobs, nrunning, neligible, nfailed, ncompleted = jobs.get_job_stats()
         waiting = jobs.queue_stats()['waiting']
@@ -9025,71 +9113,32 @@ def thread_display_status(gb, status):
             if gb.wcom_status and gb.wcom_status.getmaxyx()[1] > 50:
                 sizey = gb.wcom_status.getmaxyx()[1]
                 gb.wcom_status.erase()
-                compute_running = nrunning.get("compute", 0)
-                compute_eligible = neligible.get("compute", 0)
-                compute_total = njobs.get("compute", 0)
-                compute_completed = ncompleted.get("compute", 0)
-                compute_failed = nfailed.get("compute", 0)
+                maxrow = gb.wcom_status.getmaxyx()[0]
 
-                archive_running = nrunning.get("archive", 0)
-                archive_eligible = neligible.get("archive", 0)
-                archive_total = njobs.get("archive", 0)
-                archive_completed = ncompleted.get("archive", 0)
-                archive_failed = nfailed.get("archive", 0)
+                def put(row, col, text, color=0):
+                    # Clip to the pane: an overlong addstr raises and would
+                    # skip every row drawn after it.
+                    room = sizey - 1 - col
+                    if room > 0 and row < maxrow:
+                        gb.wcom_status.addstr(row, col, str(text)[:room], curses.color_pair(color))
 
-                gb.wcom_status.addstr(1, 1, "Compute jobs: ")
-                gb.wcom_status.addstr(
-                    1,
-                    18,
-                    "%d/%d/%d (%d completed, %d failed)"
-                    % (
-                        compute_running,
-                        compute_eligible,
-                        compute_total,
-                        compute_completed,
-                        compute_failed,
-                    ),
-                    curses.color_pair(GREEN),
-                )
-                gb.wcom_status.addstr(2, 1, "Archive jobs: ")
-                gb.wcom_status.addstr(
-                    2,
-                    18,
-                    "%d/%d/%d (%d completed, %d failed)"
-                    % (
-                        archive_running,
-                        archive_eligible,
-                        archive_total,
-                        archive_completed,
-                        archive_failed,
-                    ),
-                    curses.color_pair(GREEN),
-                )
+                def put_field(row, label, text, color=GREEN, right=False):
+                    put(row, 30 if right else 1, label)
+                    put(row, 48 if right else 18, text, color)
 
-                if status.gpu_partition or njobs.get('gpu', 0):
-                    gb.wcom_status.addstr(3, 1, 'GPU jobs: ')
-                    gb.wcom_status.addstr(3, 18, '%d/%d/%d' % (
-                        nrunning.get('gpu', 0), neligible.get('gpu', 0), njobs.get('gpu', 0)),
-                        curses.color_pair(GREEN))
-                    gpu_engines = [e for e in engines.engine_by_id.values() if e.partition == 'gpu']
-                    reserved = sum(len(devices) for e in gpu_engines for devices in e.gpu_allocations.values())
-                    total = sum(len(e.gpu_devices) for e in gpu_engines)
-                    gb.wcom_status.addstr(6, 1, 'GPU R/Q/H: ')
-                    gb.wcom_status.addstr(6, 18, '%d/%d/%d devices %d/%d' % (
-                        engines.cluster_running_engines_gpu, engines.cluster_queued_engines_gpu,
-                        engines.cluster_held_engines_gpu, reserved, total), curses.color_pair(GREEN))
-
-                if gb.wcom_status.getmaxyx()[0] > 19:
-                    gb.wcom_status.addstr(19, 1, "Waiting Q/L: ")
-                    gb.wcom_status.addstr(
-                        19, 18, "%d (%s) / %d (%s)" % (
-                            waiting['quota']['jobs'],
-                            zslurm_shared.format_time(waiting['quota']['longest_wait_s']),
-                            waiting['lease']['jobs'],
-                            zslurm_shared.format_time(waiting['lease']['longest_wait_s']),
-                        ), curses.color_pair(YELLOW if any(
-                            entry['jobs'] for entry in waiting.values()) else GREEN),
-                    )
+                type_labels = {"compute": "Compute", "archive": "Archive", "gpu": "GPU"}
+                engine_list = list(engines.engine_by_id.values())
+                shown = worker_types_shown(
+                    [kind for kind in WORKER_TYPES if njobs.get(kind, 0)]
+                    + [e.partition for e in engine_list]
+                    + (["archive"] if erunning_archive or equeue_archive or eheld_archive else [])
+                    + (["gpu"] if erunning_gpu or equeue_gpu or eheld_gpu else []))
+                for row, kind in enumerate(shown, 1):
+                    put_field(row, type_labels[kind] + " jobs: ",
+                              "%d/%d/%d (%d completed, %d failed)" % (
+                                  nrunning.get(kind, 0), neligible.get(kind, 0),
+                                  njobs.get(kind, 0), ncompleted.get(kind, 0),
+                                  nfailed.get(kind, 0)))
 
 
                 total_ssd_arr = numpy.asarray(getattr(status, 'total_ssd', []), dtype=float)
@@ -9153,8 +9202,6 @@ def thread_display_status(gb, status):
                     )
                 else:
                     gb.wcom_status.addstr(4, 18, "RUNNING", curses.color_pair(GREEN))
-
-                gb.wcom_status.addstr(5, 1, "SLURM R/Q/H/-: ")
 
                 cpu_c = GREEN
                 mem_c = GREEN
@@ -9222,7 +9269,6 @@ def thread_display_status(gb, status):
                     mem_usage = ("",)
                     load = ("",)
 
-                gb.wcom_status.addstr(5, 30, "Archive R/Q/H/-: ")
 
                 gb.wcom_status.addstr(7, 1, "CPU usage: ")
                 gb.wcom_status.addstr(
@@ -9307,102 +9353,59 @@ def thread_display_status(gb, status):
                         curses.color_pair(GREEN),
                     )
 
-                gb.wcom_status.addstr(13, 1, "Archive: ")
-                gb.wcom_status.addstr(14, 1, "Active: ")
-                gb.wcom_status.addstr(15, 1, "DCache: ")
-                gb.wcom_status.addstr(
-                    13,
-                    18,
-                    "%d / %d" % (jobs.archive_inuse, jobs.archive_total),
-                    curses.color_pair(GREEN),
-                )
-                gb.wcom_status.addstr(
-                    14,
-                    18,
-                    "%d / %d" % (jobs.active_inuse, jobs.active_total),
-                    curses.color_pair(GREEN),
-                )
-                gb.wcom_status.addstr(
-                    15,
-                    18,
-                    "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total),
-                    curses.color_pair(GREEN),
-                )
-                gb.wcom_status.addstr(16, 1, "Xfer D/U/S3: ")
-                gb.wcom_status.addstr(
-                    16,
-                    18,
-                    "%.1f/%.1f | %.1f/%.1f | %.1f/%.1f" % (
-                        jobs.dcache_download_inuse,
-                        jobs.dcache_download_total,
-                        jobs.dcache_upload_inuse,
-                        jobs.dcache_upload_total,
-                        jobs.s3_download_inuse,
-                        jobs.s3_download_total,
-                    ),
-                    curses.color_pair(GREEN),
-                )
+                put_field(13, "Archive (GB): ", "%d / %d" % (jobs.archive_inuse, jobs.archive_total))
+                put_field(14, "Active (GB): ", "%d / %d" % (jobs.active_inuse, jobs.active_total))
+                put_field(15, "dCache (GB): ", "%d / %d" % (jobs.dcache_inuse, jobs.dcache_total))
+                put_field(13, "dCache down: ", format_slot_usage(
+                    jobs.dcache_download_inuse, jobs.dcache_download_total), right=True)
+                put_field(14, "dCache up: ", format_slot_usage(
+                    jobs.dcache_upload_inuse, jobs.dcache_upload_total), right=True)
+                put_field(15, "S3 down: ", format_slot_usage(
+                    jobs.s3_download_inuse, jobs.s3_download_total), right=True)
 
+                if not status.autoconsolidate_enable:
+                    put_field(16, "Consolidation: ", "disabled", YELLOW)
+                else:
+                    kept, phased = [], 0
+                    for kind in shown:
+                        if kind == "archive":
+                            continue
+                        pool = [e for e in engine_list if e.partition == kind]
+                        out = sum(1 for e in pool if e.status == PHASING_OUT)
+                        phased += out
+                        kept.append("%s%d/%d" % (
+                            "" if len(shown) == 1 else ("CPU " if kind == "compute" else "GPU "),
+                            len(pool) - out, len(pool)))
+                    put_field(16, "Consolidation: ",
+                              "keep %s | phased-out %d" % (", ".join(kept), phased))
 
-                # Consolidation status (compute only if present)
-                try:
-                    gb.wcom_status.addstr(17, 1, "Consolidation: ")
-                    if not status.autoconsolidate_enable:
-                        color = YELLOW
-                        txt = "disabled"
-                        gb.wcom_status.addstr(17, 18, txt, curses.color_pair(color))                
-                    else:                    
-                        p_eng = [e for e in list(engines.engine_by_id.values()) if e.partition == 'compute']
-                        m = len(p_eng)
-                        k = len([e for e in p_eng if e.status == PHASING_OUT])
-                        n = m - k
-                        gb.wcom_status.addstr(
-                            17,
-                            18,
-                            "keep %d/%d | phased-out %d" % (n, m, k),
-                            curses.color_pair(GREEN),
-                        )
-                    # Autogrow status: display closeness to adding a node
-                    
-                    gb.wcom_status.addstr(18, 1, "Autogrow: ")
-                    if not status.autogrow_enable:
-                        color = YELLOW
-                        txt = "disabled"
-                    else:
-                        plan = getattr(status, 'autogrow_plan', None)
-                        
-                        if not plan:
-                            color = CYAN
-                            txt = "no data"                                    
-                        else:
-                            color = CYAN
-                            txt = plan
-                    gb.wcom_status.addstr(18, 18, txt, curses.color_pair(color))
-                    
-                    
-                      
-                except Exception:
-                    pass
+                if not status.autogrow_enable:
+                    put_field(17, "Autogrow: ", "disabled", YELLOW)
+                else:
+                    put_field(17, "Autogrow: ", getattr(status, 'autogrow_plan', None) or "no data", CYAN)
 
-                color = GREEN if equeue == 0 and eheld == 0 and ephasing == 0 else YELLOW
-                gb.wcom_status.addstr(
-                    5,
-                    18,
-                    "%d/%d/%d/%d" % (erunning, equeue, eheld, ephasing),
-                    curses.color_pair(color),
-                )
-                color_archive = GREEN if equeue_archive == 0 and eheld_archive == 0 and ephasing_archive == 0 else YELLOW
-                gb.wcom_status.addstr(
-                    5,
-                    48,
-                    "%d/%d/%d/%d" % (
-                        erunning_archive,
-                        equeue_archive,
-                        eheld_archive,
-                        ephasing_archive,
-                    ),
-                    curses.color_pair(color_archive),
-                )
+                put_field(18, "Waiting Q/L: ", "%d (%s) / %d (%s)" % (
+                    waiting['quota']['jobs'],
+                    zslurm_shared.format_time(waiting['quota']['longest_wait_s']),
+                    waiting['lease']['jobs'],
+                    zslurm_shared.format_time(waiting['lease']['longest_wait_s']),
+                ), YELLOW if any(entry['jobs'] for entry in waiting.values()) else GREEN)
+
+                def engine_counts(running, queued, held, phasing):
+                    color = GREEN if queued == 0 and held == 0 and phasing == 0 else YELLOW
+                    return "%d/%d/%d/%d" % (running, queued, held, phasing), color
+
+                put_field(5, "Compute R/Q/H/-: ", *engine_counts(erunning, equeue, eheld, ephasing))
+                if "archive" in shown:
+                    put_field(5, "Archive R/Q/H/-: ", *engine_counts(
+                        erunning_archive, equeue_archive, eheld_archive, ephasing_archive), right=True)
+                if "gpu" in shown:
+                    gpu_engines = [e for e in engine_list if e.partition == "gpu"]
+                    put_field(6, "GPU R/Q/H/-: ", *engine_counts(
+                        erunning_gpu, equeue_gpu, eheld_gpu, ephasing_gpu))
+                    put_field(6, "GPU devices: ", "%d / %d" % (
+                        sum(len(d) for e in gpu_engines for d in e.gpu_allocations.values()),
+                        sum(len(e.gpu_devices) for e in gpu_engines)), right=True)
 
                 gb.wcom_status.refresh()
         except Exception as e:
@@ -9453,7 +9456,7 @@ def build_windows(gb):
         rows, columns = os.popen("stty size", "r").read().split()
         size = (int(rows), int(columns))
 
-        com_win_rows = max(0, min(21, size[0] - 2))
+        com_win_rows = max(0, min(20, size[0] - 2))
         status_win_rows = max(0, min(2, size[0] - com_win_rows))
         log_win_rows = max(0, size[0] - com_win_rows - status_win_rows)
 
@@ -9629,19 +9632,19 @@ def init_commands(gb):
                 max_rows = 20
             inst_row = max(1, min(max_rows - 2, 18))
             gb.wcom.addstr(1, 1, "Start/stop local engine: s/x")
-            gb.wcom.addstr(2, 1, "Start/stop SLURM engines: d/c [n]")
+            gb.wcom.addstr(2, 1, "Start/stop SLURM engines: d/c")
             gb.wcom.addstr(3, 1, "Toggle auto consolidate: a")
             gb.wcom.addstr(4, 1, "Toggle phaseout engine: o")
-            
             gb.wcom.addstr(5, 1, "Active folder priority: P; clear: N")
             gb.wcom.addstr(6, 1, "Prioritize name/folder: p")
             gb.wcom.addstr(7, 1, "Deprioritize name/folder: n")
-            gb.wcom.addstr(8, 1, "Set storage totals: 1/2/3; dCache xfer D/U: 7/8")
-            gb.wcom.addstr(9, 1, "Toggle last in/first out: l")
-            gb.wcom.addstr(10, 1, "Set memory optimization job search window: m")
-            gb.wcom.addstr(11, 1, "Toggle autogrow: g")
-            gb.wcom.addstr(12, 1, "Shutdown: q")
-            gb.wcom.addstr(13, 1, "Take over old instance: Shift-H")
+            gb.wcom.addstr(8, 1, "Set archive/active/dCache GB: 1/2/3")
+            gb.wcom.addstr(9, 1, "Set dCache down/up, S3 slots: 7/8/9")
+            gb.wcom.addstr(10, 1, "Toggle last in/first out: l")
+            gb.wcom.addstr(11, 1, "Memory-fit job search window: m")
+            gb.wcom.addstr(12, 1, "Toggle autogrow: g")
+            gb.wcom.addstr(13, 1, "Shutdown: q")
+            gb.wcom.addstr(14, 1, "Take over old instance: Shift-H")
             gb.wcom.addstr(inst_row, 1, "Instance:")
             gb.wcom.refresh()
     except Exception as e:
@@ -9662,7 +9665,9 @@ def render_control_status(gb, status):
             def draw_right(row, text, color):
                 try:
                     t = str(text)
-                    field_width = max(4, min(24, right - 1))
+                    # Wide enough for the longest value ("TAKEOVER DONE"),
+                    # narrow enough not to blank the end of the labels.
+                    field_width = max(4, min(14, right - 1))
                     field_start = max(1, right - field_width)
                     gb.wcom.move(row, field_start)
                     gb.wcom.clrtoeol()
@@ -9673,17 +9678,17 @@ def render_control_status(gb, status):
             col = GREEN if getattr(status, 'autoconsolidate_enable', True) else YELLOW
             draw_right(3, ("ON" if status.autoconsolidate_enable else "OFF"), col)
             col = GREEN if status.lastin_first else YELLOW
-            draw_right(9, ("ON" if status.lastin_first else "OFF"), col)
+            draw_right(10, ("ON" if status.lastin_first else "OFF"), col)
             try:
                 val = int(status.prio_fillmem_context)
             except Exception:
                 val = 0
-            draw_right(10, str(val), GREEN)
+            draw_right(11, str(val), GREEN)
             col = GREEN if getattr(status, 'autogrow_enable', True) else YELLOW
-            draw_right(11, ("ON" if status.autogrow_enable else "OFF"), col)
+            draw_right(12, ("ON" if status.autogrow_enable else "OFF"), col)
             handover_mode = str(getattr(status, 'handover_mode', 'ACTIVE'))
             draw_right(
-                13,
+                14,
                 handover_display_label(handover_mode),
                 GREEN if handover_mode in ('ACTIVE', 'TARGET_ACTIVE') else YELLOW,
             )
@@ -10135,23 +10140,30 @@ def main(scr, *args, **kwds):
                 engines.stop_local(gb)
 
             elif c == ord("d"):  # START SLURM engines
-                default_partition = str(getattr(status, 'default_partition', 'normal') or 'normal')
-                staging_partition = str(getattr(status, 'staging_partition', 'staging') or 'staging')
                 enable_ssd_prompt = bool(getattr(status, 'enable_ssd_prompt', False))
                 enable_feature_prompt = bool(getattr(status, 'enable_feature_prompt', True))
                 ssd_feature_name = str(getattr(status, 'ssd_feature_name', '') or '')
 
-                partition = enter_command(
-                    gb, f"Partition [{default_partition}] {'/'.join(worker_partition_choices())}: "
-                )
-                if partition == "":
-                    partition = default_partition
+                type_answer = enter_command(gb, worker_type_prompt())
+                if type_answer is None:
+                    continue
+                partition_answer = None
+                kind = worker_type_alias(type_answer.strip() or 'compute')
+                choices = worker_slurm_partitions(kind) if kind else []
+                if len(choices) > 1:
+                    width = max(0, gb.wcom.getmaxyx()[1] - 2) if gb.wcom else None
+                    prompt = slurm_partition_prompt(kind, choices, width)
+                    if prompt.endswith('choices in log: '):
+                        add_log_line(gb, kind + ' Slurm partitions: ' + ', '.join(choices), CYAN)
+                    partition_answer = enter_command(gb, prompt)
+                    if partition_answer is None:
+                        continue
                 try:
-                    partition, worker_kind = resolve_worker_partition(partition)
+                    partition, worker_kind = select_worker_route(type_answer, partition_answer)
                 except ValueError as error:
                     set_status_message(gb, str(error), YELLOW)
                     continue
-                if partition == staging_partition:
+                if worker_kind == 'archive':
                     cmd = 1
                     cores = 1
                     constraint = ""
@@ -10187,6 +10199,11 @@ def main(scr, *args, **kwds):
                     runtime = "5-0:0:0"
 
                 if not cmd is None and not cores is None:
+                    add_log_line(gb, '[manager] requesting %d %s engine(s) on Slurm partition %s '
+                                 '(%s cores%s, %s)' % (
+                                     cmd, worker_kind, partition,
+                                     cores if cores else 'exclusive',
+                                     ', feature ' + constraint if constraint else '', runtime), CYAN)
                     engines.start_slurm(gb, cmd, runtime, partition, constraint, cores)
             elif c == ord("p"):
                 jobpattern = enter_command(
@@ -10312,33 +10329,22 @@ def main(scr, *args, **kwds):
                     )
 
             elif c == ord("c"):  # STOP SLURM engines
+                shown = [kind for kind in worker_types_shown(
+                    kind for kind in WORKER_TYPES if engines.count_cluster_engines(kind))]
                 group_cmd = enter_command(
-                    gb, "Cancel group [compute/staging/gpu/all] (def=all): "
+                    gb, "Stop engines (" + "/".join(shown + ["all"]) + ") [all]: "
                 )
-                group_aliases = {
-                    "": "all",
-                    "a": "all",
-                    "all": "all",
-                    "c": "compute",
-                    "compute": "compute",
-                    "s": "staging",
-                    "staging": "staging",
-                    "archive": "staging",
-                    "g": "gpu",
-                    "gpu": "gpu",
-                }
-                group = group_aliases.get(str(group_cmd or "").strip().lower())
+                answer = str(group_cmd or "").strip().lower()
+                group = "all" if answer in ("", "all") else worker_type_alias(answer)
                 if group is None:
                     set_status_message(
-                        gb,
-                        "Engine group must be compute, staging, gpu, or all",
-                        YELLOW,
-                    )
+                        gb, "Engine type must be one of: " + ", ".join(shown + ["all"]), YELLOW)
                 else:
                     available = engines.count_cluster_engines(group)
+                    label = "" if group == "all" else group + " "
                     cmd = get_number(
                         gb,
-                        f"Number of {group} allocations (R+Q+H; def=all {available}): ",
+                        f"Number of {label}engines (running+queued+held) [{available}]: ",
                         available,
                     )
                     if cmd is not None:
@@ -10445,7 +10451,10 @@ def main(scr, *args, **kwds):
                         except Exception:
                             pass
             elif c == ord("o"):
-                cmd = enter_command(gb, "Enter name or [archive|compute] +/-nr:")
+                shown = worker_types_shown(
+                    engine.partition for engine in list(engines.engine_by_id.values()))
+                cmd = enter_command(
+                    gb, "Phase out engine ID, or type +/-n (" + "/".join(shown) + "): ")
                 r = engines.toggle_phasing_out(cmd)
                 add_log_line(gb, r)
 

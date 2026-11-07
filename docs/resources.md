@@ -14,9 +14,13 @@ Besides CPU, memory, runtime, and partition constraints, ZSlurm can also schedul
 
 These counters are managed globally by the running `zslurm` instance and are shown in the manager status panel as:
 
-- **Archive**: `inuse / total`
-- **Active**: `inuse / total`
-- **DCache**: `inuse / total`
+- **Archive (GB)**: `inuse / total`
+- **Active (GB)**: `inuse / total`
+- **dCache (GB)**: `inuse / total`
+
+Next to them, the panel shows the transfer slot pools in the same style:
+**dCache down**, **dCache up** and **S3 down** (`used / total` slots; keys
+`7`/`8`/`9` change the limits).
 
 This is useful when jobs are limited not just by compute resources, but also by shared staging/storage capacity. For example:
 
