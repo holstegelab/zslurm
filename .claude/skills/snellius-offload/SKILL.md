@@ -68,9 +68,52 @@ zsoffload status
 zsoffload release            # add --reap only if YOU ran `up` and want it gone
 ```
 
-`zsoffload` is on PATH only inside the `clustersnake` conda env, OR call it by
-absolute path `/gpfs/home2/hulsmanm/projects/cluster_manager/zsoffload` (it has the
-right shebang and finds the zs* clients itself — no `conda activate` needed).
+`zsoffload` is on PATH only inside the `clustersnake` conda env. **Its shebang is
+stale** (2026-11-10: points at the deleted `/home/hulsmanm/miniconda3/envs/clustersnake`,
+giving `bad interpreter`). Call every client source script through the live env:
+
+```bash
+CS=/home/hulsmanm/all_data/research/conda/marc/miniconda3/envs/clustersnake/bin/python
+CM=/gpfs/home2/hulsmanm/projects/cluster_manager
+$CS $CM/zsoffload status;  $CS $CM/zsbatch ...;  $CS $CM/zsnodes;  $CS $CM/zscontrol jobs
+```
+
+## Never plain `sbatch` for analysis work
+
+Plain Slurm arrays on genoa are billed by memory share: a 1–2-core task asking
+24–32 GB is charged 24 CPUs. On 2026-11-10 an all-batch analysis chain run this
+way burned ~2,750 SBU (one hung task alone ~170) for work that used ~2 cores and
+≤5 GB per task. Submit through the shared zslurm manager instead; size `--mem`
+from measured MaxRSS (+ headroom), not from guesses.
+
+## Many-task pipelines: `zsbatch` with dependencies
+
+`zsoffload submit` has no dependency option. For per-shard pipelines use the
+source `zsbatch` (walltime correct in seconds; verify `reqtime_s` in
+`zscontrol jobs`) with Slurm-style dependencies, which the manager supports
+(`afterok`, `afterany`, `afternotok`, `after`, `singleton`; multiple ids joined
+with `:`; verified 2026-11-10):
+
+```bash
+zs(){ $CS $CM/zsbatch --parsable "$@"; }
+B=$(zs -J build -c 4 --mem 30000 -t 2:00:00 job.sh build)
+ids=(); for i in $(seq 0 124); do ids+=($(zs -J ex_$i -d afterok:$B -c 2 --mem 10000 -t 3:00:00 job.sh extract $i)); done
+P=$(zs -J prep -d afterok:$(IFS=:; echo "${ids[*]}") -c 2 --mem 64000 -t 2:00:00 job.sh prep)
+```
+
+zsbatch has no `--output`: let the job script redirect its own log
+(`exec python ... > /shared/path/log 2>&1`). It has no idempotency key either —
+check `zscontrol jobs` before resubmitting after a lost reply.
+
+## Fat nodes come from memory pressure (manager ≥ 0.3.6)
+
+You do not pick a partition. Autogrow (Snellius: `genoa,rome` thin pilots) grows
+**fat** nodes when the average GiB/core of all compute demand (running + backlog)
+exceeds that of the running+queued fleet (at least a thin node's ~1.75 GiB/core).
+So memory-heavy shards (e.g. 2 cores / 10 GB) land on fat nodes automatically;
+an honest `--mem` is what steers it. Idle fat nodes may also replace a late thin
+pilot (`autogrow_fat_min_earlier_sec`, cap `autogrow_max_fat_nodes`). Inspect
+with `zscontrol autogrow-plan` (`need_fat`, `plan_part`).
 
 If `submit` returns `"no shared manager reachable; run zsoffload up first"`, there
 is **no manager running**. Decide (see next section) whether to provision one.

@@ -1,5 +1,21 @@
 # Local deployment snapshot
 
+## Update 2026-11-10
+
+- Source `~/projects/cluster_manager` main @ 73d3374 (release 0.3.6, 2026-11-07):
+  genoa,rome thin growth (pilot queued even when no node is idle), fat nodes by
+  memory-pressure policy judged against running + queued fleet, job phase /
+  intentional-wait reporting, site GPU profiles.
+- Active shared manager: `zslurm_tcn617`, version 0.3.6, health schema 2, autogrow on
+  (`autogrow_max_compute_nodes: 3`), several agents holding leases. Adopt only.
+- Console-script shebangs of `zsoffload`/`zsqueue` point at the deleted
+  `/home/hulsmanm/miniconda3/envs/clustersnake`; run sources with
+  `/home/hulsmanm/all_data/research/conda/marc/miniconda3/envs/clustersnake/bin/python`.
+- Source `zsbatch` submits walltime in seconds correctly (0:05:00 -> `reqtime_s` 300)
+  and multi-id `-d afterok:a:b` dependencies are stored and honoured.
+
+---
+
 > Dated 2026-07-29. Re-run every verification command before relying on this
 > state. This file records recent context; it is not a promise that the active
 > manager or pipeline still has the same state.
