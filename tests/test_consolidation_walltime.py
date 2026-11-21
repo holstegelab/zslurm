@@ -85,6 +85,28 @@ def iteration(z, monkeypatch):
         z.thread_check_commands()
 
 
+@pytest.mark.parametrize('partition', ['compute', 'archive', 'gpu'])
+def test_idle_consolidation_stops_only_the_slurm_pilot_on_a_shared_host(z, monkeypatch, partition):
+    devices = ['0'] if partition == 'gpu' else []
+
+    def register(cluster_id):
+        return z.engines.register('shared-host', 4, 8192, partition, cluster_id,
+                                  0, 0, chief_version=z.VERSION, gpu_devices=devices)
+
+    local = register('')
+    pilot = register('123')
+    z.engines.engine_by_id[pilot].slurm_state = 'R'
+    iteration(z, monkeypatch)
+
+    def idle_poll(engine_id):
+        return z.engines.poll(engine_id, 0, 0, 0, z.zslurm_shared.RUNNING, 60,
+                              {}, {}, 0, 0, 0, 0)
+
+    stop = (z.zslurm_shared.STOP, None)
+    assert stop not in idle_poll(local)
+    assert stop in idle_poll(pilot)
+
+
 @pytest.mark.parametrize('site,shape', [('spider', (30, 220708)), ('snellius', (192, 344064))])
 def test_fifteen_thousand_long_tasks_do_not_retain_nineteen_short_idle_pilots(z, monkeypatch, site, shape):
     z._apply_cluster_config({'cluster_site': site})

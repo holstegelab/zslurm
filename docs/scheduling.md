@@ -97,7 +97,7 @@ This is useful when you want to:
 
 ### Autoconsolidate (`a`)
 
-Autoconsolidation tries to reduce the number of running engines when the current workload fits on fewer nodes.
+Autoconsolidation phases out surplus Slurm pilots when the workload fits on fewer nodes. Local engines stay available when idle.
 
 Operationally, it:
 

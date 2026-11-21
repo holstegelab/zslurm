@@ -6811,7 +6811,7 @@ class EngineManager(object):
                 return commands
 
             commands = e.pending_commands
-            # kill if idle for 3 minutes, but not if local engine or archive engine  (except if no extra jobs)
+            # A draining engine stops as soon as its chief reports it idle.
             if idle > 0.0 and e.status == PHASING_OUT:
                 add_log_line(gb, "Stopping phased out engine: " + myid, YELLOW)
                 commands.append((zslurm_shared.STOP, None))
@@ -8903,11 +8903,13 @@ def thread_check_commands():
 
             if status.autoconsolidate_enable and now - autoconsolidate_last_plan_ts > 60:
                 autoconsolidate_last_plan_ts = now
-                consolidate_gpu_engines(all_engines, now)
+                # Local chiefs have no Slurm allocation to release.
+                cluster_engines = [e for e in all_engines if e.cluster_id not in (None, False, '')]
+                consolidate_gpu_engines(cluster_engines, now)
 
-                parts = set(e.partition for e in all_engines if e.partition != 'gpu')
+                parts = set(e.partition for e in cluster_engines if e.partition != 'gpu')
                 for part in parts:
-                    part_engines = [e for e in all_engines if e.partition == part]
+                    part_engines = [e for e in cluster_engines if e.partition == part]
                     if not part_engines:
                         continue
 
